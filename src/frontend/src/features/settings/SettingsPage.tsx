@@ -11,6 +11,7 @@ import { FormField } from '../../components/ui/FormField';
 import { toast } from '../../components/ui/Toast';
 import { DropdownList, SelectMenu, useClickOutside } from '../../components/ui/SelectMenu';
 import { fmtTime } from '../../lib/format';
+import { localOrigin } from '../../lib/endpoint';
 import { SysinfoPanel } from '../../components/ui/SysinfoPanel';
 import { McpToolsContent } from '../mcp/McpToolsPage';
 import { AcademicIdentitySection } from './AcademicIdentitySection';
@@ -29,7 +30,9 @@ import {
   LLM_EFFORT_LEVELS,
   type LlmCallLogRow,
   type LlmProviderInput,
+  type LlmProviderAuthScheme,
   type LlmProviderKind,
+  type LlmProviderTransport,
   type LlmEffort,
   type LlmProviderRead,
   type LlmRoute,
@@ -42,7 +45,14 @@ import { BuddySettings } from './BuddySettings';
 import { ExtensionApiKeySettings } from './ExtensionApiKeySettings';
 import { FullExportSettings } from './FullExportSettings';
 import { PluginsSettings } from './PluginsSettings';
-import { CAPABILITY_PLUGINS_MANAGE, isCapabilityAvailable, loadCapabilities } from '../../lib/host';
+import { ObsidianVaultSettings } from './ObsidianVaultSettings';
+import { LocalLlmImport } from './LocalLlmImport';
+import {
+  CAPABILITY_OBSIDIAN_VAULT_SYNC,
+  CAPABILITY_PLUGINS_MANAGE,
+  isCapabilityAvailable,
+  loadCapabilities,
+} from '../../lib/host';
 import { AdminSpeechSettings, PersonalSpeechSettings } from './SpeechSettings';
 // 原「管理」页的三块（#755）：入口合一后直接在同一页渲染
 import { ExperimentSettings } from './ExperimentSettings';
@@ -61,6 +71,32 @@ import { DocumentProcessingSettingsPanel } from './DocumentProcessingSettings';
    ============================================================ */
 
 const KINDS: LlmProviderKind[] = ['openai_compat', 'anthropic'];
+
+function transportOptions(kind: LlmProviderKind): Array<{ value: LlmProviderTransport; label: string }> {
+  if (kind === 'fake') return [{ value: 'fake', label: tr('内置测试模型', 'Built-in test model') }];
+  if (kind === 'anthropic') {
+    return [{ value: 'anthropic_messages', label: 'Anthropic Messages' }];
+  }
+  return [
+    { value: 'chat_completions', label: 'OpenAI Chat Completions' },
+    { value: 'responses', label: 'OpenAI Responses' },
+  ];
+}
+
+function authSchemeOptions(kind: LlmProviderKind): Array<{ value: LlmProviderAuthScheme; label: string }> {
+  if (kind === 'fake') return [{ value: 'none', label: tr('无需鉴权', 'No authentication') }];
+  if (kind === 'anthropic') {
+    return [
+      { value: 'x_api_key', label: 'x-api-key' },
+      { value: 'bearer', label: 'Bearer token' },
+      { value: 'none', label: tr('无需鉴权', 'No authentication') },
+    ];
+  }
+  return [
+    { value: 'bearer', label: 'Bearer token' },
+    { value: 'none', label: tr('无需鉴权', 'No authentication') },
+  ];
+}
 
 // ---------------- 个人 ----------------
 
@@ -879,9 +915,13 @@ function SshTab() {
 interface ProviderDraft {
   name: string;
   kind: LlmProviderKind;
+  transport: LlmProviderTransport;
+  auth_scheme: LlmProviderAuthScheme;
   base_url: string;
   user_agent: string;
   api_key: string;
+  /** 编辑态是否已有只写凭据；值本身从不进入 renderer。 */
+  has_api_key: boolean;
   enabled: boolean;
   /** 可用模型列表原始输入（逗号/换行分隔），保存时解析为数组 */
   models: string;
@@ -893,16 +933,30 @@ function parseModels(raw: string): string[] {
 }
 
 function emptyDraft(): ProviderDraft {
-  return { name: '', kind: 'openai_compat', base_url: '', user_agent: '', api_key: '', enabled: true, models: '' };
+  return {
+    name: '',
+    kind: 'openai_compat',
+    transport: 'chat_completions',
+    auth_scheme: 'bearer',
+    base_url: '',
+    user_agent: '',
+    api_key: '',
+    has_api_key: false,
+    enabled: true,
+    models: '',
+  };
 }
 
 function draftFrom(p: LlmProviderRead): ProviderDraft {
   return {
     name: p.name,
     kind: p.kind,
+    transport: p.transport,
+    auth_scheme: p.auth_scheme,
     base_url: p.base_url ?? '',
     user_agent: p.user_agent ?? '',
     api_key: '',
+    has_api_key: Boolean(p.api_key_masked),
     enabled: p.enabled,
     models: (p.models ?? []).join('\n'),
   };
@@ -912,9 +966,13 @@ function toInput(d: ProviderDraft): LlmProviderInput {
   return {
     name: d.name.trim(),
     kind: d.kind,
+    transport: d.transport,
+    auth_scheme: d.auth_scheme,
     base_url: d.base_url.trim() || undefined,
     user_agent: d.kind === 'anthropic' ? d.user_agent.trim() : '',
-    api_key: d.api_key, // 空字符串 = 不变（PATCH）；POST 时后端忽略空 key
+    // none 时不把用户刚输入但随后取消使用的 secret 落库；PATCH 的空字符串
+    // 保持已有密文不变，runtime 会因 auth_scheme=none 而不发送它。
+    api_key: d.auth_scheme === 'none' ? '' : d.api_key,
     enabled: d.enabled,
     models: parseModels(d.models), // 整体替换（清空 = []）
   };
@@ -925,6 +983,8 @@ function ProviderForm({ draft, setDraft, isNew }: {
   setDraft: (d: ProviderDraft) => void;
   isNew: boolean;
 }) {
+  const noAuth = draft.auth_scheme === 'none';
+  const credentialMissing = !noAuth && !draft.has_api_key && !draft.api_key.trim();
   return (
     <>
       <FormField label={tr('名称', 'Name')}>
@@ -936,12 +996,57 @@ function ProviderForm({ draft, setDraft, isNew }: {
           <SelectMenu
             value={draft.kind}
             options={KINDS.map((k) => ({ value: k, label: k }))}
-            onChange={(v) => setDraft({ ...draft, kind: v as LlmProviderKind })}
+            onChange={(v) => {
+              const kind = v as LlmProviderKind;
+              setDraft({
+                ...draft,
+                kind,
+                transport: kind === 'anthropic'
+                  ? 'anthropic_messages'
+                  : kind === 'fake' ? 'fake' : 'chat_completions',
+                auth_scheme: kind === 'anthropic'
+                  ? 'x_api_key'
+                  : kind === 'fake' ? 'none' : 'bearer',
+              });
+            }}
           />
         </FormField>
         <FormField label="Base URL" style={{ flex: 1 }}>
           <input className="input mono" value={draft.base_url} onChange={(e) => setDraft({ ...draft, base_url: e.target.value })}
             placeholder="https://api.example.com/v1" disabled={draft.kind === 'fake'} />
+        </FormField>
+      </div>
+      <div className="row gap12" style={{ alignItems: 'flex-start' }}>
+        <FormField
+          label={tr('请求协议', 'Transport')}
+          hint={tr('必须与服务端实际提供的 API 一致。', 'Must match the API exposed by the server.')}
+          style={{ flex: 1 }}
+        >
+          <SelectMenu
+            value={draft.transport}
+            options={transportOptions(draft.kind)}
+            onChange={(value) => setDraft({
+              ...draft,
+              transport: value as LlmProviderTransport,
+            })}
+          />
+        </FormField>
+        <FormField
+          label={tr('鉴权方式', 'Authentication')}
+          hint={noAuth
+            ? tr('不会向服务端发送 API 凭据。', 'No API credential will be sent to the server.')
+            : tr('Bearer 写入 Authorization；x-api-key 写入同名请求头。', 'Bearer uses Authorization; x-api-key uses the matching header.')}
+          style={{ flex: 1 }}
+        >
+          <SelectMenu
+            value={draft.auth_scheme}
+            options={authSchemeOptions(draft.kind)}
+            onChange={(value) => setDraft({
+              ...draft,
+              auth_scheme: value as LlmProviderAuthScheme,
+              api_key: value === 'none' ? '' : draft.api_key,
+            })}
+          />
         </FormField>
       </div>
       {draft.kind === 'anthropic' && (
@@ -952,11 +1057,23 @@ function ProviderForm({ draft, setDraft, isNew }: {
             placeholder="claude-cli/2.1.226 (external, sdk-cli)" />
         </FormField>
       )}
-      <FormField label="API Key"
-        hint={isNew ? undefined : tr('留空 = 保持不变；后端只写不读，展示为 masked', 'Leave empty to keep unchanged; write-only on the backend, shown masked')}>
+      <FormField
+        label={draft.auth_scheme === 'bearer' ? 'Bearer token' : 'API Key'}
+        hint={noAuth
+          ? tr(
+            isNew ? '当前连接不需要凭据，不会保存此字段。' : '当前连接不发送凭据；此前保存的密文保持不变但不会使用。',
+            isNew ? 'This connection needs no credential, so none will be stored.' : 'This connection sends no credential. Any previously stored value remains encrypted but unused.',
+          )
+          : credentialMissing
+            ? tr('所选鉴权方式需要填写凭据。', 'A credential is required for the selected authentication scheme.')
+            : isNew
+            ? tr('凭据只写入本机后端，不会返回到界面。', 'The credential is write-only to the local backend and never returned to this page.')
+            : tr('留空 = 保持不变；后端只写不读，展示为 masked', 'Leave empty to keep unchanged; write-only on the backend, shown masked')}
+      >
         <input className="input mono" type="password" autoComplete="new-password" value={draft.api_key}
           onChange={(e) => setDraft({ ...draft, api_key: e.target.value })}
-          placeholder={isNew ? 'sk-…' : tr('••••••（留空不变）', '•••••• (empty = unchanged)')} disabled={draft.kind === 'fake'} />
+          placeholder={noAuth ? tr('无需填写', 'Not required') : isNew ? 'sk-…' : tr('••••••（留空不变）', '•••••• (empty = unchanged)')}
+          disabled={draft.kind === 'fake' || noAuth} />
       </FormField>
       <FormField label={tr('可用模型', 'Available models')}
         hint={tr('逗号或换行分隔；作为路由表 model 输入框的候选', 'Comma or newline separated; used as suggestions in the routing table model field')}>
@@ -1195,7 +1312,7 @@ function ProvidersSection() {
             <thead>
               <tr>
                 <th style={{ width: 230 }}>{tr('名称', 'Name')}</th>
-                <th style={{ width: 130 }}>api_key</th>
+                <th style={{ width: 130 }}>{tr('凭据', 'Credential')}</th>
                 <th>{tr('可用模型', 'Models')}</th>
                 <th style={{ width: 80 }}>{tr('状态', 'Status')}</th>
                 <th style={{ width: 130 }}>{tr('模型状态', 'Model status')}</th>
@@ -1215,18 +1332,30 @@ function ProvidersSection() {
                 return (
                   <tr key={p.id}>
                     <td>
-                      <div className="row gap6" style={{ alignItems: 'center' }}>
+                      <div className="row gap6" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
                         <span style={{ fontSize: 12, fontWeight: 650 }}>{p.name}</span>
                         <span className="pill sm mono" style={{ background: 'var(--surface-3)', color: 'var(--text-3)' }}>
                           {p.kind}
                         </span>
+                        <span className="pill sm mono" style={{ background: 'var(--surface-3)', color: 'var(--text-3)' }}>
+                          {p.transport}
+                        </span>
+                        {p.import_source && (
+                          <span className="pill sm" style={{ background: 'var(--accent-soft)', color: 'var(--accent-text)' }}>
+                            {p.import_source === 'codex' ? 'Codex' : 'Claude Code'}
+                          </span>
+                        )}
                       </div>
                       <div className="mono" title={p.base_url ?? undefined}
                         style={{ fontSize: 10.5, color: 'var(--text-3)', maxWidth: 210, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {p.base_url ?? '—'}
+                        {p.base_url ?? '—'} · {p.auth_scheme}
                       </div>
                     </td>
-                    <td className="mono" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{p.api_key_masked ?? '—'}</td>
+                    <td className="mono" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>
+                      {p.auth_scheme === 'none'
+                        ? tr('不发送', 'not sent')
+                        : p.api_key_masked || '—'}
+                    </td>
                     <td>
                       {models.length === 0 ? (
                         <span style={{ fontSize: 11.5, color: 'var(--text-4)' }}>{tr('（未填写）', '(none)')}</span>
@@ -1304,11 +1433,17 @@ function ProvidersSection() {
         open={modal !== 'closed'}
         onClose={() => setModal('closed')}
         title={isNew ? tr('新增 Provider', 'Add provider') : tr('编辑 Provider', 'Edit provider')}
-        sub={tr('api_key 后端只写不读，展示为 masked', 'api_key is write-only on the backend and shown masked')}
+        sub={tr('API 凭据后端只写不读，展示为 masked', 'API credentials are write-only on the backend and shown masked')}
         footer={
           <>
             <button className="btn btn-ghost" onClick={() => setModal('closed')}>{tr('取消', 'Cancel')}</button>
-            <button className="btn btn-primary" disabled={!draft.name.trim() || busy}
+            <button
+              className="btn btn-primary"
+              disabled={
+                !draft.name.trim()
+                || (draft.auth_scheme !== 'none' && !draft.has_api_key && !draft.api_key.trim())
+                || busy
+              }
               onClick={() => (isNew ? createMutation.mutate() : patchMutation.mutate(modal))}>
               {busy ? tr('保存中…', 'Saving…') : tr('保存', 'Save')}
             </button>
@@ -2113,6 +2248,7 @@ function EmbeddingSpaceSection() {
 export function LlmTab() {
   return (
     <>
+      <LocalLlmImport />
       <ProvidersSection />
       <RoutesSection />
       <EmbeddingSpaceSection />
@@ -2329,7 +2465,7 @@ function MyUsageTab() {
 /** 设置页的标签页。原「管理」那六项自 #755 起也在这里。 */
 type Tab =
   | 'personal' | 'prefs' | 'buddy' | 'speech' | 'bots' | 'ssh' | 'myusage'
-  | 'extension' | 'mcp' | 'export' | 'plugins'
+  | 'extension' | 'mcp' | 'export' | 'obsidian' | 'plugins'
   // 原 /admin 的六项（#755）：平台只剩一个使用者，另开一个「管理」入口只是
   // 实验室时代的残留——同一个人要在两个页面之间找同一类配置
   | 'llm' | 'literature' | 'processing' | 'experiment' | 'daily' | 'usage';
@@ -2767,7 +2903,7 @@ export function DailyCategoriesTab() {
   );
 }
 
-const PERSONAL_TABS: Tab[] = ['personal', 'prefs', 'buddy', 'speech', 'bots', 'ssh', 'myusage', 'extension', 'mcp', 'export', 'plugins'];
+const PERSONAL_TABS: Tab[] = ['personal', 'prefs', 'buddy', 'speech', 'bots', 'ssh', 'myusage', 'extension', 'mcp', 'export', 'obsidian', 'plugins'];
 
 export function SettingsPage() {
   // 支持 /settings?tab=mcp 这类深链（如旧 /mcp-tools 路由的重定向）
@@ -2782,19 +2918,29 @@ export function SettingsPage() {
   // 异步拉取，本页可能先于它渲染完，这里再取一次并在拿到结果后重读，避免首次进
   // 设置页时 tab 闪失。没接内核的部署探测失败即维持 false，页面上就没有这个 tab。
   const [pluginsAvailable, setPluginsAvailable] = useState(() => isCapabilityAvailable(CAPABILITY_PLUGINS_MANAGE));
+  const [obsidianAvailable, setObsidianAvailable] = useState(
+    () => localOrigin() !== null && isCapabilityAvailable(CAPABILITY_OBSIDIAN_VAULT_SYNC),
+  );
   useEffect(() => {
-    if (pluginsAvailable) return;
+    if (pluginsAvailable && obsidianAvailable) return;
     let alive = true;
     void loadCapabilities().then(() => {
-      if (alive) setPluginsAvailable(isCapabilityAvailable(CAPABILITY_PLUGINS_MANAGE));
+      if (alive) {
+        setPluginsAvailable(isCapabilityAvailable(CAPABILITY_PLUGINS_MANAGE));
+        setObsidianAvailable(
+          localOrigin() !== null && isCapabilityAvailable(CAPABILITY_OBSIDIAN_VAULT_SYNC),
+        );
+      }
     });
     return () => {
       alive = false;
     };
-  }, [pluginsAvailable]);
+  }, [obsidianAvailable, pluginsAvailable]);
   // 深链 ?tab=plugins 在能力缺失（web 端、清单未就绪）时回落默认 tab，不崩也不留空白；
   // 清单稍后就绪且能力在，effectiveTab 自动切回 plugins。
-  const effectiveTab: Tab = tab === 'plugins' && !pluginsAvailable ? 'personal' : tab;
+  const effectiveTab: Tab = (tab === 'plugins' && !pluginsAvailable) || (tab === 'obsidian' && !obsidianAvailable)
+    ? 'personal'
+    : tab;
 
   // 管理页并入本页后（#755），这些标签**就在这里**，不能再往 /admin 跳——
   // /admin 已经反向重定向到 /settings，两边对跳就是一个死循环。
@@ -2814,6 +2960,7 @@ export function SettingsPage() {
     { v: 'extension', label: tr('Polaris 扩展', 'Polaris extension') },
     { v: 'mcp', label: tr('MCP 接入', 'MCP access') },
     { v: 'export', label: tr('数据导出', 'Data export') },
+    ...(obsidianAvailable ? [{ v: 'obsidian' as Tab, label: 'Obsidian Vault' }] : []),
     ...(pluginsAvailable ? [{ v: 'plugins' as Tab, label: tr('插件', 'Plugins') }] : []),
     // —— 原「管理」页的六项，并入同一个入口 ——
     { v: 'llm', label: tr('模型与路由', 'Models & routing') },
@@ -2840,6 +2987,7 @@ export function SettingsPage() {
       {effectiveTab === 'extension' && <ExtensionApiKeySettings />}
       {effectiveTab === 'mcp' && <McpToolsContent />}
       {effectiveTab === 'export' && <FullExportSettings />}
+      {effectiveTab === 'obsidian' && <ObsidianVaultSettings />}
       {effectiveTab === 'plugins' && <PluginsSettings />}
       {effectiveTab === 'llm' && <LlmTab />}
       {effectiveTab === 'literature' && <LiteratureSearchSettingsPanel />}

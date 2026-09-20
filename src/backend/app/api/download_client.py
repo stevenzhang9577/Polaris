@@ -544,7 +544,11 @@ async def _archive_bound_pdf(
         identity_status="verified",
         sharing_scope=sharing_scope,
     )
-    current = await content_service.current_content_version(session, paper_id=paper.id)
+    current = await content_service.latest_readable_content_version(
+        session,
+        paper_id=paper.id,
+        library_id=library.id,
+    )
     enqueue_parse = False
     if current is not None and current.asset_id == asset.id and current.status != "failed":
         version = current

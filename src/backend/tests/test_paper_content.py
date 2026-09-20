@@ -9,7 +9,7 @@ from sqlalchemy import select
 from app.core.db import get_sessionmaker
 from app.core.embedding_space import EmbeddingSpace
 from app.models.library_direction import DirectionLibrary, LibraryPaper
-from app.models.paper import new_paper
+from app.models.paper import Paper, new_paper
 from app.models.paper_assets import AssetGrant
 from app.models.paper_content import (
     PaperContentChunk,
@@ -277,6 +277,58 @@ async def test_current_fulltext_search_enforces_asset_grant(app, client):
             library_ids=[library.id],
         )
         assert denied_context is None
+
+
+@pytest.mark.asyncio
+async def test_read_fulltext_tool_never_falls_back_across_asset_grants(
+    app, client, tmp_path
+):
+    owner, _owner_library, paper, _asset = await _setup(client)
+    _headers, reader_id = await _user(
+        client, f"content-reader-{uuid.uuid4().hex}@example.com"
+    )
+    legacy_text = tmp_path / "legacy-private-fulltext.txt"
+    legacy_text.write_text("tenant-a-private-fulltext", encoding="utf-8")
+
+    async with get_sessionmaker()() as session:
+        reader_library = DirectionLibrary(
+            name=f"reader-{uuid.uuid4().hex[:8]}",
+            statement="reader library without an asset grant",
+            submitted_by=reader_id,
+        )
+        session.add(reader_library)
+        await session.flush()
+        session.add(
+            LibraryPaper(
+                library_id=reader_library.id,
+                paper_id=paper.id,
+                status="included",
+            )
+        )
+        stored = await session.get(Paper, paper.id)
+        assert stored is not None
+        stored.full_text_path = str(legacy_text)
+        await session.commit()
+
+    import app.tools as tools
+    from app.core.llm.router import LLMRouter
+    from app.tools import ToolContext
+
+    result = await tools.run_tool(
+        ToolContext(
+            project_id=None,
+            llm=LLMRouter(),
+            library_ids=(reader_library.id,),
+            user_id=reader_id,
+        ),
+        "read_fulltext",
+        {"paper_id": str(paper.id)},
+    )
+
+    assert owner.id != reader_id
+    assert result["text"] is None
+    assert result["abstract"] is None
+    assert "tenant-a-private-fulltext" not in str(result)
 
 
 @pytest.mark.asyncio

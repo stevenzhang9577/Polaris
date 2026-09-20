@@ -7,16 +7,32 @@
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime, timedelta
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.base import utcnow
 from app.models.library_direction import LibraryPaper
 from app.models.paper import Paper, PaperNote
 from app.models.topic_shelf import TopicPaper
 from app.models.user import User
-from app.services import file_projection
+from app.services import file_projection, obsidian_vault_bridge
 from app.services.libraries import get_source_library_ids
+
+NOTE_DELETION_RETENTION_DAYS = 30
+
+
+async def _refresh_note_projections(
+    session: AsyncSession, *, paper_id: uuid.UUID, user_id: uuid.UUID
+) -> None:
+    """Refresh the internal export and queue the editable local Vault copy."""
+    await file_projection.refresh_paper_notes(session, paper_id)
+    await obsidian_vault_bridge.enqueue_paper_projection(
+        paper_id=paper_id,
+        user_id=user_id,
+        entity_type="notes",
+    )
 
 
 def author_name_of(display_name: str | None, email: str) -> str:
@@ -33,7 +49,7 @@ async def create_note(
     await session.refresh(note)
     # 常驻文件投影（#719）：保存成功后 best-effort 重渲染该论文的笔记文件。
     # 冲突规则 DB wins：投影失败只记日志，绝不影响这次保存。
-    await file_projection.refresh_paper_notes(session, paper_id)
+    await _refresh_note_projections(session, paper_id=paper_id, user_id=author.id)
     return note
 
 
@@ -44,7 +60,11 @@ async def list_paper_notes(
     stmt = (
         select(PaperNote, User.display_name, User.email)
         .join(User, User.id == PaperNote.author_id)
-        .where(PaperNote.paper_id == paper_id, PaperNote.author_id == author_id)
+        .where(
+            PaperNote.paper_id == paper_id,
+            PaperNote.author_id == author_id,
+            PaperNote.deleted_at.is_(None),
+        )
         .order_by(PaperNote.created_at.desc())
     )
     rows = (await session.execute(stmt)).all()
@@ -58,7 +78,11 @@ async def get_own_note(
     stmt = (
         select(PaperNote, User.display_name, User.email)
         .join(User, User.id == PaperNote.author_id)
-        .where(PaperNote.id == note_id, PaperNote.author_id == user.id)
+        .where(
+            PaperNote.id == note_id,
+            PaperNote.author_id == user.id,
+            PaperNote.deleted_at.is_(None),
+        )
     )
     row = (await session.execute(stmt)).first()
     if row is None:
@@ -71,16 +95,66 @@ async def update_note(session: AsyncSession, note: PaperNote, *, content: str) -
     note.content = content
     await session.commit()
     await session.refresh(note)
-    await file_projection.refresh_paper_notes(session, note.paper_id)  # 投影跟进（DB wins）
+    await _refresh_note_projections(
+        session, paper_id=note.paper_id, user_id=note.author_id
+    )
     return note
 
 
 async def delete_note(session: AsyncSession, note: PaperNote) -> None:
-    paper_id = note.paper_id  # delete 后对象过期，先留住
-    await session.delete(note)
+    paper_id = note.paper_id
+    note.deleted_at = utcnow()
     await session.commit()
     # 投影跟进：这是该论文最后一条笔记且没有划线时，文件一并清走
-    await file_projection.refresh_paper_notes(session, paper_id)
+    await _refresh_note_projections(
+        session, paper_id=paper_id, user_id=note.author_id
+    )
+
+
+async def restore_own_note(
+    session: AsyncSession, *, note_id: uuid.UUID, user: User, now: datetime | None = None
+) -> tuple[PaperNote, str] | None:
+    """Restore the caller's tombstoned note while it is inside the 30-day retention window.
+
+    Missing, foreign, active, and expired rows are deliberately indistinguishable so a caller
+    cannot use recovery as an ownership oracle.
+    """
+    cutoff = (now or utcnow()) - timedelta(days=NOTE_DELETION_RETENTION_DAYS)
+    stmt = (
+        select(PaperNote, User.display_name, User.email)
+        .join(User, User.id == PaperNote.author_id)
+        .where(
+            PaperNote.id == note_id,
+            PaperNote.author_id == user.id,
+            PaperNote.deleted_at.is_not(None),
+            PaperNote.deleted_at >= cutoff,
+        )
+    )
+    row = (await session.execute(stmt)).first()
+    if row is None:
+        return None
+    note, display_name, email = row
+    note.deleted_at = None
+    await session.commit()
+    await session.refresh(note)
+    await _refresh_note_projections(
+        session, paper_id=note.paper_id, user_id=note.author_id
+    )
+    return note, author_name_of(display_name, email)
+
+
+async def purge_expired_notes(
+    session: AsyncSession, *, now: datetime | None = None
+) -> int:
+    """Permanently purge note tombstones whose 30-day recovery period has elapsed."""
+    cutoff = (now or utcnow()) - timedelta(days=NOTE_DELETION_RETENTION_DAYS)
+    result = await session.execute(
+        delete(PaperNote).where(
+            PaperNote.deleted_at.is_not(None), PaperNote.deleted_at < cutoff
+        )
+    )
+    await session.commit()
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
 
 async def list_project_notes(
@@ -119,7 +193,11 @@ async def list_project_notes(
         select(PaperNote, User.display_name, User.email, Paper.title)
         .join(User, User.id == PaperNote.author_id)
         .join(Paper, Paper.id == PaperNote.paper_id)
-        .where(PaperNote.author_id == author_id, in_scope)
+        .where(
+            PaperNote.author_id == author_id,
+            PaperNote.deleted_at.is_(None),
+            in_scope,
+        )
     )
     if q:
         stmt = stmt.where(PaperNote.content.ilike(f"%{q}%"))
@@ -156,7 +234,11 @@ async def list_library_notes(
         select(PaperNote, User.display_name, User.email, Paper.title)
         .join(User, User.id == PaperNote.author_id)
         .join(Paper, Paper.id == PaperNote.paper_id)
-        .where(PaperNote.author_id == author_id, in_scope)
+        .where(
+            PaperNote.author_id == author_id,
+            PaperNote.deleted_at.is_(None),
+            in_scope,
+        )
     )
     if q:
         stmt = stmt.where(PaperNote.content.ilike(f"%{q}%"))

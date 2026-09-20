@@ -257,6 +257,7 @@ export function PdfReader({
   jumpTarget,
 }: PdfReaderProps) {
   const queryClient = useQueryClient();
+  const zoteroLibraryId = paper.zotero_library_id ?? libraryId ?? null;
   // 用回调 ref 而不是裸 useRef：滚动容器不是一挂载就存在的（论文原本没有 PDF、
   // 点「获取 PDF」后 pdf_available 才翻 true，容器这时才出现）。effect 只依赖 mode
   // 的话不会重跑，pageWidth 停在 0，一页都不渲染——表现就是整片深色背景。
@@ -283,6 +284,7 @@ export function PdfReader({
   const pageHeights = useRef<Map<number, number>>(new Map()); // 渲染过的实际高度，占位块照它来
   const [pending, setPending] = useState<Pending | null>(null);
   const [pendingStyle, setPendingStyle] = useState<HighlightStyle>('highlight');
+  const [zoteroFetchError, setZoteroFetchError] = useState<string | null>(null);
   const toolbarRef = useRef<HTMLDivElement>(null);
   const wheelAccum = useRef(0); // 捏合/滚轮缩放的手势累积量：攒够一档才缩放，避免频繁重渲染卡顿
 
@@ -474,6 +476,41 @@ export function PdfReader({
       toast(`获取 PDF 失败：${msg}`, 'error');
     },
   });
+
+  const materializeZoteroMutation = useMutation({
+    mutationFn: () => {
+      if (!zoteroLibraryId) throw new Error('ZOTERO_LIBRARY_REQUIRED');
+      return api.materializeZoteroPaper(zoteroLibraryId, paper.id);
+    },
+    onMutate: () => setZoteroFetchError(null),
+    onSuccess: () => {
+      toast(tr('Zotero PDF 已复制到 Polaris，正在打开', 'Zotero PDF copied into Polaris and is opening'), 'ok');
+      setZoteroFetchError(null);
+      void queryClient.invalidateQueries({ queryKey: ['paper-assets', zoteroLibraryId, paper.id] });
+      void queryClient.invalidateQueries({ queryKey: ['paper-content-version', zoteroLibraryId, paper.id] });
+      if (libraryId && libraryId !== zoteroLibraryId) {
+        void queryClient.invalidateQueries({ queryKey: ['paper-assets', libraryId, paper.id] });
+        void queryClient.invalidateQueries({ queryKey: ['paper-content-version', libraryId, paper.id] });
+      }
+      void queryClient.invalidateQueries({ queryKey: ['paper', paper.id] });
+      void queryClient.invalidateQueries({ queryKey: ['papers', zoteroLibraryId] });
+      if (libraryId && libraryId !== zoteroLibraryId) {
+        void queryClient.invalidateQueries({ queryKey: ['papers', libraryId] });
+      }
+    },
+    onError: (error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      setZoteroFetchError(detail);
+      toast(
+        `${tr('无法从 Zotero 取得 PDF', 'Could not get the PDF from Zotero')}：${detail}`,
+        'error',
+      );
+    },
+  });
+
+  useEffect(() => {
+    setZoteroFetchError(null);
+  }, [paper.id, zoteroLibraryId]);
 
   // —— 划词：mouseup 后读取选区，落到某一页并归一化 ——
   const captureSelection = useCallback(() => {
@@ -689,7 +726,16 @@ export function PdfReader({
   // 无 PDF：引导获取（原先靠「先整包下一遍，404 就是没有」判断，现在直接读元数据，
   // 免掉一次无谓的整包下载）
   if (!hasPdf && !assetsQuery.isLoading) {
-    const canFetch = !!paper.arxiv_id;
+    const canFetchZotero = Boolean(
+      zoteroLibraryId
+      && paper.can_materialize_zotero === true
+      && paper.zotero_source
+      && paper.zotero_pdf_status !== 'missing'
+      && paper.zotero_pdf_status !== 'error',
+    );
+    const canFetchArxiv = paper.can_manage_summary === true && !!paper.arxiv_id;
+    const canFetch = canFetchZotero || canFetchArxiv;
+    const fetching = materializeZoteroMutation.isPending || fetchPdfMutation.isPending;
     return (
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <EmptyState
@@ -698,41 +744,85 @@ export function PdfReader({
           desc={
             canFetch
               ? undefined
-              : '这篇论文不是 arXiv 来源，暂时不支持自动下载 PDF，可以通过右上角原文链接查看。'
+              : paper.zotero_source
+                ? paper.can_materialize_zotero === false && zoteroLibraryId
+                  ? tr('你对 Zotero 来源文献库只有读取权限，无法复制该附件。', 'You have read-only access to the Zotero source library and cannot copy its attachment.')
+                  : tr('Zotero 附件未在本机落地或不可用，请先在 Zotero 中下载该 PDF。', 'The Zotero attachment is unavailable locally. Download it in Zotero first.')
+                : tr('这篇论文不是 arXiv 来源，暂时不支持自动下载 PDF，可以通过右上角原文链接查看。', 'This paper is not from arXiv, so Polaris cannot fetch its PDF automatically. Use the source link instead.')
           }
           action={(
-            <div className="row gap8 wrap" style={{ justifyContent: 'center' }}>
-              {canFetch ? (
-                <button
-                  className="btn btn-primary"
-                  disabled={fetchPdfMutation.isPending}
-                  onClick={() => fetchPdfMutation.mutate()}
+            <div className="col gap8" style={{ alignItems: 'center' }}>
+              <div className="row gap8 wrap" style={{ justifyContent: 'center' }}>
+                {canFetchZotero && (
+                  <button
+                    className="btn btn-primary"
+                    disabled={fetching}
+                    onClick={() => materializeZoteroMutation.mutate()}
+                  >
+                    {materializeZoteroMutation.isPending ? (
+                      <>
+                        <Icon name="refresh" size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                        {tr('正在从 Zotero 复制…', 'Copying from Zotero…')}
+                      </>
+                    ) : (
+                      <>
+                        <Icon name="download" size={14} />
+                        {tr('从 Zotero 取得 PDF', 'Get PDF from Zotero')}
+                      </>
+                    )}
+                  </button>
+                )}
+                {canFetchArxiv && (
+                  <button
+                    className={canFetchZotero ? 'btn btn-soft' : 'btn btn-primary'}
+                    disabled={fetching}
+                    onClick={() => fetchPdfMutation.mutate()}
+                  >
+                    {fetchPdfMutation.isPending ? (
+                      <>
+                        <Icon name="refresh" size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                        {tr('正在从 arXiv 下载…', 'Downloading from arXiv…')}
+                      </>
+                    ) : (
+                      <>
+                        <Icon name="download" size={14} />
+                        {tr('从 arXiv 获取', 'Get from arXiv')}
+                      </>
+                    )}
+                  </button>
+                )}
+                {!canFetch && paper.url && (
+                  <a
+                    className="btn btn-ghost"
+                    href={paper.url}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    style={{ textDecoration: 'none' }}
+                  >
+                    <Icon name="link" size={14} />
+                    {tr('打开原文链接', 'Open source link')}
+                  </a>
+                )}
+                {!libraryId && (
+                  <PdfUploadButton
+                    paperId={paper.id}
+                    pdfAvailable={paper.pdf_available}
+                    canManage={paper.can_manage_summary === true}
+                  />
+                )}
+              </div>
+              {zoteroFetchError && (
+                <div
+                  role="alert"
+                  style={{ maxWidth: 520, fontSize: 11.5, lineHeight: 1.6, color: 'var(--danger-tx)' }}
                 >
-                  {fetchPdfMutation.isPending ? (
-                    <>
-                      <Icon name="refresh" size={14} style={{ animation: 'spin 1s linear infinite' }} />
-                      {tr('正在下载…', 'Downloading…')}
-                    </>
-                  ) : (
-                    <>
-                      <Icon name="download" size={14} />
-                      {tr('获取 PDF', 'Fetch PDF')}
-                    </>
-                  )}
-                </button>
-              ) : paper.url ? (
-                <a
-                  className="btn btn-ghost"
-                  href={paper.url}
-                  target="_blank"
-                  rel="noreferrer noopener"
-                  style={{ textDecoration: 'none' }}
-                >
-                  <Icon name="link" size={14} />
-                  {tr('打开原文链接', 'Open source link')}
-                </a>
-              ) : null}
-              {!libraryId && <PdfUploadButton paperId={paper.id} pdfAvailable={paper.pdf_available} />}
+                  {tr('Zotero 复制失败', 'Zotero copy failed')}：{zoteroFetchError}
+                  {' '}
+                  {canFetchArxiv
+                    ? tr('可以改用 arXiv 下载。', 'You can fall back to the arXiv download.')
+                    : tr('请确认附件已在 Zotero 本机下载后重试。', 'Make sure the attachment is downloaded locally in Zotero, then retry.')}
+                </div>
+              )}
             </div>
           )}
         />

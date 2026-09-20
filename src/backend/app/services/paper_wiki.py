@@ -10,9 +10,7 @@ from collections.abc import Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import set_committed_value
 
-from app.models.base import utcnow
 from app.models.paper import Paper, PaperWiki
 from app.models.user import User
 
@@ -24,42 +22,45 @@ async def upsert_wiki(
     content: str,
     model: str | None = None,
     compiled_by: uuid.UUID | None = None,
+    source_level: str | None = None,
+    content_version_id: uuid.UUID | None = None,
+    source_fingerprint: str | None = None,
+    evidence_manifest: dict | None = None,
+    source_library_id: uuid.UUID | None = None,
+    source_project_id: uuid.UUID | None = None,
 ) -> PaperWiki:
-    """写这篇论文的解读：已有则整行覆盖（以最新一次编译为准），没有则新建。
+    """追加一个版本并更新兼容 ``PaperWiki`` 投影（调用方负责 commit）。
 
-    调用方负责 commit。``compiled_by`` 每次覆盖成最新编译的人。
+    ``compiled_by`` 每次覆盖成最新编译的人；失败发生在投影切换前时，旧版本保持可读。
     """
-    # 显式查行，不依赖 paper.wiki 是否已加载（刚 refresh 过的对象上读关系会隐式发 SQL）
-    wiki = (
-        await session.execute(select(PaperWiki).where(PaperWiki.paper_id == paper.id))
-    ).scalar_one_or_none()
-    if wiki is None:
-        wiki = PaperWiki(
-            paper_id=paper.id, content=content, model=model, compiled_by=compiled_by
-        )
-        session.add(wiki)
-    else:
-        wiki.content = content
-        wiki.model = model
-        wiki.compiled_by = compiled_by
-        wiki.updated_at = utcnow()  # 内容不变时也算一次新编译
-    # 解读里的 ## TL;DR 是这篇论文**权威的**一句话总结：编译提示词不带任何库的方向
-    # 陈述或 rubric，所以它对全平台是同一份。同步回 paper.tldr，覆盖掉打分阶段可能
-    # 留下的临时占位——那份是对着某一个库的方向写的，不该被别的库当成论文摘要看。
-    from app.services.obsidian_vault_sync import extract_tldr
+    from app.services.paper_summaries import append_ready_revision, extract_tldr
 
-    if (compiled_tldr := extract_tldr(content)):
-        paper.tldr = compiled_tldr
-    await session.flush()
-    # 内存里的 paper 跟上（后续 link_paper_concepts / 出参都直接读 paper.wiki_content）
-    set_committed_value(paper, "wiki", wiki)
+    compiled_tldr = extract_tldr(content)
+    wiki, _revision = await append_ready_revision(
+        session,
+        paper=paper,
+        content=content,
+        model=model,
+        created_by=compiled_by,
+        source_level=source_level,
+        content_version_id=content_version_id,
+        source_fingerprint=source_fingerprint,
+        evidence_manifest=evidence_manifest,
+        source_library_id=source_library_id,
+        source_project_id=source_project_id,
+    )
+    # Keep this compatibility projection explicit at the legacy write boundary: callers outside
+    # the versioned summary API still expect the latest compiled TL;DR on the Paper row.
+    paper.tldr = compiled_tldr
     return wiki
 
 
 
 async def content_for(session: AsyncSession, paper_id: uuid.UUID) -> str | None:
     """单篇解读正文（没有则 None）；只有 paper_id、拿不到 Paper 对象时用。"""
-    stmt = select(PaperWiki.content).where(PaperWiki.paper_id == paper_id)
+    stmt = select(PaperWiki.content).where(
+        PaperWiki.paper_id == paper_id, PaperWiki.deleted_at.is_(None)
+    )
     return (await session.execute(stmt)).scalar_one_or_none()
 
 

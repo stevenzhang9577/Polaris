@@ -100,6 +100,19 @@ async def delete_note(
     await notes_service.delete_note(session, note)
 
 
+@router.post("/notes/{note_id}/restore", response_model=NoteRead)
+async def restore_note(
+    note_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+) -> NoteRead:
+    row = await notes_service.restore_own_note(session, note_id=note_id, user=user)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOTE_NOT_FOUND")
+    note, author_name = row
+    return _note_read(note, author_name)
+
+
 @router.get("/projects/{project_id}/notes", response_model=NotebookPage)
 async def project_notebook(
     project_id: uuid.UUID,

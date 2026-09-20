@@ -261,7 +261,10 @@ async def _export_notes(
         await session.execute(
             select(PaperNote, Paper)
             .join(Paper, Paper.id == PaperNote.paper_id)
-            .where(PaperNote.author_id == user_id)
+            .where(
+                PaperNote.author_id == user_id,
+                PaperNote.deleted_at.is_(None),
+            )
             .order_by(PaperNote.created_at)
         )
     ).all()

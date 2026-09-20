@@ -9,6 +9,8 @@
         "name": "Probe, Golden"
       }
     ],
+    "can_manage_summary": true,
+    "can_materialize_zotero": false,
     "compiled_at": null,
     "compiled_by_name": null,
     "compiled_model": null,
@@ -36,7 +38,11 @@
     "url": null,
     "venue": "Journal of Reproducible Plumbing",
     "wiki_content": null,
-    "year": 2026
+    "year": 2026,
+    "zotero_item_key": null,
+    "zotero_library_id": null,
+    "zotero_pdf_status": null,
+    "zotero_source": false
   },
   "add_paper_two": {
     "abstract": "Synthetic record two: structured agent planning evidence with grounded citations for the deterministic golden harness.",
@@ -48,6 +54,8 @@
         "name": "Chain, Import"
       }
     ],
+    "can_manage_summary": true,
+    "can_materialize_zotero": false,
     "compiled_at": null,
     "compiled_by_name": null,
     "compiled_model": null,
@@ -75,7 +83,11 @@
     "url": null,
     "venue": "Journal of Reproducible Plumbing",
     "wiki_content": null,
-    "year": 2026
+    "year": 2026,
+    "zotero_item_key": null,
+    "zotero_library_id": null,
+    "zotero_pdf_status": null,
+    "zotero_source": false
   },
   "create_discovery": {
     "budget": null,

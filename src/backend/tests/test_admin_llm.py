@@ -249,6 +249,7 @@ async def test_routes_put_get_and_validation(client):
             "provider_id": provider_id,
             "model": "fake-strong",
             "temperature": 0.2,
+            "context_window": 200000,
         },
     ]
     resp = await client.put("/api/admin/llm/routes", json=routes, headers=admin)
@@ -258,6 +259,7 @@ async def test_routes_put_get_and_validation(client):
     # 未显式给 temperature 时为 None（= 不向模型发送该参数，新款 Claude 已弃用它）
     assert got["default"]["temperature"] is None
     assert got["navigator"]["temperature"] == 0.2
+    assert got["navigator"]["context_window"] == 200000
 
     resp = await client.get("/api/admin/llm/routes", headers=admin)
     assert len(resp.json()) == 2
@@ -473,6 +475,44 @@ async def test_test_model_anthropic_custom_user_agent(client):
     llm = router._provider_for(resolved, "default")
     assert llm._headers()["user-agent"] == "claude-cli/test"  # type: ignore[attr-defined]
     await llm.aclose()
+
+
+@respx.mock
+async def test_test_model_anthropic_bearer_auth(client):
+    admin, _ = await _admin_and_member(client)
+    resp = await client.post(
+        "/api/admin/llm/providers",
+        json={
+            "name": "claude-bearer",
+            "kind": "anthropic",
+            "transport": "anthropic_messages",
+            "auth_scheme": "bearer",
+            "base_url": "http://claude-bearer.test/v1",
+            "api_key": API_KEY,
+        },
+        headers=admin,
+    )
+    assert resp.status_code == 201, resp.text
+    route = respx.post("http://claude-bearer.test/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "model": "claude-test",
+                "content": [{"type": "text", "text": "pong"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+    )
+    result = await client.post(
+        "/api/admin/llm/test-model",
+        json={"provider_id": resp.json()["id"], "model": "claude-test"},
+        headers=admin,
+    )
+    assert result.status_code == 200
+    assert result.json()["ok"] is True
+    assert route.calls.last.request.headers["authorization"] == f"Bearer {API_KEY}"
+    assert "x-api-key" not in route.calls.last.request.headers
 
 
 @respx.mock

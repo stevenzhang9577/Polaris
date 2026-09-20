@@ -244,8 +244,11 @@ async def resolve_evidence_anchor(
     *,
     current_chunks: Sequence[PaperContentChunk] | None = None,
 ) -> EvidenceResolution:
-    chunks = list(current_chunks or [])
-    if not chunks:
+    # ``None`` means the caller did not scope resolution and wants the paper-global
+    # current version.  An explicit empty sequence means an authorization-aware
+    # caller found no readable chunks; never widen that to global content.
+    chunks = list(current_chunks) if current_chunks is not None else []
+    if current_chunks is None:
         chunks = list(
             (
                 await session.execute(
@@ -318,15 +321,21 @@ async def current_fulltext_evidence(
 ) -> dict[str, Any] | None:
     """Return current parsed chunks with sentence anchors for agent and MCP tools."""
     version_query = select(PaperContentVersion).where(
-            PaperContentVersion.paper_id == paper_id,
-            PaperContentVersion.is_current.is_(True),
-            PaperContentVersion.status.in_(_READY_CONTENT_STATUSES),
-        )
+        PaperContentVersion.paper_id == paper_id,
+        PaperContentVersion.status.in_(_READY_CONTENT_STATUSES),
+    )
     if library_ids is not None:
         if not library_ids:
             return None
         version_query = version_query.where(_asset_grant_exists(library_ids))
-    version = await session.scalar(version_query)
+    else:
+        version_query = version_query.where(PaperContentVersion.is_current.is_(True))
+    version = await session.scalar(
+        version_query.order_by(
+            PaperContentVersion.is_current.desc(),
+            PaperContentVersion.version_no.desc(),
+        ).limit(1)
+    )
     if version is None:
         return None
     page_size = max(1, min(limit, 20))

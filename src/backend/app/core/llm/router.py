@@ -33,6 +33,7 @@ from app.core.llm.base import (
 )
 from app.core.llm.fake import FakeProvider, estimate_tokens
 from app.core.llm.openai_compat import OpenAICompatProvider
+from app.core.llm.openai_responses import OpenAIResponsesProvider
 from app.core.security import decrypt_secret
 
 logger = logging.getLogger(__name__)
@@ -216,6 +217,8 @@ class ResolvedRoute:
     api_key: str
     model: str
     temperature: float | None
+    transport: str = "chat_completions"
+    auth_scheme: str = "bearer"
     provider_name: str = "fake"  # 管理端 provider 名称（调用日志用）
     user_agent: str | None = None  # Provider 级客户端标识；None = HTTP 客户端默认值
     effort: EffortLevel | None = None  # 推理档位，None = 不发送该参数（用模型默认）
@@ -231,6 +234,8 @@ _FALLBACK_ROUTE = ResolvedRoute(
     api_key="",
     model="fake-default",
     temperature=0.0,
+    transport="fake",
+    auth_scheme="none",
     provider_name="fake",
     effort=None,
 )
@@ -350,9 +355,12 @@ def call_profile(stage: str) -> tuple[float, int]:
     return _SHORT_CALL
 
 
-#: provider 客户端缓存的键：(kind, base_url, api_key, user_agent, timeout, attempts)。
+#: provider 客户端缓存的键：
+#: (kind, transport, auth_scheme, base_url, api_key, user_agent, timeout, attempts).
 #: 与 ``_provider_for`` 构造键的地方保持一致。
-_ProviderKey = dict[tuple[str, str | None, str, str | None, float, int], LLMProvider]
+_ProviderKey = dict[
+    tuple[str, str, str, str | None, str, str | None, float, int], LLMProvider
+]
 
 
 class LLMRouter:
@@ -422,6 +430,8 @@ class LLMRouter:
                 )
                 routes[route.stage] = ResolvedRoute(
                     provider_kind=provider.kind,
+                    transport=provider.transport,
+                    auth_scheme=provider.auth_scheme,
                     base_url=provider.base_url,
                     api_key=api_key,
                     model=route.model,
@@ -487,6 +497,8 @@ class LLMRouter:
         timeout, attempts = call_profile(stage)
         key = (
             route.provider_kind,
+            route.transport,
+            route.auth_scheme,
             route.base_url,
             route.api_key,
             route.user_agent,
@@ -494,11 +506,21 @@ class LLMRouter:
             attempts,
         )
         if key not in self._providers:
-            if route.provider_kind == "openai_compat":
+            if route.provider_kind == "openai_compat" and route.transport == "responses":
+                base_url = route.base_url or get_settings().openai_compat_base_url
+                self._providers[key] = OpenAIResponsesProvider(
+                    base_url=base_url,
+                    api_key=route.api_key,
+                    auth_scheme=route.auth_scheme,
+                    timeout=timeout,
+                    max_attempts=attempts,
+                )
+            elif route.provider_kind == "openai_compat":
                 base_url = route.base_url or get_settings().openai_compat_base_url
                 self._providers[key] = OpenAICompatProvider(
                     base_url=base_url,
                     api_key=route.api_key,
+                    auth_scheme=route.auth_scheme,
                     timeout=timeout,
                     max_attempts=attempts,
                 )
@@ -507,6 +529,7 @@ class LLMRouter:
                     api_key=route.api_key,
                     base_url=route.base_url,
                     user_agent=route.user_agent,
+                    auth_scheme=route.auth_scheme,
                     timeout=timeout,
                 )
             elif route.provider_kind == "fake":

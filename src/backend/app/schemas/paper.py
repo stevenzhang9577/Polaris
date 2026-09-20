@@ -109,6 +109,12 @@ class PaperDetail(PaperRead):
     # 最后一次编译解读的人（显示名）；存量数据 / 用户已删为 null。重新编译前提示用
     compiled_by_name: str | None = None
     pdf_available: bool = False
+    zotero_source: bool = False
+    zotero_item_key: str | None = None
+    zotero_pdf_status: Literal["on_demand", "materialized", "missing", "error"] | None = None
+    zotero_library_id: uuid.UUID | None = None
+    can_materialize_zotero: bool = False
+    can_manage_summary: bool = False
     concepts: list[PaperConceptRead] = []
     figures: list[PaperFigure] = []
     # 手动添加后启动的后台补全任务 id（下载/抽取/向量化/打分）；无需补全时为 null。
@@ -119,6 +125,47 @@ class PaperDetail(PaperRead):
     @classmethod
     def _figures(cls, v: Any) -> Any:
         return v or []
+
+
+class PaperSummaryRevisionRead(BaseModel):
+    """One immutable summary revision, including queued/failed generation attempts."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    paper_id: uuid.UUID
+    content_version_id: uuid.UUID | None
+    source_level: Literal["fulltext", "abstract", "obsidian", "legacy"]
+    content: str | None
+    tldr: str | None
+    model: str | None
+    prompt_version: str | None
+    schema_version: str | None
+    created_by: uuid.UUID | None
+    source_fingerprint: str | None
+    evidence_manifest: dict[str, Any] | None
+    status: Literal["queued", "generating", "ready", "failed", "stale"]
+    stage: Literal["materialize", "parse", "compile", "project", "complete"] | None
+    error_code: str | None
+    error_detail: str | None
+    is_current: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+
+class PaperSummaryRead(BaseModel):
+    paper_id: uuid.UUID
+    current_revision: PaperSummaryRevisionRead
+    stale: bool
+    deleted_at: datetime | None = None
+    restore_until: datetime | None = None
+
+
+class PaperSummaryQueued(BaseModel):
+    paper_id: uuid.UUID
+    revision_id: uuid.UUID
+    status: Literal["queued", "generating"]
+    stage: Literal["materialize", "parse", "compile", "project"]
 
 
 class PaperCitationItem(BaseModel):

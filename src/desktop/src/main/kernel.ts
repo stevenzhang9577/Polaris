@@ -24,7 +24,7 @@
      两者都不成立（开发态未设 env）时不注入，条目保持 disabled，走远端流程。
    ============================================================ */
 
-import { app } from 'electron';
+import { app, safeStorage } from 'electron';
 
 import {
   createPluginHost,
@@ -39,6 +39,12 @@ import {
 
 import type { EngineBootstrapStatus, KernelStatus, LocalBackendInfo } from '../shared/contract';
 import { bootstrapEngine } from './engine-bootstrap';
+import {
+  configuredEngineEncryptionKey,
+  LEGACY_ENGINE_SECRETS_ERROR,
+  loadOrCreateEngineEncryptionKey,
+  withEngineEncryptionKey,
+} from './engine-secret';
 
 let kernel: Kernel | null = null;
 
@@ -187,8 +193,40 @@ async function doStartKernel(): Promise<Kernel> {
     const entry = configTree.store['legacy-engine'];
     if (entry) {
       try {
-        await entry.update({ config: engine, disabled: null });
+        if (engine.mode === 'command') {
+          // 只在 entry.update 内的同步 spawn 窗口注入；子进程拿到 env 副本后立即
+          // 从 Electron 主进程 env 恢复/删除。密钥既不进 command argv（ps 看不到），
+          // 也不进持久配置树。显式 env 是开发/运维覆盖，否则使用每安装随机 key。
+          const encryptionKey = configuredEngineEncryptionKey()
+            ?? loadOrCreateEngineEncryptionKey({
+              dataDir: app.getPath('userData'),
+              platform: process.platform,
+              safeStorage,
+              // 当前 macOS 包是 ad-hoc 签名；safeStorage 的 Keychain ACL 会随每次
+              // 构建变化并反复弹授权框。专用 0600 fallback 的边界见 engine-secret。
+              allowSafeStorage: process.platform !== 'darwin',
+            });
+          await withEngineEncryptionKey(
+            encryptionKey,
+            () => entry.update({ config: engine, disabled: null }),
+          );
+        } else {
+          // docker: 是开发/测试显式覆盖，不是发行路径；其 env 白名单由 kernel
+          // 插件维护，桌面壳不能把 secret 塞进配置树或 argv。生产内嵌引擎始终
+          // 是上面的 command 模式，安全密钥链路在那里强制生效。
+          await entry.update({ config: engine, disabled: null });
+        }
       } catch (err) {
+        if (err instanceof Error && err.message.includes(LEGACY_ENGINE_SECRETS_ERROR)) {
+          // 给首启等待页一个可操作、已脱敏的诊断；数据库与旧密文原样保留。
+          // 其余启动错误仍只进本地日志，避免把底层命令/路径意外暴露给 renderer。
+          bootstrapStatus = {
+            phase: 'failed',
+            done: true,
+            errorCode: LEGACY_ENGINE_SECRETS_ERROR,
+            message: '检测到旧版加密凭据，已在创建新密钥前停止升级；数据库未修改。请用原 POLARIS_ENCRYPTION_KEY 重新启动，并在完成凭据重加密前保留原密钥和本机数据。',
+          };
+        }
         // 失败时 Entry.update 自己把 options 回滚到 disabled 且不落库，
         // 用户树不被污染；这里照旧记录错误后回落远端服务器流程。
         console.error('[kernel] 本地引擎启动失败，回落远端流程：', err);

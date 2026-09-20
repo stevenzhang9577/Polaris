@@ -172,6 +172,7 @@ async def build_obsidian_zip_for_libraries(
         .where(
             PaperNote.author_id == user_id,
             PaperNote.paper_id.in_([p.id for p in papers]),
+            PaperNote.deleted_at.is_(None),
         )
         .order_by(PaperNote.created_at)
     )

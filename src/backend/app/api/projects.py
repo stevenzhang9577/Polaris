@@ -3,10 +3,12 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import current_active_user
 from app.core.db import get_session
+from app.models.library_direction import DirectionLibrary
 from app.models.project import Project
 from app.models.user import User
 from app.schemas.libraries import DirectionLibrarySummary, SourceLibrariesUpdate
@@ -110,8 +112,20 @@ async def set_source_libraries(
     关联为空时想法生成/检索/图谱/伴读等消费端给「还没关联文献库」空态，不报错。
     """
     await _get_my_project(session, project_id, user)
+    linkable_ids = set(
+        (
+            await session.execute(
+                select(DirectionLibrary.id).where(
+                    DirectionLibrary.id.in_(data.library_ids),
+                    libraries_service.linkable_library_clause(user.id),
+                )
+            )
+        ).scalars()
+    )
     await libraries_service.set_source_libraries(
-        session, topic_id=project_id, library_ids=data.library_ids
+        session,
+        topic_id=project_id,
+        library_ids=[library_id for library_id in data.library_ids if library_id in linkable_ids],
     )
     await session.commit()
     rows = await libraries_service.source_libraries_overview(

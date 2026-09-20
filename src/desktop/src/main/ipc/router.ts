@@ -59,6 +59,7 @@ const HANDLERS: Record<MethodName, Handler> = {
   'host.openExternal': (p) => host.openExternal(asString(p, 'url')),
   'host.copyText': (p) => host.copyText(asString(p, 'text')),
   'host.setBadgeCount': (p) => host.setBadgeCount(asNumber(p, 'count')),
+  'host.pickDirectory': (p) => host.pickDirectory(asString(p, 'purpose')),
   'host.capabilities': () => capabilityManifest(),
   'host.update.check': () => checkForUpdate(),
   'host.update.apply': () => applyUpdate(),

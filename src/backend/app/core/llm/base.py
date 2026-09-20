@@ -74,7 +74,27 @@ class ToolResultBlock:
     is_error: bool = False
 
 
-ContentBlock = TextBlock | ImageBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock
+@dataclass(slots=True, frozen=True)
+class OpaqueProviderStateBlock:
+    """Provider-private continuation state that must never be rendered or logged.
+
+    Responses reasoning models require their encrypted reasoning item to be
+    replayed before a function result.  The payload is deliberately opaque to
+    Polaris and ``repr=False`` prevents accidental diagnostic disclosure.
+    """
+
+    provider: str
+    payload: dict[str, Any] = field(repr=False)
+
+
+ContentBlock = (
+    TextBlock
+    | ImageBlock
+    | ThinkingBlock
+    | ToolUseBlock
+    | ToolResultBlock
+    | OpaqueProviderStateBlock
+)
 
 
 def _block_text(block: ContentBlock) -> str:
@@ -87,6 +107,8 @@ def _block_text(block: ContentBlock) -> str:
         return f"[调用 {block.name} {json.dumps(block.input, ensure_ascii=False)}]"
     if isinstance(block, ToolResultBlock):
         return f"[工具结果] {block.content}"
+    if isinstance(block, OpaqueProviderStateBlock):
+        return ""
     return f"[图片 {block.mime}]"
 
 
@@ -170,12 +192,28 @@ class ToolUseStop:
 
 
 @dataclass(slots=True, frozen=True)
+class OpaqueProviderState:
+    """Internal stream event; consumers must not forward its payload to UI/logs."""
+
+    provider: str
+    payload: dict[str, Any] = field(repr=False)
+
+
+@dataclass(slots=True, frozen=True)
 class StreamDone:
     finish_reason: str | None = None
     usage: dict[str, int] = field(default_factory=dict)
 
 
-StreamEvent = TextDelta | ThinkingDelta | ToolUseStart | ToolUseArgsDelta | ToolUseStop | StreamDone
+StreamEvent = (
+    TextDelta
+    | ThinkingDelta
+    | ToolUseStart
+    | ToolUseArgsDelta
+    | ToolUseStop
+    | OpaqueProviderState
+    | StreamDone
+)
 
 
 def normalize_finish_reason(raw: str | None) -> str | None:

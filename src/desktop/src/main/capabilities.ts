@@ -10,6 +10,8 @@ import { promisify } from 'node:util';
 
 import {
   CAPABILITY_LATEX_COMPILE,
+  CAPABILITY_LLM_LOCAL_CONFIG_IMPORT,
+  CAPABILITY_OBSIDIAN_VAULT_SYNC,
   CAPABILITY_PLUGINS_MANAGE,
   CONTRACT_VERSION,
   type CapabilityManifest,
@@ -61,6 +63,10 @@ export async function capabilityManifest(): Promise<CapabilityManifest> {
         detail: tectonicProbe,
       },
       [CAPABILITY_PLUGINS_MANAGE]: pluginsManageState(),
+      [CAPABILITY_OBSIDIAN_VAULT_SYNC]: { available: true },
+      // 配置文件由本地 FastAPI 按固定白名单路径读取；这里仅声明 Desktop
+      // 宿主形态支持该入口，不增加可被 renderer 滥用的任意文件读取 IPC。
+      [CAPABILITY_LLM_LOCAL_CONFIG_IMPORT]: { available: true },
     },
   };
 }

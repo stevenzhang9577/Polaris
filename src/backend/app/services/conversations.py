@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.llm.base import (
     ContentBlock,
     Message,
+    OpaqueProviderStateBlock,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -45,6 +46,11 @@ def blocks_to_json(blocks: tuple[ContentBlock, ...] | list[ContentBlock]) -> lis
     """
     out: list[dict[str, Any]] = []
     for b in blocks:
+        if isinstance(b, OpaqueProviderStateBlock):
+            # It is needed only between tool rounds of the active in-memory
+            # response. Never expose encrypted provider state through the
+            # conversation API or retain it in application logs.
+            continue
         if isinstance(b, TextBlock):
             out.append({"kind": "text", "text": b.text})
         elif isinstance(b, ThinkingBlock):

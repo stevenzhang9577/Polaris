@@ -17,6 +17,9 @@ from app.schemas.llm_admin import (
     CallLogPage,
     CallLogRow,
     CallLogSettings,
+    LocalConfigDiscovery,
+    LocalConfigImportRequest,
+    LocalConfigImportResult,
     ProviderCreate,
     ProviderRead,
     ProviderUpdate,
@@ -26,6 +29,7 @@ from app.schemas.llm_admin import (
     UsageRow,
 )
 from app.services import llm_admin as llm_admin_service
+from app.services import llm_local_config as local_config_service
 from app.services.owner import is_owner, require_owner
 
 router = APIRouter(prefix="/admin/llm", tags=["admin-llm"])
@@ -52,11 +56,17 @@ def _provider_read(provider: LLMProviderConfig) -> ProviderRead:
         id=provider.id,
         name=provider.name,
         kind=provider.kind,
+        transport=provider.transport,
+        auth_scheme=provider.auth_scheme,
         base_url=provider.base_url,
         user_agent=provider.user_agent,
         api_key_masked=llm_admin_service.masked_key_of(provider),
         enabled=provider.enabled,
         models=provider.models,
+        import_source=provider.import_source,
+        import_source_key=provider.import_source_key,
+        import_fingerprint=provider.import_fingerprint,
+        imported_at=provider.imported_at,
     )
 
 
@@ -86,6 +96,8 @@ async def create_provider(
 ) -> ProviderRead:
     try:
         provider = await llm_admin_service.create_provider(session, data, scope)
+    except llm_admin_service.InvalidProviderError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     except IntegrityError as e:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="PROVIDER_NAME_EXISTS") from e
     return _provider_read(provider)
@@ -99,7 +111,10 @@ async def update_provider(
     scope: uuid.UUID | None = Depends(config_scope),
 ) -> ProviderRead:
     provider = await _get_provider_or_404(session, provider_id, scope)
-    provider = await llm_admin_service.update_provider(session, provider, data)
+    try:
+        provider = await llm_admin_service.update_provider(session, provider, data)
+    except llm_admin_service.InvalidProviderError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     return _provider_read(provider)
 
 
@@ -147,6 +162,59 @@ async def test_model(
         provider, data.model, data.capability
     )
     return TestModelResult(ok=ok, latency_ms=latency_ms, error=error)
+
+
+@router.get("/local-configs", response_model=LocalConfigDiscovery)
+async def discover_local_configs(
+    session: AsyncSession = Depends(get_session),
+    scope: uuid.UUID | None = Depends(config_scope),
+) -> LocalConfigDiscovery:
+    """Discover redacted user-level Codex and Claude Code configs (Desktop only)."""
+    try:
+        configs, errors = await local_config_service.previews(session, scope)
+    except local_config_service.DesktopOnlyError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    return LocalConfigDiscovery(configs=configs, errors=errors)
+
+
+@router.post("/local-configs/import", response_model=LocalConfigImportResult)
+async def import_local_config(
+    data: LocalConfigImportRequest,
+    session: AsyncSession = Depends(get_session),
+    scope: uuid.UUID | None = Depends(config_scope),
+) -> LocalConfigImportResult:
+    """Probe and transactionally merge a local config into selected model routes."""
+    try:
+        result = await local_config_service.import_local_config(
+            session,
+            owner_id=scope,
+            source=data.source,
+            source_key=data.source_key,
+            stages=data.stages,
+            overwrite_routes=data.overwrite_routes,
+        )
+    except local_config_service.DesktopOnlyError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except local_config_service.LocalConfigNotFoundError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except local_config_service.LocalConfigInvalidError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except local_config_service.LocalConfigProbeError as e:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "LLM_LOCAL_CONFIG_PROBE_FAILED", "error": str(e)},
+        ) from e
+    except IntegrityError as e:
+        await session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="LLM_LOCAL_CONFIG_CONFLICT") from e
+    return LocalConfigImportResult(
+        provider=_provider_read(result.provider),
+        routes=local_config_service.route_items(result.routes),
+        created=result.created,
+        updated_stages=result.updated_stages,
+        skipped_stages=result.skipped_stages,
+        probe=TestModelResult(ok=True, latency_ms=result.latency_ms, error=None),
+    )
 
 
 @router.get("/usage", response_model=list[UsageRow])

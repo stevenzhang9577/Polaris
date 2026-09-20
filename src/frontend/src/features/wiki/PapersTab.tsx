@@ -8,7 +8,6 @@ import { RelevanceBar } from '../../components/ui/RelevanceBar';
 import { ScoreRing } from '../../components/ui/ScoreRing';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { Modal } from '../../components/ui/Modal';
-import { ConfirmModal } from '../../components/ui/ConfirmModal';
 import { FigureEmbed, FiguresSection, hasEmbeddedFigures, usePaperFigures } from '../../components/ui/FigureGallery';
 import { CompileBadge } from '../../components/ui/CompileBadge';
 import { citationExportItems, ExportDropdown } from '../../components/ui/ExportDropdown';
@@ -36,7 +35,7 @@ import {
   type SearchMode,
 } from '../../lib/api';
 import { tr } from '../../lib/i18n';
-import { usePendingByPaper } from '../../lib/pending';
+import { localOrigin } from '../../lib/endpoint';
 import {
   AffiliationChips,
   AuthorLinks,
@@ -57,6 +56,8 @@ import { clampLines } from '../../lib/clamp';
 import { splitPaperInput } from './paperInput';
 import { ExtensionBatchHistoryModal } from './ExtensionBatchHistoryModal';
 import { ComparisonModal } from './ComparisonModal';
+import { ZoteroLocalSyncModal } from './ZoteroLocalSyncModal';
+import { PaperSummaryPanel } from './PaperSummaryPanel';
 
 /* ============================================================
    论文库 Tab：左列表（过滤/搜索/排序/加载更多 + 添加文献/导出）
@@ -798,8 +799,6 @@ function PaperDetailPane({
   onFilterAuthor,
   onFilterAffiliation,
   onDeleted,
-  compiling,
-  onRecompile,
   sendingToExtension,
   onSendToExtension,
 }: {
@@ -815,9 +814,6 @@ function PaperDetailPane({
   onFilterAffiliation: (name: string) => void;
   /** 删除成功后回调（父组件清空选中，自动跳到列表第一篇） */
   onDeleted: () => void;
-  /** 这篇正在 AI 编译（状态存在列表页，切走再切回来照样是「编译中」） */
-  compiling: boolean;
-  onRecompile: (paperId: string) => void;
   sendingToExtension: boolean;
   onSendToExtension: (paper: PaperDetail) => void;
 }) {
@@ -828,8 +824,6 @@ function PaperDetailPane({
   const [conceptsOpen, setConceptsOpen] = useState(false);
   const [readerOpen, setReaderOpen] = useState(false);
   const [readerPrint, setReaderPrint] = useState(false);
-  // 已有解读时重新编译要先确认：解读每篇只有一份，重编即覆盖，旧版本找不回来
-  const [recompileConfirm, setRecompileConfirm] = useState(false);
 
   // 作用域读：锁定当前库/课题那份成员行，避免同一论文属多个库时读到跨库归并的错行
   // （相关度/状态/wiki）。queryKey 带 scope 隔离不同库的缓存。
@@ -881,7 +875,6 @@ function PaperDetailPane({
   useEffect(() => {
     setConceptsOpen(false);
     setReaderOpen(false);
-    setRecompileConfirm(false);
   }, [paperId]);
 
   // 正文 ![[fig:N]] 嵌入图（docs/task-system.md §7（原 api-lit.md §6.6））
@@ -948,6 +941,21 @@ function PaperDetailPane({
                 PDF
               </span>
             )}
+            {paper.zotero_source && (
+              <span
+                className="pill sm"
+                title={paper.zotero_item_key ? `Zotero ${paper.zotero_item_key}` : 'Zotero'}
+                style={{ background: 'var(--surface-3)', color: 'var(--text-2)' }}
+              >
+                Zotero · {paper.zotero_pdf_status === 'materialized'
+                  ? tr('PDF 已复制', 'PDF copied')
+                  : paper.zotero_pdf_status === 'missing'
+                    ? tr('已移出 Collection', 'Removed from collection')
+                    : paper.zotero_pdf_status === 'error'
+                      ? tr('同步异常', 'Sync error')
+                      : tr('PDF 按需复制', 'PDF on demand')}
+              </span>
+            )}
             {(paper.note_count ?? 0) > 0 && (
               <span className="pill sm" style={{ background: 'var(--surface-3)', color: 'var(--text-2)' }}>
                 <Icon name="pen" size={10} />
@@ -971,28 +979,6 @@ function PaperDetailPane({
         <button className="btn btn-primary sm" onClick={() => navigate(`/papers/${paper.id}/read`, { state: readerFrom(location, 'wiki') })}>
           <Icon name="file" size={13} />
           {tr('阅读原文', 'Read original')}
-        </button>
-        <button
-          className="btn btn-soft sm"
-          title={
-            paper.has_wiki
-              ? tr('用最新的图文模式重写这篇介绍', 'Rewrite this intro with the latest text+figures mode')
-              : tr('AI 精读并编译图文介绍', 'Have the AI read and compile an illustrated intro')
-          }
-          disabled={compiling}
-          onClick={() => (paper.has_wiki ? setRecompileConfirm(true) : onRecompile(paperId))}
-        >
-          {compiling ? (
-            <>
-              <Icon name="refresh" size={13} style={{ animation: 'spin 1s linear infinite' }} />
-              {tr('AI 编译中，约 1 分钟…', 'Compiling — about a minute…')}
-            </>
-          ) : (
-            <>
-              <Icon name="sparkle" size={13} />
-              {paper.has_wiki ? tr('重新编译', 'Recompile') : tr('编译', 'Compile')}
-            </>
-          )}
         </button>
         {paper.has_wiki && paper.wiki_content && (
           <button
@@ -1056,7 +1042,13 @@ function PaperDetailPane({
             {tr('推送扩展', 'Send to extension')}
           </button>
         )}
-          {!libraryId && <PdfUploadButton paperId={paper.id} pdfAvailable={paper.pdf_available} />}
+          {!libraryId && (
+            <PdfUploadButton
+              paperId={paper.id}
+              pdfAvailable={paper.pdf_available}
+              canManage={paper.can_manage_summary === true}
+            />
+          )}
         </div>
 
         {libraryId && (
@@ -1067,6 +1059,11 @@ function PaperDetailPane({
             canManage={canManage}
           />
         )}
+
+        <PaperSummaryPanel
+          paperId={paper.id}
+          canManage={paper.can_manage_summary ?? canManage}
+        />
 
       {/* —— 个人状态：星标 + 阅读状态 —— */}
       <div className="row gap12 wrap" style={{ marginTop: 12 }}>
@@ -1211,7 +1208,7 @@ function PaperDetailPane({
             >
               <div className="row gap8">
                 <span className="mono" style={{ fontSize: 11, color: 'var(--text-4)', letterSpacing: '0.04em' }}>
-                  {tr('AI 图文介绍', 'AI intro')}
+                  {tr('论文总结', 'Paper summary')}
                 </span>
                 <CompileBadge model={paper.compiled_model} at={paper.compiled_at} />
               </div>
@@ -1251,8 +1248,8 @@ function PaperDetailPane({
           <EmptyState
             compact
             icon="pen"
-            title={tr('还没有 AI 介绍', 'No AI intro yet')}
-            desc={tr('点上方的编译让 AI 精读并生成。', 'Use “Compile” above to have the AI read it and write one.')}
+            title={tr('还没有论文总结', 'No paper summary yet')}
+            desc={tr('点击上方“生成总结”，Polaris 会优先读取全文；没有 PDF 时会明确标注为摘要级。', 'Choose “Generate summary” above. Polaris prefers full text and clearly marks abstract-only results when no PDF is available.')}
           />
         )}
       </div>
@@ -1272,22 +1269,6 @@ function PaperDetailPane({
         />
       )}
 
-      {/* 覆盖确认：解读每篇一份，重编会顶掉现有那份，且没有历史版本 */}
-      <ConfirmModal
-        open={recompileConfirm}
-        onClose={() => setRecompileConfirm(false)}
-        title={tr('重新编译解读', 'Recompile the wiki')}
-        message={tr(
-          `现有解读由 ${paper.compiled_by_name ?? '未知用户'} 在 ${paper.compiled_at ? fmtTime(paper.compiled_at) : '未知时间'} 用 ${paper.compiled_model ?? '未知模型'} 编译，重新编译会覆盖它，旧的找不回来。`,
-          `The current wiki was compiled by ${paper.compiled_by_name ?? 'an unknown user'} at ${paper.compiled_at ? fmtTime(paper.compiled_at) : 'an unknown time'} with ${paper.compiled_model ?? 'an unknown model'}. Recompiling overwrites it — the old one cannot be recovered.`,
-        )}
-        confirmText={tr('重新编译', 'Recompile')}
-        danger
-        onConfirm={() => {
-          setRecompileConfirm(false);
-          onRecompile(paperId);
-        }}
-      />
     </div>
   );
 }
@@ -1295,6 +1276,7 @@ function PaperDetailPane({
 /* ---------------- Tab 主体 ---------------- */
 
 export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSelect, onOpenConcept, onWikiLink, advSeed }: PapersTabProps) {
+  const zoteroLocalAvailable = localOrigin() !== null;
   const scopeId = libraryId ?? pid ?? '';
   const [view, setView] = useState<ViewFilter>('all');
   const [sort, setSort] = useState<PaperSort>('relevance');
@@ -1306,6 +1288,7 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
   const [myTagFilter, setMyTagFilter] = useState('');
   const [readingFilter, setReadingFilter] = useState<'' | ReadingStatus>('');
   const [addOpen, setAddOpen] = useState(false);
+  const [zoteroOpen, setZoteroOpen] = useState(false);
   // 高级检索（作者/机构/发表时间/入库时间）
   const [advOpen, setAdvOpen] = useState(false);
   const [advAuthor, setAdvAuthor] = useState('');
@@ -1363,26 +1346,6 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
     setSelected(new Set());
     setSelectMode(false);
   }, [scopeId, view, q, myTagFilter, readingFilter]);
-
-  // 重新编译：同步等着（约 1 分钟），用户很可能切走再切回来。
-  // 进行中状态按 paper id 记在列表页这一层：详情面板换论文不会丢，多篇同时编译也各记各的。
-  const compilePending = usePendingByPaper();
-  const recompile = useCallback(
-    (paperId: string) => {
-      void compilePending.run(paperId, async () => {
-        try {
-          await api.recompilePaper(paperId);
-          toast(tr('编译完成，介绍已更新', 'Compiled — the intro has been updated'), 'ok');
-          void queryClient.invalidateQueries({ queryKey: ['paper', scopeId, paperId] });
-          void queryClient.invalidateQueries({ queryKey: ['paper-figures', paperId] });
-          void queryClient.invalidateQueries({ queryKey: ['papers', scopeId] });
-        } catch (e) {
-          toast(`${tr('重新编译失败：', 'Recompile failed: ')}${e instanceof Error ? e.message : String(e)}`, 'error');
-        }
-      });
-    },
-    [compilePending, queryClient, scopeId],
-  );
 
   const bulkDeleteMutation = useMutation({
     mutationFn: () => (libraryId ? api.batchDeleteLibraryPapers(libraryId, [...selected]) : api.batchDeletePapers(scopeId, [...selected])),
@@ -1724,7 +1687,13 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
               value={sort}
               onChange={setSort}
             />
-            <button className="btn btn-primary sm" style={{ height: 26, marginLeft: 'auto' }} onClick={() => setAddOpen(true)}>
+            {libraryId && canManage && zoteroLocalAvailable && (
+              <button className="btn btn-soft sm" style={{ height: 26, marginLeft: 'auto' }} onClick={() => setZoteroOpen(true)}>
+                <Icon name="refresh" size={12} />
+                Zotero
+              </button>
+            )}
+            <button className="btn btn-primary sm" style={{ height: 26, marginLeft: libraryId && canManage && zoteroLocalAvailable ? 0 : 'auto' }} onClick={() => setAddOpen(true)}>
               <Icon name="plus" size={12} />
               {tr('添加文献', 'Add paper')}
             </button>
@@ -1909,8 +1878,6 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
             onFilterAuthor={filterByAuthor}
             onFilterAffiliation={filterByAffiliation}
             onDeleted={() => onSelect('')}
-            compiling={compilePending.has(selectedId)}
-            onRecompile={recompile}
             sendingToExtension={extensionBatchMutation.isPending}
             onSendToExtension={(paper) => extensionBatchMutation.mutate([paper])}
           />
@@ -1923,6 +1890,13 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
 
       {/* —— 添加文献 Modal —— */}
       <AddPaperModal pid={pid ?? ''} libraryId={libraryId} open={addOpen} onClose={() => setAddOpen(false)} onImported={onSelect} />
+      {libraryId && canManage && zoteroLocalAvailable && (
+        <ZoteroLocalSyncModal
+          libraryId={libraryId}
+          open={zoteroOpen}
+          onClose={() => setZoteroOpen(false)}
+        />
+      )}
 
       {/* —— 回收站 —— */}
       <PapersTrashModal pid={pid ?? ''} libraryId={libraryId} open={trashOpen} onClose={() => setTrashOpen(false)} />

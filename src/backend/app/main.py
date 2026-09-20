@@ -1,7 +1,9 @@
 """FastAPI 应用工厂。"""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,12 +15,14 @@ from app.api.ws import router as ws_router
 from app.core.config import get_settings
 from app.core.db import create_all, dispose_engine, get_sessionmaker
 from app.core.llm.router import LLMNotConfiguredError
+from app.core.queue import InlineTaskQueue, get_task_queue
 from app.core.redis import close_redis
 from app.mcp import mcp_router
 from app.services.crdt_rooms import reset_crdt_rooms
 from app.services.crdt_stream import get_crdt_stream_subscriber, stop_crdt_stream_subscriber
 from app.services.discipline_packs import load_disciplines
 from app.services.interdisciplinary_workflows import ensure_guidance_documents
+from app.services.obsidian_vault_bridge import resume_configured_watchers, stop_all_watchers
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +32,39 @@ logger = logging.getLogger(__name__)
 DESKTOP_ORIGIN = "app://polaris"
 
 
+async def _desktop_integration_scheduler(stop: asyncio.Event) -> None:
+    """Drive local-only integrations in the single-process Desktop profile.
+
+    Server deployments use ARQ cron. Desktop has no worker process, so the same registered
+    worker functions are dispatched through ``InlineTaskQueue`` at startup and every 15 minutes.
+    """
+    queue = await get_task_queue()
+    maintenance_day = None
+    startup = True
+    while not stop.is_set():
+        try:
+            await queue.enqueue("zotero_local_sync_task")
+            await queue.enqueue("recover_paper_summary_jobs_task", include_fresh=startup)
+            startup = False
+            today = datetime.now(UTC).date()
+            if maintenance_day != today:
+                maintenance_day = today
+                await queue.enqueue("purge_deleted_paper_summaries_task")
+                await queue.enqueue("purge_obsidian_vault_tombstones_task")
+                await queue.enqueue("purge_deleted_paper_notes_task")
+        except Exception:  # noqa: BLE001 - integrations must not take down the API process
+            logger.warning("desktop integration scheduling failed", exc_info=True)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=15 * 60)
+        except TimeoutError:
+            continue
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    desktop_scheduler_stop: asyncio.Event | None = None
+    desktop_scheduler_task: asyncio.Task[None] | None = None
     # 仅 sqlite（无 docker 的本地 dev）在启动时建表；postgres 走 alembic migration
     if settings.is_sqlite:
         await create_all()
@@ -45,7 +79,31 @@ async def lifespan(app: FastAPI):
     load_disciplines()
     # AI 起草流式镜像订阅（worker 发布 → 写活跃 CRDT 房间；连不上 redis 自动放弃）
     get_crdt_stream_subscriber().start()
+    if settings.is_desktop:
+        from app.services.zotero_local import recover_interrupted_sync_runs
+
+        async with get_sessionmaker()() as session:
+            await recover_interrupted_sync_runs(session)
+        # Vault 启动先全量核对，再开始监听；失败只影响该连接，不阻断桌面后端。
+        try:
+            await resume_configured_watchers()
+        except Exception:  # noqa: BLE001
+            logger.warning("failed to resume Obsidian vault watchers", exc_info=True)
+        desktop_scheduler_stop = asyncio.Event()
+        desktop_scheduler_task = asyncio.create_task(
+            _desktop_integration_scheduler(desktop_scheduler_stop),
+            name="desktop-integrations",
+        )
     yield
+    if desktop_scheduler_stop is not None:
+        desktop_scheduler_stop.set()
+    if desktop_scheduler_task is not None:
+        await desktop_scheduler_task
+    await stop_all_watchers()
+    if settings.is_desktop:
+        queue = await get_task_queue()
+        if isinstance(queue, InlineTaskQueue):
+            await queue.drain()
     await stop_crdt_stream_subscriber()
     await reset_crdt_rooms()  # 关停 CRDT 房间服务器（先冲刷不了的防抖任务直接取消）
     await dispose_engine()

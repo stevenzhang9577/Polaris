@@ -142,11 +142,19 @@ class PaperView:
     @property
     def compiled_at(self) -> datetime | None:
         """最后一次编译解读的时间（解读行的 updated_at）。"""
-        return self.paper.wiki.updated_at if self.paper.wiki is not None else None
+        return (
+            self.paper.wiki.updated_at
+            if self.paper.wiki is not None and self.paper.wiki.deleted_at is None
+            else None
+        )
 
     @property
     def compiled_model(self) -> str | None:
-        return self.paper.wiki.model if self.paper.wiki is not None else None
+        return (
+            self.paper.wiki.model
+            if self.paper.wiki is not None and self.paper.wiki.deleted_at is None
+            else None
+        )
 
     @property
     def wiki_content(self) -> str | None:
@@ -154,7 +162,7 @@ class PaperView:
 
     @property
     def has_wiki(self) -> bool:
-        return self.paper.wiki is not None
+        return self.paper.wiki_content is not None
 
     @property
     def created_at(self) -> datetime:
@@ -613,7 +621,11 @@ async def paper_extras_map(
         extras[pid]["my_tags"].append(name)
     note_rows = await session.execute(
         select(PaperNote.paper_id, func.count())
-        .where(PaperNote.paper_id.in_(ids), PaperNote.author_id == user_id)
+        .where(
+            PaperNote.paper_id.in_(ids),
+            PaperNote.author_id == user_id,
+            PaperNote.deleted_at.is_(None),
+        )
         .group_by(PaperNote.paper_id)
     )
     for pid, count in note_rows.all():
@@ -1278,13 +1290,20 @@ async def keyword_search_papers(
     hits = [
         Paper.title.ilike(pattern),
         Paper.abstract.ilike(pattern),
-        Paper.id.in_(select(PaperWiki.paper_id).where(PaperWiki.content.ilike(pattern))),
+        Paper.id.in_(
+            select(PaperWiki.paper_id).where(
+                PaperWiki.deleted_at.is_(None),
+                PaperWiki.content.ilike(pattern),
+            )
+        ),
     ]
     if user_id is not None:
         hits.append(
             Paper.id.in_(
                 select(PaperNote.paper_id).where(
-                    PaperNote.author_id == user_id, PaperNote.content.ilike(pattern)
+                    PaperNote.author_id == user_id,
+                    PaperNote.deleted_at.is_(None),
+                    PaperNote.content.ilike(pattern),
                 )
             )
         )

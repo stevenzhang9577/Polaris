@@ -33,6 +33,14 @@ WORKER_FUNCTIONS = frozenset(
         "run_literature_discovery",
         "translate_literature_hit",
         "zotero_import",
+        "zotero_local_sync_task",
+        "generate_paper_summary_task",
+        "recover_paper_summary_jobs_task",
+        "purge_deleted_paper_summaries_task",
+        "purge_obsidian_vault_tombstones_task",
+        "purge_deleted_paper_notes_task",
+        "sync_obsidian_vault_paper_task",
+        "sync_obsidian_vault_library_task",
         "full_export",
     }
 )

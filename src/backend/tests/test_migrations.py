@@ -9,7 +9,9 @@ from alembic import command
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
-HEAD_REVISION = "c1d80a3fb492"  # 每日订阅按人存 (#806)
+HEAD_REVISION = "9a7d4c2e6f10"  # Desktop local LLM config import
+PRE_LLM_IMPORT_REVISION = "31cf6000d718"  # Zotero Local, summaries, and Obsidian Vault
+PRE_ZOTERO_REVISION = "c1d80a3fb492"  # 每日订阅按人存 (#806)
 SKILLS_DROP_REVISION = "d7f4a16c8e29"  # 技能功能移除 (#755)
 VECTOR_SCOPE_REVISION = "c5e02a9b31d7"  # Method vectors scoped to their card (#772)
 HYPOTHESIS_SEQ_REVISION = "b4d91f7a2c08"  # Hypothesis node creation sequence (#784)
@@ -135,6 +137,14 @@ def _inspect_db(db_path: Path) -> tuple[str, dict[str, set[str]]]:
                     "agent_skills",
                     "agent_skill_files",
                     "paper_wikis",
+                    "paper_wiki_revisions",
+                    "zotero_local_bindings",
+                    "zotero_sync_runs",
+                    "zotero_item_links",
+                    "obsidian_vault_connections",
+                    "obsidian_vault_library_bindings",
+                    "obsidian_vault_file_states",
+                    "obsidian_vault_conflicts",
                     "library_papers",
                     "daily_feed_entries",
                     "user_publications",
@@ -472,7 +482,34 @@ def test_migrations_sqlite_upgrade_head_and_roundtrip(tmp_path):
     assert "ix_llm_usage_created_at" in _index_names(db_path, "llm_usage")
     # 本分支新增：论文级唯一解读表（原列一律保留，只是不再读写）
     assert "paper_wikis" in columns["_tables"]
-    assert {"paper_id", "content", "model", "compiled_by"} <= columns["paper_wikis"]
+    assert {
+        "paper_id",
+        "content",
+        "model",
+        "compiled_by",
+        "current_revision_id",
+        "deleted_at",
+    } <= columns["paper_wikis"]
+    assert "deleted_at" in columns["paper_notes"]
+    assert {
+        "paper_wiki_revisions",
+        "zotero_local_bindings",
+        "zotero_sync_runs",
+        "zotero_item_links",
+        "obsidian_vault_connections",
+        "obsidian_vault_library_bindings",
+        "obsidian_vault_file_states",
+        "obsidian_vault_conflicts",
+    } <= columns["_tables"]
+    assert {
+        "paper_id",
+        "content_version_id",
+        "source_level",
+        "content",
+        "source_fingerprint",
+        "status",
+        "stage",
+    } <= columns["paper_wiki_revisions"]
     # 本分支新增：概念统一到论文级（去 library_id，slug 全局唯一）+ 两张回滚留档表
     assert "library_id" not in columns["concepts"]
     assert {"concepts_pre_unify", "paper_concepts_pre_unify"} <= columns["_tables"]
@@ -586,6 +623,14 @@ def test_migrations_sqlite_upgrade_head_and_roundtrip(tmp_path):
     ]
     assert {"library_kind", "interdisciplinary_project_id"} <= columns["direction_libraries"]
     assert "research_mode" in columns["projects"]
+    assert {
+        "transport",
+        "auth_scheme",
+        "import_source",
+        "import_source_key",
+        "import_fingerprint",
+        "imported_at",
+    } <= columns["llm_providers"]
 
     assert {"query_matrix", "evidence_balance"} <= columns["interdisciplinary_research_profiles"]
     assert {
@@ -642,7 +687,37 @@ def test_migrations_sqlite_upgrade_head_and_roundtrip(tmp_path):
     } <= columns["paper_extractions"]
     assert "ix_paper_extractions_paper_id" in _index_names(db_path, "paper_extractions")
 
-    # 先退掉「每日订阅按人存」（只动数据，不动表结构）。
+    # 先退掉 Desktop 本地 LLM 配置导入字段。
+    command.downgrade(cfg, "-1")
+    version, columns = _inspect_db(db_path)
+    assert version == PRE_LLM_IMPORT_REVISION
+    assert not {
+        "transport",
+        "auth_scheme",
+        "import_source",
+        "import_source_key",
+        "import_fingerprint",
+        "imported_at",
+    } & columns["llm_providers"]
+
+    # 再退掉 Zotero/总结版本/Vault 扩展，并确认兼容列也完整回滚。
+    command.downgrade(cfg, "-1")
+    version, columns = _inspect_db(db_path)
+    assert version == PRE_ZOTERO_REVISION
+    assert not {
+        "paper_wiki_revisions",
+        "zotero_local_bindings",
+        "zotero_sync_runs",
+        "zotero_item_links",
+        "obsidian_vault_connections",
+        "obsidian_vault_library_bindings",
+        "obsidian_vault_file_states",
+        "obsidian_vault_conflicts",
+    } & columns["_tables"]
+    assert not {"current_revision_id", "deleted_at"} & columns["paper_wikis"]
+    assert "deleted_at" not in columns["paper_notes"]
+
+    # 再退掉「每日订阅按人存」（只动数据，不动表结构）。
     command.downgrade(cfg, "-1")
     version, columns = _inspect_db(db_path)
     assert version == SKILLS_DROP_REVISION

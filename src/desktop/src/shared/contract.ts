@@ -29,8 +29,11 @@ export interface HostInfo {
  * 老外壳看到比自己大的号就不收这份界面，改走安装器。这一步不能省——插件页按能力
  * 表自动隐藏，老外壳装上新界面**不会报错**，只会悄悄少一块功能，然后因为版本号
  * 已经追平而不再提示更新，用户就永远停在收不到插件的外壳上了。
+ * 3：新增 Obsidian Vault 目录选择方法与 obsidian.vault.sync 能力。
+ * 4：新增 llm.local-config-import 桌面能力。虽未增加 IPC 方法，旧外壳也不能
+ * 接收会展示本地配置导入入口的新 renderer，所以必须涨契约。
  */
-export const CONTRACT_VERSION = 2;
+export const CONTRACT_VERSION = 4;
 
 /** 单个能力的可用性。detail 给前端做提示（如 tectonic 装了但缓存是空的）。 */
 export interface CapabilityState {
@@ -56,6 +59,15 @@ export interface CapabilityManifest {
 export const CAPABILITY_LATEX_COMPILE = 'latex.compile';
 /** 插件管理（#705）：kernel 活着且配置树服务可达时可用，设置页插件 tab 读它显隐。 */
 export const CAPABILITY_PLUGINS_MANAGE = 'plugins.manage';
+/** 可选择本机 Obsidian Vault，并由本地后端维护双向同步。 */
+export const CAPABILITY_OBSIDIAN_VAULT_SYNC = 'obsidian.vault.sync';
+/** 从本机 Codex / Claude Code 固定配置路径发现并导入模型连接（只在 Desktop）。 */
+export const CAPABILITY_LLM_LOCAL_CONFIG_IMPORT = 'llm.local-config-import';
+
+export interface PickDirectoryResult {
+  /** 用户取消时为 null；绝不回退到任意默认目录。 */
+  path: string | null;
+}
 
 /** 长任务句柄：invoke 立刻返回它，进度经事件通道推。 */
 export interface JobHandle {
@@ -114,6 +126,10 @@ export interface LocalBackendInfo {
 export interface EngineBootstrapStatus {
   phase: string;
   done: boolean;
+  /** 需要用户处理的可恢复启动故障；普通引导失败不暴露底层异常。 */
+  errorCode?: string;
+  /** 已脱敏、可直接展示的处理提示。 */
+  message?: string;
 }
 
 /* ---- plugins.*（#705）：配置树管理的载荷类型 ---- */
@@ -214,6 +230,11 @@ export interface Methods {
   'host.copyText': { params: { text: string }; result: boolean };
   /** Dock/任务栏角标（待审批数）。Windows 需 overlay icon，一期不做，静默忽略。 */
   'host.setBadgeCount': { params: { count: number }; result: void };
+  /** 打开原生目录选择器。purpose 是封闭枚举，避免 renderer 指定任意对话框行为。 */
+  'host.pickDirectory': {
+    params: { purpose: 'obsidian-vault' };
+    result: PickDirectoryResult;
+  };
   'host.capabilities': { params: void; result: CapabilityManifest };
   /** 查有没有新版本。失败一律当作「没有更新」，不打扰用户。 */
   'host.update.check': { params: void; result: UpdateInfo };

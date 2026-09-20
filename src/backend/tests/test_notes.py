@@ -74,6 +74,23 @@ async def test_notes_crud_and_author_only_visibility(client):
     assert resp.status_code == 204
     resp = await client.get(f"/api/papers/{ids['p1']}/notes", headers=alice)
     assert resp.json() == []
+    async with get_sessionmaker()() as session:
+        tombstone = await session.get(PaperNote, uuid.UUID(note_id))
+        assert tombstone is not None and tombstone.deleted_at is not None
+
+    # Tombstones remain private, and the author can restore the same stable note identity.
+    resp = await client.post(f"/api/notes/{note_id}/restore", headers=bob)
+    assert resp.status_code == 404
+    resp = await client.post(f"/api/notes/{note_id}/restore", headers=alice)
+    assert resp.status_code == 200
+    assert resp.json()["id"] == note_id
+    assert resp.json()["content"] == "改过了"
+    resp = await client.get(f"/api/papers/{ids['p1']}/notes", headers=alice)
+    assert [row["id"] for row in resp.json()] == [note_id]
+
+    # Leave it deleted and verify repeated deletes cannot address an already-hidden row.
+    assert (await client.delete(f"/api/notes/{note_id}", headers=alice)).status_code == 204
+    assert (await client.delete(f"/api/notes/{note_id}", headers=alice)).status_code == 404
 
     # author_name 回退 email @ 前部分
     assert author_name_of("", "carol@example.com") == "carol"
@@ -204,6 +221,36 @@ async def test_keyword_search_includes_own_note_hits_only(client):
         f"/api/projects/{project_id}/search?q=量子退火&mode=keyword", headers=bob
     )
     assert resp.status_code == 404
+
+
+async def test_deleted_notes_are_filtered_from_notebook_search_and_exports(client):
+    project_id, alice, _bob, ids = await _setup(client)
+    marker = "SOFT_DELETE_ONLY_TOKEN"
+    created = await client.post(
+        f"/api/papers/{ids['p2']}/notes", json={"content": marker}, headers=alice
+    )
+    assert created.status_code == 201
+    note_id = created.json()["id"]
+    assert (await client.delete(f"/api/notes/{note_id}", headers=alice)).status_code == 204
+
+    notebook = await client.get(f"/api/projects/{project_id}/notes?q={marker}", headers=alice)
+    assert notebook.status_code == 200
+    assert notebook.json()["total"] == 0
+
+    search = await client.get(
+        f"/api/projects/{project_id}/search?q={marker}&mode=keyword", headers=alice
+    )
+    assert search.status_code == 200
+    assert search.json()["papers"] == []
+
+    exported = await client.get(f"/api/projects/{project_id}/export/obsidian", headers=alice)
+    assert exported.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+        assert marker not in "\n".join(
+            archive.read(name).decode("utf-8")
+            for name in archive.namelist()
+            if name.endswith(".md")
+        )
 
 
 async def test_obsidian_export_includes_own_notes_section(client):

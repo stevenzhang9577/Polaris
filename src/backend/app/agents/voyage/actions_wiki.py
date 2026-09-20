@@ -33,6 +33,7 @@ from app.models.base import utcnow
 from app.models.daily_feed import DailyFeedEntry
 from app.models.library_direction import DirectionLibrary, LibraryPaper
 from app.models.paper import Paper, new_paper
+from app.models.paper_assets import PaperAsset
 from app.models.research_digest import LibraryResearchDigest
 from app.models.voyage import VoyageRun, VoyageStep
 from app.schemas.ingest import TIME_RANGE_DAYS
@@ -1387,13 +1388,19 @@ async def compile_wiki(ctx: ActionContext, params: dict[str, Any]) -> dict[str, 
             paper = await session.get(Paper, membership.paper_id)
             if paper is None:
                 return None
+            has_assets = (
+                await session.scalar(
+                    select(PaperAsset.id).where(PaperAsset.paper_id == paper.id).limit(1)
+                )
+                is not None
+            )
             affil_mode = await get_affiliation_extraction_mode(session)
             progress["n"] += 1
             await ctx.log(f"📖 精读编译 {progress['n']}/{total}：{paper.title}")
             # ① 编译前筛选注释论文图（stage=librarian 多模态）：图文编译要用重要图；
             #    失败仅 log（annotate 内部已带降级），不影响编译。annotate 只改内存对象，
             #    由本任务的 session commit。
-            if paper.figures and not figures_annotated(paper.figures):
+            if not has_assets and paper.figures and not figures_annotated(paper.figures):
                 try:
                     await annotate_figures(
                         paper,
@@ -1412,6 +1419,11 @@ async def compile_wiki(ctx: ActionContext, params: dict[str, Any]) -> dict[str, 
             # ② 图文编译（重要图 ≤4 张随 prompt 送入）+ ③ 无效 ![[fig:N]] 标记剥除。
             #    on_compile 模式且尚无机构时顺带带回作者↔机构映射（省一次专门调用）。
             collect_affs = affil_mode == "on_compile" and not paper.affiliations
+            from app.services.paper_summaries import current_summary_source
+
+            source = await current_summary_source(
+                session, paper, library_id=membership.library_id
+            )
             compiled = await compile_paper(
                 paper,
                 session=session,
@@ -1422,6 +1434,9 @@ async def compile_wiki(ctx: ActionContext, params: dict[str, Any]) -> dict[str, 
                 voyage_id=ctx.run.id,
                 extra_guidance=guidance,
                 collect_affiliations=collect_affs,
+                source_text=source.text,
+                source_level=source.source_level,
+                include_figures=not has_assets,
             )
             # 解读全平台一份：写 paper_wikis（已有则覆盖成本次结果）。编译者记发起
             # 本次同步的人（公共库的账记系统，billing_user_id 为空，但人是有的）
@@ -1431,6 +1446,11 @@ async def compile_wiki(ctx: ActionContext, params: dict[str, Any]) -> dict[str, 
                 content=compiled.content,
                 model=compiled.model or None,
                 compiled_by=ctx.run.created_by,
+                source_level=source.source_level,
+                content_version_id=source.content_version_id,
+                source_fingerprint=source.fingerprint,
+                source_library_id=membership.library_id,
+                source_project_id=project_id,
             )
             membership.status = "compiled"
             if compiled.author_affiliations and not paper.affiliations:
@@ -1465,6 +1485,9 @@ async def compile_wiki(ctx: ActionContext, params: dict[str, Any]) -> dict[str, 
     # 逐篇重建是 O(N²) 的读写量，批量场景按批收口（best-effort，DB wins）
     if compiled:
         await file_projection.refresh_library_vault_by_id(library_id)
+        from app.services.obsidian_vault_bridge import enqueue_library_projection
+
+        await enqueue_library_projection(library_id=library_id, entity_type="summary")
     return {
         "processed": len(paper_ids),
         "succeeded": compiled,

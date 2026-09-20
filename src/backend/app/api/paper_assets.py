@@ -270,13 +270,12 @@ async def get_current_paper_content_version(
     if library is None or not libraries_service.library_visible_to(library, user):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="LIBRARY_NOT_FOUND")
     await _paper_in_library(session, library_id, paper_id, user)
-    version = await content_service.current_content_version(session, paper_id=paper_id)
-    if version is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="CONTENT_VERSION_NOT_FOUND")
-    readable = await asset_service.readable_asset(
-        session, asset_id=version.asset_id, library_id=library_id
+    version = await content_service.latest_readable_content_version(
+        session,
+        paper_id=paper_id,
+        library_id=library_id,
     )
-    if readable is None:
+    if version is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="CONTENT_VERSION_NOT_FOUND")
     return PaperContentVersionRead.model_validate(version)
 

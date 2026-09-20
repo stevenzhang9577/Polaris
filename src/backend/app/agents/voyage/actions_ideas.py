@@ -207,7 +207,10 @@ async def forge_read_context(ctx: ActionContext, params: dict[str, Any]) -> dict
                     await session.execute(
                         member_papers_stmt(library_ids)
                         .join(PaperWiki, PaperWiki.paper_id == Paper.id)
-                        .where(LibraryPaper.status.in_(("compiled", "included")))
+                        .where(
+                            LibraryPaper.status.in_(("compiled", "included")),
+                            PaperWiki.deleted_at.is_(None),
+                        )
                     )
                 ).all()
             )

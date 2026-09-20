@@ -13,6 +13,8 @@
         "name": "Chain, Import"
       }
     ],
+    "can_manage_summary": true,
+    "can_materialize_zotero": false,
     "compiled_at": null,
     "compiled_by_name": null,
     "compiled_model": null,
@@ -40,7 +42,11 @@
     "url": null,
     "venue": "Journal of Reproducible Plumbing",
     "wiki_content": null,
-    "year": 2026
+    "year": 2026,
+    "zotero_item_key": null,
+    "zotero_library_id": null,
+    "zotero_pdf_status": null,
+    "zotero_source": false
   },
   "create_library": {
     "cadence": null,
@@ -133,6 +139,8 @@
         "name": "Chain, Import"
       }
     ],
+    "can_manage_summary": true,
+    "can_materialize_zotero": false,
     "compiled_at": "<ts>",
     "compiled_by_name": "Golden Probe",
     "compiled_model": "fake-default",
@@ -146,7 +154,7 @@
     "my_tags": [],
     "note_count": 0,
     "pdf_available": false,
-    "project_id": null,
+    "project_id": "<uuid-3>",
     "published_at": null,
     "reading_status": "unread",
     "relevance_score": null,
@@ -160,7 +168,11 @@
     "url": null,
     "venue": "Journal of Reproducible Plumbing",
     "wiki_content": "## TL;DR\n\nDeterministic Golden Chain Probe 的一句话总结（fake librarian）。\n\n## 研究背景与动机\n\n围绕 [[Agent]] 场景的关键问题展开叙述（fake）。\n\n## 方法\n\n提出基于 [[Agent]] 与 [[强化学习]] 的方法，分段展开讲解（fake）。\n\n## 实验与结果\n\n在多个基准上验证有效（fake）。\n\n## 讨论与可借鉴点\n\n可复用其训练流程，局限在于评测范围（fake）。\n\n<!-- polaris-ai-evidence:{\"version\":1,\"mode\":\"abstract_only\",\"paper_count\":1,\"refs\":[{\"article_no\":1,\"sentence_no\":1,\"paper_id\":\"<uuid-4>\",\"href\":\"/papers/<uuid-4>/read?evidence=1\",\"source\":\"abstract_only\"}]} -->\n",
-    "year": 2026
+    "year": 2026,
+    "zotero_item_key": null,
+    "zotero_library_id": null,
+    "zotero_pdf_status": null,
+    "zotero_source": false
   },
   "register": {
     "display_name": "Golden Probe",

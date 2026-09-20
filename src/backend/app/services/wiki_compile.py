@@ -13,11 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.llm.base import Message
 from app.core.llm.router import LLMRouter, get_llm_router
 from app.models.paper import Paper
+from app.models.paper_assets import PaperAsset
 from app.services import file_projection
 from app.services.affiliations import (
     AFFIL_COMPILE_INSTRUCTION,
@@ -120,13 +122,27 @@ def _figure_prompt_section(selected: list[tuple[dict[str, Any], bytes]]) -> str:
     return "\n".join(lines)
 
 
-def build_compile_prompt(paper: Paper) -> tuple[str, list[bytes]]:
+def build_compile_prompt(
+    paper: Paper,
+    *,
+    source_text: str | None = None,
+    source_level: str | None = None,
+    include_figures: bool = True,
+) -> tuple[str, list[bytes]]:
     """组装编译 user prompt 与随附图片（无重要图时 images 为空 → 纯文字编译）。
 
     只喂论文本身：解读全平台唯一一份，不带任何库的方向陈述 / rubric 侧重。"""
-    body: str | None = None
-    source = "abstract"
-    if paper.full_text_path and Path(paper.full_text_path).exists():
+    body: str | None = source_text
+    source = source_level or ("full_text" if source_text else "abstract")
+    # Supplying source_level is an explicit scoped-source decision. In that mode, ``None`` means
+    # the caller was not authorized for a full-text version, so never fall back to the legacy
+    # paper-global path (which may now point at another library's private asset).
+    if (
+        body is None
+        and source_level is None
+        and paper.full_text_path
+        and Path(paper.full_text_path).exists()
+    ):
         body = Path(paper.full_text_path).read_text(encoding="utf-8", errors="ignore")
         source = "full_text"
     body = (body or paper.abstract or "（无正文）")[:FULLTEXT_PROMPT_CHARS]
@@ -138,7 +154,7 @@ def build_compile_prompt(paper: Paper) -> tuple[str, list[bytes]]:
         f"正文来源：{source}\n"
         f"正文：\n{body}"
     )
-    selected = important_figures_with_bytes(paper)
+    selected = important_figures_with_bytes(paper) if include_figures else []
     if selected:
         prompt += "\n\n" + _figure_prompt_section(selected)
     return prompt, [data for _, data in selected]
@@ -168,6 +184,9 @@ async def compile_paper(
     voyage_id: uuid.UUID | None = None,
     extra_guidance: str = "",
     collect_affiliations: bool = False,
+    source_text: str | None = None,
+    source_level: str | None = None,
+    include_figures: bool = True,
 ) -> CompiledWiki:
     """图文编译一篇论文，返回校验过标记的 wiki markdown 与所用模型（调用方负责落库）。
 
@@ -181,7 +200,12 @@ async def compile_paper(
     让它残留进 wiki，也绝不因解析失败让编译失败。
     """
     llm = llm or get_llm_router()
-    user_prompt, images = build_compile_prompt(paper)
+    user_prompt, images = build_compile_prompt(
+        paper,
+        source_text=source_text,
+        source_level=source_level,
+        include_figures=include_figures,
+    )
     evidence_bundle: AIEvidenceBundle | None = None
     if session is not None and library_id is not None:
         evidence_bundle = await build_paper_evidence_context(
@@ -257,8 +281,16 @@ async def recompile_paper(
     paper = view.paper
     membership = view.membership
     project_id = view.project_id
+    has_assets = (
+        await session.scalar(
+            select(PaperAsset.id).where(PaperAsset.paper_id == paper.id).limit(1)
+        )
+        is not None
+    )
 
-    if paper.pdf_path and Path(paper.pdf_path).exists():
+    # Legacy figure files have no library provenance. Once scoped assets exist, do not read the
+    # paper-global PDF/figure projection: it may have been produced from another private grant.
+    if not has_assets and paper.pdf_path and Path(paper.pdf_path).exists():
         # 从未提取过，或上一轮一张重要图都没选出来（多为旧提取逻辑漏掉矢量图）→ 重提候选
         if paper.figures is None or not any(f.get("important") for f in paper.figures):
             candidates = await extract_figures(str(paper.id), Path(paper.pdf_path))
@@ -279,6 +311,11 @@ async def recompile_paper(
     # on_compile 模式且尚无机构时，让本次编译顺带带回作者↔机构映射（省一次专门调用）
     mode = await get_affiliation_extraction_mode(session)
     collect_affs = mode == "on_compile" and not paper.affiliations
+    from app.services.paper_summaries import current_summary_source
+
+    source = await current_summary_source(
+        session, paper, library_id=membership.library_id
+    )
     compiled = await compile_paper(
         paper,
         session=session,
@@ -287,6 +324,9 @@ async def recompile_paper(
         project_id=project_id,
         library_id=membership.library_id,  # 从库里发起的重编译记方向库账（P6）
         collect_affiliations=collect_affs,
+        source_text=source.text,
+        source_level=source.source_level,
+        include_figures=not has_assets,
     )
     await upsert_wiki(
         session,
@@ -294,6 +334,11 @@ async def recompile_paper(
         content=compiled.content,
         model=compiled.model or None,
         compiled_by=user_id,
+        source_level=source.source_level,
+        content_version_id=source.content_version_id,
+        source_fingerprint=source.fingerprint,
+        source_library_id=membership.library_id,
+        source_project_id=project_id,
     )
     if membership.status in ("scored", "fetched"):
         membership.status = "compiled"
@@ -306,4 +351,7 @@ async def recompile_paper(
     )
     # 常驻文件投影（#719）：解读更新 → 刷新所有含它的库 vault（best-effort，DB wins）
     await file_projection.refresh_wiki_vaults_for_paper(session, paper.id)
+    from app.services.obsidian_vault_bridge import enqueue_paper_projection
+
+    await enqueue_paper_projection(paper_id=paper.id, entity_type="summary")
     return view

@@ -254,3 +254,42 @@ async def test_asset_http_private_library_is_not_visible_to_stranger(app, client
         f"/api/libraries/{library_id}/papers/{paper_id}/assets", headers=stranger_headers
     )
     assert response.status_code == 404
+
+
+async def test_legacy_pdf_route_does_not_leak_private_asset_across_libraries(app, client):
+    owner_headers, owner_id = await _user(client, "asset-route-owner@example.com")
+    stranger_headers, stranger_id = await _user(client, "asset-route-stranger@example.com")
+    async with get_sessionmaker()() as session:
+        owner = await session.get(User, owner_id)
+        assert owner is not None
+        owner_library = await _library(session, user_id=owner_id)
+        stranger_library = await _library(session, user_id=stranger_id)
+        paper = await _paper_in_library(session, owner_library)
+        session.add(
+            LibraryPaper(
+                library_id=stranger_library.id,
+                paper_id=paper.id,
+                status="included",
+            )
+        )
+        await create_or_reuse_asset(
+            session,
+            paper=paper,
+            library=owner_library,
+            content=_pdf_bytes("owner private content"),
+            user=owner,
+            source="zotero",
+            sharing_scope="private",
+        )
+        await session.commit()
+        paper_id = paper.id
+
+    owner_response = await client.get(f"/api/papers/{paper_id}/pdf", headers=owner_headers)
+    assert owner_response.status_code == 200
+    stranger_response = await client.get(
+        f"/api/papers/{paper_id}/pdf", headers=stranger_headers
+    )
+    assert stranger_response.status_code == 404
+    detail = await client.get(f"/api/papers/{paper_id}", headers=stranger_headers)
+    assert detail.status_code == 200
+    assert detail.json()["pdf_available"] is False

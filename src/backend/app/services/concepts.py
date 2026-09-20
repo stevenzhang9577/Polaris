@@ -649,6 +649,7 @@ async def link_all_paper_concepts(
             .where(
                 LibraryPaper.library_id == library_id,
                 LibraryPaper.status.in_(("compiled", "included")),
+                PaperWiki.deleted_at.is_(None),
             )
         )
     ).all()

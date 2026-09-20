@@ -9,8 +9,9 @@ from alembic.config import Config
 from alembic import command
 from app.core.db import get_sessionmaker
 from app.models.evidence import PaperEvidenceAnchor
+from app.models.library_direction import DirectionLibrary, LibraryPaper
 from app.models.paper import new_paper
-from app.models.paper_assets import PaperAsset, PdfBlob
+from app.models.paper_assets import AssetGrant, PaperAsset, PdfBlob
 from app.models.paper_content import PaperContentChunk, PaperContentVersion
 from app.services.evidence import (
     build_chunk_anchor_payloads,
@@ -20,6 +21,7 @@ from app.services.evidence import (
     resolve_evidence_anchor,
     split_sentences,
 )
+from tests.test_paper_assets import _user
 
 
 def test_normalization_and_sentence_split_are_deterministic() -> None:
@@ -161,6 +163,166 @@ async def test_resolve_falls_back_to_chunk_then_paper(app) -> None:
         assert result.status == "chunk"
         assert result.anchor_type == "chunk"
         assert result.href.endswith(f"evidence={anchor.id}")
+
+        explicitly_empty = await resolve_evidence_anchor(
+            session, anchor, current_chunks=[]
+        )
+        assert explicitly_empty.status == "paper"
+        assert explicitly_empty.chunk_id is None
+
+
+@pytest.mark.asyncio
+async def test_evidence_api_rejects_anchor_from_another_library_asset(app, client) -> None:
+    _owner_headers, owner_id = await _user(
+        client, f"evidence-owner-{uuid.uuid4().hex}@example.com"
+    )
+    reader_headers, reader_id = await _user(
+        client, f"evidence-reader-{uuid.uuid4().hex}@example.com"
+    )
+    async with get_sessionmaker()() as session:
+        owner_library = DirectionLibrary(
+            name="Evidence owner library",
+            statement="private source",
+            submitted_by=owner_id,
+        )
+        reader_library = DirectionLibrary(
+            name="Evidence reader library",
+            statement="separate private source",
+            submitted_by=reader_id,
+        )
+        paper = new_paper(title="Globally deduplicated evidence paper")
+        session.add_all([owner_library, reader_library, paper])
+        await session.flush()
+        session.add_all(
+            [
+                LibraryPaper(
+                    library_id=owner_library.id,
+                    paper_id=paper.id,
+                    status="included",
+                ),
+                LibraryPaper(
+                    library_id=reader_library.id,
+                    paper_id=paper.id,
+                    status="included",
+                ),
+            ]
+        )
+        owner_blob = PdfBlob(
+            sha256="c" * 64,
+            byte_size=1,
+            storage_key=f"pdf-blobs/cc/{'c' * 64}.pdf",
+            content_type="application/pdf",
+            state="ready",
+        )
+        reader_blob = PdfBlob(
+            sha256="d" * 64,
+            byte_size=1,
+            storage_key=f"pdf-blobs/dd/{'d' * 64}.pdf",
+            content_type="application/pdf",
+            state="ready",
+        )
+        session.add_all([owner_blob, reader_blob])
+        await session.flush()
+        owner_asset = PaperAsset(
+            paper_id=paper.id,
+            blob_id=owner_blob.id,
+            source="zotero",
+            state="ready",
+        )
+        reader_asset = PaperAsset(
+            paper_id=paper.id,
+            blob_id=reader_blob.id,
+            source="upload",
+            state="ready",
+        )
+        session.add_all([owner_asset, reader_asset])
+        await session.flush()
+        session.add_all(
+            [
+                AssetGrant(
+                    asset_id=owner_asset.id,
+                    library_id=owner_library.id,
+                    can_read=True,
+                    can_process=True,
+                    status="active",
+                ),
+                AssetGrant(
+                    asset_id=reader_asset.id,
+                    library_id=reader_library.id,
+                    can_read=True,
+                    can_process=True,
+                    status="active",
+                ),
+            ]
+        )
+        owner_version = PaperContentVersion(
+            paper_id=paper.id,
+            asset_id=owner_asset.id,
+            version_no=1,
+            parser="pymupdf",
+            status="ready_fallback",
+            is_current=False,
+        )
+        reader_version = PaperContentVersion(
+            paper_id=paper.id,
+            asset_id=reader_asset.id,
+            version_no=2,
+            parser="pymupdf",
+            status="ready_fallback",
+            is_current=True,
+        )
+        session.add_all([owner_version, reader_version])
+        await session.flush()
+        owner_chunk = PaperContentChunk(
+            content_version_id=owner_version.id,
+            seq=0,
+            text="Owner-only quoted evidence.",
+        )
+        reader_chunk = PaperContentChunk(
+            content_version_id=reader_version.id,
+            seq=0,
+            text="Reader-visible quoted evidence.",
+        )
+        session.add_all([owner_chunk, reader_chunk])
+        await session.flush()
+        await persist_chunk_anchors(
+            session, paper_id=paper.id, chunks=[owner_chunk, reader_chunk]
+        )
+        await session.commit()
+        owner_anchor = await session.scalar(
+            __import__("sqlalchemy").select(PaperEvidenceAnchor).where(
+                PaperEvidenceAnchor.paper_id == paper.id,
+                PaperEvidenceAnchor.chunk_id == owner_chunk.id,
+                PaperEvidenceAnchor.anchor_type == "sentence",
+            )
+        )
+        reader_anchor = await session.scalar(
+            __import__("sqlalchemy").select(PaperEvidenceAnchor).where(
+                PaperEvidenceAnchor.paper_id == paper.id,
+                PaperEvidenceAnchor.chunk_id == reader_chunk.id,
+                PaperEvidenceAnchor.anchor_type == "sentence",
+            )
+        )
+        assert owner_anchor is not None and reader_anchor is not None
+        reader_library_id = reader_library.id
+        paper_id = paper.id
+        owner_anchor_id = owner_anchor.id
+        reader_anchor_id = reader_anchor.id
+
+    denied = await client.get(
+        f"/api/libraries/{reader_library_id}/papers/{paper_id}/evidence/{owner_anchor_id}",
+        headers=reader_headers,
+    )
+    assert denied.status_code == 404
+    assert denied.json()["detail"] == "EVIDENCE_NOT_FOUND"
+
+    allowed = await client.get(
+        f"/api/libraries/{reader_library_id}/papers/{paper_id}/evidence/{reader_anchor_id}",
+        headers=reader_headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["quoted_text"] == "Reader-visible quoted evidence."
+    assert "Owner-only" not in allowed.text
 
 
 @pytest.mark.asyncio

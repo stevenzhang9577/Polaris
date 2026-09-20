@@ -18,6 +18,7 @@ from app.core.llm.base import (
     ImageBlock,
     LLMProvider,
     Message,
+    OpaqueProviderStateBlock,
     StreamDone,
     StreamEvent,
     TextBlock,
@@ -78,6 +79,8 @@ def _normalize_usage(raw: dict[str, Any] | None) -> dict[str, int]:
 
 
 def _content_payload(block: ContentBlock) -> dict[str, Any] | None:
+    if isinstance(block, OpaqueProviderStateBlock):
+        return None
     if isinstance(block, TextBlock):
         return {"type": "text", "text": block.text} if block.text else None
     if isinstance(block, ThinkingBlock):
@@ -128,16 +131,22 @@ class AnthropicProvider(LLMProvider):
         *,
         base_url: str | None = None,
         user_agent: str | None = None,
+        auth_scheme: str = "x_api_key",
         client: httpx.AsyncClient | None = None,
         timeout: float = 300.0,
     ) -> None:
         self._api_key = api_key
         self._api_url = _messages_url(base_url)
         self._user_agent = user_agent.strip() if user_agent else None
+        self._auth_scheme = auth_scheme
         self._client = client or httpx.AsyncClient(timeout=timeout)
 
     def _headers(self) -> dict[str, str]:
-        headers = {"x-api-key": self._api_key, "anthropic-version": _API_VERSION}
+        headers = {"anthropic-version": _API_VERSION}
+        if self._api_key and self._auth_scheme == "bearer":
+            headers["authorization"] = f"Bearer {self._api_key}"
+        elif self._api_key and self._auth_scheme == "x_api_key":
+            headers["x-api-key"] = self._api_key
         if self._user_agent:
             headers["user-agent"] = self._user_agent
         return headers

@@ -21,6 +21,8 @@ from typing import Any
 
 from app.core.llm.base import (
     ContentBlock,
+    OpaqueProviderState,
+    OpaqueProviderStateBlock,
     StreamEvent,
     TextBlock,
     TextDelta,
@@ -57,6 +59,7 @@ class ToolCallAccumulator:
         self._thinking_signature: str | None = None
         self._pending: dict[int, _Pending] = {}
         self._order: list[int] = []
+        self._provider_state: list[OpaqueProviderStateBlock] = []
 
     def feed(self, ev: StreamEvent) -> None:
         if isinstance(ev, TextDelta):
@@ -82,6 +85,8 @@ class ToolCallAccumulator:
                 self._pending[ev.index] = cur
                 self._order.append(ev.index)
             cur.args.append(ev.json_fragment)
+        elif isinstance(ev, OpaqueProviderState):
+            self._provider_state.append(OpaqueProviderStateBlock(ev.provider, ev.payload))
         # ToolUseStop / StreamDone 不需要动作：参数一律在 finish 时统一解析
 
     @property
@@ -94,7 +99,8 @@ class ToolCallAccumulator:
 
     def finish(self) -> tuple[ContentBlock, ...]:
         """产出块列表：thinking → text → 各个 tool_use（按 index 首次出现的顺序）。"""
-        blocks: list[ContentBlock] = []
+        # Provider state must precede the function_call item when replayed.
+        blocks: list[ContentBlock] = list(self._provider_state)
         thinking = "".join(self._thinking)
         if thinking:
             blocks.append(ThinkingBlock(thinking, self._thinking_signature))

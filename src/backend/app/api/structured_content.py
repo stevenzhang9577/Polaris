@@ -62,7 +62,12 @@ async def _authorized_version(
         user=user,
     )
     if version_id is None:
-        version = await content_service.current_content_version(session, paper_id=paper_id)
+        version = await content_service.latest_readable_content_version(
+            session,
+            paper_id=paper_id,
+            library_id=library_id,
+            ready_only=True,
+        )
     else:
         version = await session.get(PaperContentVersion, version_id)
     if version is None or version.paper_id != paper_id:

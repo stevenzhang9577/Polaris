@@ -10,6 +10,21 @@ import type { EngineBootstrapStatus } from '../../lib/host';
 
 export type BootstrapGate = 'proceed' | 'wait' | 'failed';
 
+export const DESKTOP_ENCRYPTION_MIGRATION_REQUIRED =
+  'DESKTOP_ENCRYPTION_MIGRATION_REQUIRED';
+
+export type BootstrapFailureKind = 'legacy-encryption-migration' | 'generic';
+
+/**
+ * 把宿主故障码收敛成前端认识的展示分支。不要把 ``status.message`` 当作任意
+ * 错误详情直接渲染：即使当前宿主承诺已脱敏，未来底层异常也可能带路径或参数。
+ */
+export function bootstrapFailureKind(status: EngineBootstrapStatus): BootstrapFailureKind {
+  return status.errorCode === DESKTOP_ENCRYPTION_MIGRATION_REQUIRED
+    ? 'legacy-encryption-migration'
+    : 'generic';
+}
+
 /**
  * 由引导状态决定挂载去向：
  * - null（web 端 / 旧宿主 / 桥故障）→ 放行，按既有远端流程走；

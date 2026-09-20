@@ -137,7 +137,11 @@ export function InfoPanel({
             {arxivUrl ? tr('arXiv 原文', 'View on arXiv') : tr('原文链接', 'Source link')}
           </a>
         )}
-        <PdfUploadButton paperId={paper.id} pdfAvailable={paper.pdf_available} />
+        <PdfUploadButton
+          paperId={paper.id}
+          pdfAvailable={paper.pdf_available}
+          canManage={paper.can_manage_summary === true}
+        />
       </div>
 
       {/* —— 元信息（默认折叠） —— */}

@@ -55,6 +55,284 @@ async def parse_paper_content_task(
             logger.exception("content vectorization failed for %s", version_id)
 
 
+async def zotero_local_sync_task(
+    ctx: dict[str, Any],
+    *,
+    binding_id: str | None = None,
+    requested_by: str | None = None,
+    full: bool = False,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Run one durable Zotero collection sync, or dispatch all bindings currently due.
+
+    The no-argument form is suitable for desktop startup and a 15-minute cron.  It is
+    an intentional no-op in Server profile; Server exposes only the existing file import.
+    """
+    from app.core.config import get_settings
+    from app.models.zotero_local import ZoteroLocalBinding
+    from app.services.zotero_local import (
+        due_binding_ids,
+        execute_sync_run,
+        prepare_sync_run,
+    )
+
+    if not get_settings().is_desktop:
+        return {"status": "disabled", "reason": "ZOTERO_LOCAL_DESKTOP_ONLY"}
+    if binding_id is None:
+        async with get_sessionmaker()() as session:
+            ids = await due_binding_ids(session)
+        for due_id in ids:
+            await ctx["redis"].enqueue_job(
+                "zotero_local_sync_task",
+                binding_id=str(due_id),
+                _job_id=f"zotero-local-sync-{due_id}",
+            )
+        return {"status": "dispatched", "count": len(ids)}
+
+    binding_uuid = uuid.UUID(binding_id)
+    async with get_sessionmaker()() as session:
+        binding = await session.get(ZoteroLocalBinding, binding_uuid)
+        if binding is None:
+            return {"status": "missing", "binding_id": binding_id}
+        if run_id is None:
+            run = await prepare_sync_run(
+                session,
+                binding=binding,
+                requested_by=uuid.UUID(requested_by) if requested_by else binding.created_by,
+                full=full,
+            )
+            run_uuid = run.id
+        else:
+            run_uuid = uuid.UUID(run_id)
+        result = await execute_sync_run(session, run_id=run_uuid)
+        if result.created or result.updated or result.missing:
+            try:
+                from app.services.obsidian_vault_bridge import sync_library_to_vaults
+
+                await sync_library_to_vaults(session, library_id=binding.library_id)
+                await session.commit()
+            except Exception:  # noqa: BLE001 - Zotero metadata remains authoritative
+                await session.rollback()
+                logger.warning(
+                    "Obsidian projection failed after Zotero sync for library %s",
+                    binding.library_id,
+                )
+        return {
+            "status": result.status,
+            "run_id": str(result.id),
+            "binding_id": str(result.binding_id),
+            "total": result.total,
+            "created": result.created,
+            "updated": result.updated,
+            "existing": result.existing,
+            "ignored": result.ignored,
+            "missing": result.missing,
+            "failed": result.failed,
+        }
+
+
+async def generate_paper_summary_task(
+    ctx: dict[str, Any],
+    revision_id: str,
+    user_id: str | None = None,
+    library_id: str | None = None,
+    project_id: str | None = None,
+) -> None:
+    """Generate one persisted summary revision and switch it current only after success."""
+    from app.services.paper_summaries import generate_queued_revision
+
+    async with get_sessionmaker()() as session:
+        await generate_queued_revision(
+            session,
+            revision_id=uuid.UUID(revision_id),
+            user_id=uuid.UUID(user_id) if user_id else None,
+            library_id=uuid.UUID(library_id) if library_id else None,
+            project_id=uuid.UUID(project_id) if project_id else None,
+        )
+
+
+async def recover_paper_summary_jobs_task(
+    ctx: dict[str, Any], *, include_fresh: bool = False
+) -> int:
+    """Requeue durable summary revisions orphaned by an API/worker restart.
+
+    Startup owns every pre-existing in-flight row and can reclaim it immediately. Periodic
+    reconciliation is conservative: queued rows wait two minutes and generating rows wait past
+    the worker's two-hour timeout before being reset.
+    """
+    import time
+    from datetime import timedelta
+
+    from sqlalchemy import or_, select
+
+    from app.models.base import utcnow
+    from app.models.library_direction import DirectionLibrary, LibraryPaper
+    from app.models.paper import PaperWikiRevision
+    from app.models.zotero_local import ZoteroLocalBinding
+
+    now = utcnow()
+    stmt = select(PaperWikiRevision).where(
+        or_(
+            PaperWikiRevision.status.in_(("queued", "generating")),
+            (
+                (PaperWikiRevision.status == "ready")
+                & (PaperWikiRevision.stage == "project")
+            ),
+        )
+    )
+    if not include_fresh:
+        stmt = stmt.where(
+            or_(
+                (
+                    (PaperWikiRevision.status == "queued")
+                    & (PaperWikiRevision.updated_at < now - timedelta(minutes=2))
+                ),
+                (
+                    (PaperWikiRevision.status == "generating")
+                    & (PaperWikiRevision.updated_at < now - timedelta(hours=2))
+                ),
+                (
+                    (PaperWikiRevision.status == "ready")
+                    & (PaperWikiRevision.stage == "project")
+                ),
+            )
+        )
+
+    jobs: list[tuple[uuid.UUID, uuid.UUID | None, uuid.UUID | None, uuid.UUID | None]] = []
+    async with get_sessionmaker()() as session:
+        revisions = list((await session.execute(stmt)).scalars())
+        for revision in revisions:
+            if revision.status == "ready":
+                # The projection and ready revision were committed together; only the cosmetic
+                # final stage commit was interrupted, so no LLM work needs to be repeated.
+                revision.stage = "complete"
+                continue
+            if revision.status == "generating":
+                revision.status = "queued"
+                revision.stage = "materialize"
+                revision.error_code = None
+                revision.error_detail = None
+            context = None
+            if revision.source_library_id is None:
+                context = (
+                    await session.execute(
+                        select(LibraryPaper.library_id, DirectionLibrary.project_id)
+                        .join(
+                            DirectionLibrary,
+                            DirectionLibrary.id == LibraryPaper.library_id,
+                        )
+                        .outerjoin(
+                            ZoteroLocalBinding,
+                            ZoteroLocalBinding.library_id == LibraryPaper.library_id,
+                        )
+                        .where(
+                            LibraryPaper.paper_id == revision.paper_id,
+                            LibraryPaper.trash_reason.is_(None),
+                        )
+                        .order_by(
+                            (ZoteroLocalBinding.id.is_not(None)).desc(),
+                            LibraryPaper.created_at,
+                        )
+                        .limit(1)
+                    )
+                ).first()
+            jobs.append(
+                (
+                    revision.id,
+                    revision.created_by,
+                    revision.source_library_id
+                    or (context.library_id if context is not None else None),
+                    revision.source_project_id
+                    or (context.project_id if context is not None else None),
+                )
+            )
+        await session.commit()
+
+    bucket = int(time.time() // 600)
+    for revision_id, user_id, library_id, project_id in jobs:
+        await ctx["redis"].enqueue_job(
+            "generate_paper_summary_task",
+            str(revision_id),
+            str(user_id) if user_id else None,
+            str(library_id) if library_id else None,
+            str(project_id) if project_id else None,
+            _job_id=f"paper-summary-recovery-{revision_id}-{bucket}",
+        )
+    return len(revisions)
+
+
+async def purge_deleted_paper_summaries_task(ctx: dict[str, Any]) -> int:
+    """Permanently remove summary revisions after the 30-day soft-delete window."""
+    from app.services.paper_summaries import purge_expired_summaries
+
+    async with get_sessionmaker()() as session:
+        purged = await purge_expired_summaries(session)
+        await session.commit()
+    return purged
+
+
+async def purge_obsidian_vault_tombstones_task(ctx: dict[str, Any]) -> int:
+    """Remove expired bridge bookkeeping without deleting papers, PDFs, or notes."""
+    from app.services.obsidian_vault_bridge import purge_expired_tombstones
+
+    async with get_sessionmaker()() as session:
+        purged = await purge_expired_tombstones(session)
+        await session.commit()
+    return purged
+
+
+async def purge_deleted_paper_notes_task(ctx: dict[str, Any]) -> int:
+    """Permanently remove private note tombstones after the 30-day recovery window."""
+    from app.services.notes import purge_expired_notes
+
+    async with get_sessionmaker()() as session:
+        return await purge_expired_notes(session)
+
+
+async def sync_obsidian_vault_paper_task(
+    ctx: dict[str, Any],
+    paper_id: str,
+    user_id: str | None = None,
+    entity_type: str | None = None,
+) -> dict[str, Any]:
+    """Incrementally project one changed paper without rescanning every paper in a library."""
+    from app.core.config import get_settings
+    from app.services.obsidian_vault_bridge import sync_paper_to_vaults
+
+    if not get_settings().is_desktop:
+        return {"status": "disabled", "reason": "OBSIDIAN_VAULT_DESKTOP_ONLY"}
+    entity_types = frozenset({entity_type}) if entity_type else None
+    async with get_sessionmaker()() as session:
+        stats = await sync_paper_to_vaults(
+            session,
+            paper_id=uuid.UUID(paper_id),
+            user_id=uuid.UUID(user_id) if user_id else None,
+            entity_types=entity_types,
+        )
+        await session.commit()
+    return stats.as_dict()
+
+
+async def sync_obsidian_vault_library_task(
+    ctx: dict[str, Any], library_id: str, entity_type: str | None = None
+) -> dict[str, Any]:
+    """Project one changed library to all enabled local Vault connections."""
+    from app.core.config import get_settings
+    from app.services.obsidian_vault_bridge import sync_library_to_vaults
+
+    if not get_settings().is_desktop:
+        return {"status": "disabled", "reason": "OBSIDIAN_VAULT_DESKTOP_ONLY"}
+    entity_types = frozenset({entity_type}) if entity_type else None
+    async with get_sessionmaker()() as session:
+        stats = await sync_library_to_vaults(
+            session,
+            library_id=uuid.UUID(library_id),
+            entity_types=entity_types,
+        )
+        await session.commit()
+    return stats.as_dict()
+
+
 def _make_engine() -> VoyageEngine:
     return VoyageEngine(event_bus=EventBus(get_redis()))
 
@@ -111,6 +389,7 @@ async def reconcile_stuck_voyages(ctx: dict[str, Any]) -> None:
         await ctx["redis"].enqueue_job(
             "resume_voyage", str(vid), _job_id=_reconcile_job_id(vid, now)
         )
+    await recover_paper_summary_jobs_task(ctx, include_fresh=True)
 
 
 async def reconcile_stale_voyages(

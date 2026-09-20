@@ -15,7 +15,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.models.paper_assets import PaperAsset, PdfBlob
+from app.models.paper_assets import AssetGrant, PaperAsset, PdfBlob
 from app.models.paper_content import (
     PaperContentChunk,
     PaperContentChunkVector,
@@ -325,6 +325,44 @@ async def current_content_version(
         .where(PaperContentVersion.paper_id == paper_id, PaperContentVersion.is_current.is_(True))
         .order_by(PaperContentVersion.version_no.desc())
     )
+
+
+async def latest_readable_content_version(
+    session: AsyncSession,
+    *,
+    paper_id: uuid.UUID,
+    library_id: uuid.UUID,
+    require_process: bool = False,
+    ready_only: bool = False,
+) -> PaperContentVersion | None:
+    """Return the newest version backed by an active grant for one library.
+
+    ``is_current`` is a legacy paper-global pointer.  A globally deduplicated Paper can have
+    private assets in several libraries, so requiring that flag would let a parse in library B
+    hide the still-readable version in library A.  Prefer it when it is accessible, then fall
+    back to the newest accessible immutable version.
+    """
+    stmt = (
+        select(PaperContentVersion)
+        .join(AssetGrant, AssetGrant.asset_id == PaperContentVersion.asset_id)
+        .where(
+            PaperContentVersion.paper_id == paper_id,
+            AssetGrant.library_id == library_id,
+            AssetGrant.status == "active",
+            AssetGrant.can_read.is_(True),
+        )
+        .order_by(
+            PaperContentVersion.is_current.desc(),
+            PaperContentVersion.version_no.desc(),
+        )
+    )
+    if require_process:
+        stmt = stmt.where(AssetGrant.can_process.is_(True))
+    if ready_only:
+        stmt = stmt.where(
+            PaperContentVersion.status.in_(("ready", "ready_fallback", "vector_ready"))
+        )
+    return await session.scalar(stmt.limit(1))
 
 
 async def list_content_chunks(

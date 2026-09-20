@@ -7,7 +7,12 @@
    - 引导中的所有具名阶段都映射到四步进度里，未知阶段稳妥地不高亮。 */
 
 import { describe, expect, it } from 'vitest';
-import { BOOTSTRAP_STEPS, bootstrapGate, bootstrapStepIndex } from './engineBootstrap';
+import {
+  BOOTSTRAP_STEPS,
+  bootstrapFailureKind,
+  bootstrapGate,
+  bootstrapStepIndex,
+} from './engineBootstrap';
 
 describe('bootstrapGate', () => {
   it('web 端 / 桥失败（null）放行', () => {
@@ -55,5 +60,25 @@ describe('bootstrapStepIndex', () => {
       expect(i).toBeGreaterThanOrEqual(0);
       expect(i).toBeLessThan(BOOTSTRAP_STEPS.length);
     }
+  });
+});
+
+describe('bootstrapFailureKind', () => {
+  it('只对已知的旧凭据迁移故障展示恢复指引', () => {
+    expect(bootstrapFailureKind({
+      phase: 'failed',
+      done: true,
+      errorCode: 'DESKTOP_ENCRYPTION_MIGRATION_REQUIRED',
+      message: '宿主提供的脱敏提示',
+    })).toBe('legacy-encryption-migration');
+  });
+
+  it('未知故障码与任意 message 都落到通用失败页', () => {
+    expect(bootstrapFailureKind({
+      phase: 'failed',
+      done: true,
+      errorCode: 'UNEXPECTED_FAILURE',
+      message: '/Users/example/private/path secret=do-not-render',
+    })).toBe('generic');
   });
 });

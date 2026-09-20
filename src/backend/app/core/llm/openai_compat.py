@@ -268,12 +268,14 @@ class OpenAICompatProvider(LLMProvider):
         base_url: str,
         api_key: str,
         *,
+        auth_scheme: str = "bearer",
         client: httpx.AsyncClient | None = None,
         timeout: float = 300.0,
         max_attempts: int = _MAX_ATTEMPTS,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
+        self._auth_scheme = auth_scheme
         self._max_attempts = max_attempts
         self._client = client or httpx.AsyncClient(timeout=timeout)
         # 已确认不吃 reasoning_effort 的 model（本进程内记忆）。provider 实例被
@@ -281,6 +283,8 @@ class OpenAICompatProvider(LLMProvider):
         self._effort_unsupported: set[str] = set()
 
     def _headers(self) -> dict[str, str]:
+        if self._auth_scheme == "none" or not self._api_key:
+            return {}
         return {"Authorization": f"Bearer {self._api_key}"}
 
     def _payload(

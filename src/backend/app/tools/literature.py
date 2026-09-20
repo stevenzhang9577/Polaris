@@ -13,7 +13,9 @@ from sqlalchemy import select
 
 from app.core.db import get_sessionmaker
 from app.models.paper import Concept, Paper
+from app.models.paper_assets import PaperAsset
 from app.services import concepts as concepts_service
+from app.services import paper_summaries as paper_summaries_service
 from app.services import papers as papers_service
 from app.services.concepts import library_concept_ids
 from app.services.embedding import embed_query
@@ -147,6 +149,61 @@ async def read_wiki(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+@tool(
+    "read_paper_summary",
+    description="读取论文当前的版本化总结，返回全文/摘要级别、过期状态与证据引用",
+    input_schema={
+        "type": "object",
+        "properties": {"paper_id": {"type": "string", "description": "论文 uuid"}},
+        "required": ["paper_id"],
+    },
+    summarize=lambda a, r: f"阅读论文总结：{r.get('title', a.get('paper_id', ''))}",
+)
+async def read_paper_summary(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    async with get_sessionmaker()() as session:
+        paper = await _get_project_paper(session, ctx, args.get("paper_id"))
+        current = await paper_summaries_service.get_current_summary(
+            session, paper=paper.paper
+        )
+        if current is None:
+            return {
+                "paper_id": str(paper.id),
+                "title": paper.title,
+                "summary": None,
+                "abstract": (paper.abstract or "")[:2000] or None,
+                "note": "该论文尚无可用总结",
+            }
+        _wiki, revision = current
+        stale = await paper_summaries_service.revision_is_stale(
+            session, paper=paper.paper, revision=revision
+        )
+        await session.commit()  # persists lazy legacy backfill
+        content = revision.content or ""
+        return {
+            "paper_id": str(paper.id),
+            "title": paper.title,
+            "current_revision_id": str(revision.id),
+            "content_version_id": (
+                str(revision.content_version_id) if revision.content_version_id else None
+            ),
+            "source_level": revision.source_level,
+            "source_basis": (
+                "fulltext"
+                if revision.content_version_id is not None
+                or revision.source_level == "fulltext"
+                else "abstract"
+                if revision.source_level in {"abstract", "obsidian"}
+                else "unknown"
+            ),
+            "stale": stale,
+            "tldr": revision.tldr,
+            "model": revision.model,
+            "summary": content[:_WIKI_CHARS],
+            "truncated": len(content) > _WIKI_CHARS,
+            "evidence_manifest": revision.evidence_manifest,
+        }
+
+
 def _read_fulltext_summary(a: dict[str, Any], r: dict[str, Any]) -> str:
     target = r.get("title", a.get("paper_id", ""))
     return f"查阅全文：{target}" + (f"（定位「{a['query']}」）" if a.get("query") else "")
@@ -193,7 +250,21 @@ async def read_fulltext(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
                 "evidence": [ref for chunk in chunks for ref in chunk["evidence"]],
                 "next_page": page + 1 if parsed["next_offset"] is not None else None,
             }
-        path = Path(paper.full_text_path) if paper.full_text_path else None
+        # ``Paper.full_text_path`` predates library-scoped assets and may point at text
+        # extracted from another tenant's private PDF. Once any scoped asset exists for
+        # the globally deduplicated paper, an absent grant-scoped result must stay absent;
+        # never fall back to that compatibility path.
+        has_scoped_asset = (
+            await session.scalar(
+                select(PaperAsset.id).where(PaperAsset.paper_id == paper.id).limit(1)
+            )
+            is not None
+        )
+        path = (
+            Path(paper.full_text_path)
+            if paper.full_text_path and not has_scoped_asset
+            else None
+        )
         title = paper.title
         paper_id = str(paper.id)
         if path is None or not path.is_file():

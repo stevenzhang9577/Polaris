@@ -305,7 +305,13 @@ export function LibraryDetailPane({
             {tr('原文链接', 'Source link')}
           </a>
         )}
-        {alive && <PdfUploadButton paperId={paper.id} pdfAvailable={paper.pdf_available} />}
+        {alive && (
+          <PdfUploadButton
+            paperId={paper.id}
+            pdfAvailable={paper.pdf_available}
+            canManage={paper.can_manage_summary === true}
+          />
+        )}
       </div>
 
       {/* —— 个人状态：星标 + 阅读状态（论文还在才有） —— */}

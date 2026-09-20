@@ -199,7 +199,10 @@ async def refresh_paper_notes(session: AsyncSession, paper_id: uuid.UUID) -> Non
             (
                 await session.execute(
                     select(PaperNote)
-                    .where(PaperNote.paper_id == paper_id)
+                    .where(
+                        PaperNote.paper_id == paper_id,
+                        PaperNote.deleted_at.is_(None),
+                    )
                     .order_by(PaperNote.created_at)
                 )
             ).scalars()

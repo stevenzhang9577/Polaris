@@ -17,17 +17,33 @@
 import { BrowserWindow, app } from 'electron';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { gzipSync } from 'node:zlib';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import type { FetchImpl, SqliteTree, StorageService } from '@polaris/kernel';
 
 import { kernelPluginMeta, localBackend, marketPluginsDir, startKernel, stopKernel } from './main/kernel';
 import { capabilityManifest } from './main/capabilities';
+import {
+  LEGACY_ENGINE_SECRETS_ERROR,
+  loadOrCreateEngineEncryptionKey,
+  withEngineEncryptionKey,
+  type SafeStorageLike,
+} from './main/engine-secret';
 import { installIpc, registeredMethods } from './main/ipc/router';
+import { pickDirectory } from './main/ipc/methods.host';
 import {
   MARKET_ENDPOINT_META_KEY,
   awaitInstallForTesting,
@@ -40,7 +56,7 @@ import {
 } from './main/ipc/methods.market';
 import { writeConfig } from './main/store';
 import { pluginsDisable, pluginsEnable, pluginsExportTree, pluginsList } from './main/ipc/methods.plugins';
-import { MARKET_ENDPOINT_DEFAULT } from './shared/contract';
+import { CONTRACT_VERSION, MARKET_ENDPOINT_DEFAULT } from './shared/contract';
 import { extractTarGz } from './main/updates/tar';
 import { compareVersions, stagedSupersedes } from './main/updates/version';
 import { APP_INDEX, buildCsp, handleAppProtocol, registerAppScheme } from './main/protocol';
@@ -354,7 +370,7 @@ void app.whenReady().then(async () => {
 
   console.log('\n能力清单与 local.*');
   const manifest = await capabilityManifest();
-  check('契约版本已声明', manifest.contract >= 1);
+  check('能力清单使用当前契约版本', manifest.contract === CONTRACT_VERSION && CONTRACT_VERSION === 4);
 
   // 方法表与契约版本是一对：#705 把 local.* 换成 kernel.*/plugins.* 却没动
   // CONTRACT_VERSION，老外壳因此会照收新界面——插件页按能力表自动隐藏，不报错，
@@ -364,6 +380,7 @@ void app.whenReady().then(async () => {
     'host.copyText',
     'host.info',
     'host.openExternal',
+    'host.pickDirectory',
     'host.setBadgeCount',
     'host.setServerUrl',
     'host.testServer',
@@ -401,6 +418,216 @@ void app.whenReady().then(async () => {
     'plugins.manage 能力位可用（配置树已就绪）',
     manifest.capabilities['plugins.manage']?.available === true,
     JSON.stringify(manifest.capabilities['plugins.manage']),
+  );
+  check(
+    'obsidian.vault.sync 能力位可用',
+    manifest.capabilities['obsidian.vault.sync']?.available === true,
+  );
+  check(
+    'llm.local-config-import 能力位可用',
+    manifest.capabilities['llm.local-config-import']?.available === true,
+  );
+
+  // 内嵌后端主密钥：用进程内假 safeStorage 测格式/幂等/权限，绝不触碰测试机
+  // 钥匙串。真实 Electron safeStorage 只在实际存在 command 引擎时才会被调用。
+  const fakeSafeStorage: SafeStorageLike = {
+    isEncryptionAvailable: () => true,
+    // 可逆替身只用于证明持久载荷不是明文；真实密码学由 Electron 实现。
+    encryptString: (plainText) => {
+      const bytes = Buffer.from(plainText, 'utf8');
+      for (let i = 0; i < bytes.length; i++) bytes[i] ^= 0xa5;
+      return bytes;
+    },
+    decryptString: (encrypted) => {
+      const bytes = Buffer.from(encrypted);
+      for (let i = 0; i < bytes.length; i++) bytes[i] ^= 0xa5;
+      return bytes.toString('utf8');
+    },
+    getSelectedStorageBackend: () => 'gnome_libsecret',
+  };
+  const secureSecretDir = mkdtempSync(join(tmpdir(), 'polaris-secret-secure-'));
+  const secureOptions = {
+    dataDir: secureSecretDir,
+    platform: 'linux' as const,
+    safeStorage: fakeSafeStorage,
+    allowSafeStorage: true,
+  };
+  const firstEngineKey = loadOrCreateEngineEncryptionKey(secureOptions);
+  const secondEngineKey = loadOrCreateEngineEncryptionKey(secureOptions);
+  const secureSecretPath = join(secureSecretDir, 'secrets', 'engine-fernet-key');
+  const securePayload = readFileSync(secureSecretPath);
+  check(
+    '内嵌后端主密钥跨启动稳定且安全存储文件不含明文',
+    firstEngineKey === secondEngineKey && !securePayload.includes(Buffer.from(firstEngineKey)),
+  );
+  check(
+    '内嵌后端主密钥文件权限为 0600',
+    process.platform === 'win32' || (statSync(secureSecretPath).mode & 0o777) === 0o600,
+  );
+  const isolatedEnv: NodeJS.ProcessEnv = {};
+  let injectedKey = '';
+  await withEngineEncryptionKey(firstEngineKey, async () => {
+    injectedKey = isolatedEnv.POLARIS_ENCRYPTION_KEY ?? '';
+  }, isolatedEnv);
+  check(
+    '主密钥只在 engine spawn 窗口注入并在之后清除',
+    injectedKey === firstEngineKey && isolatedEnv.POLARIS_ENCRYPTION_KEY === undefined,
+  );
+  writeFileSync(secureSecretPath, 'corrupt', { mode: 0o600 });
+  let corruptSecretError = '';
+  try {
+    loadOrCreateEngineEncryptionKey(secureOptions);
+  } catch (error) {
+    corruptSecretError = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    '损坏的内嵌后端主密钥 fail closed 而不静默轮换',
+    corruptSecretError.includes('invalid size') || corruptSecretError.includes('unknown format'),
+    corruptSecretError,
+  );
+  rmSync(secureSecretDir, { recursive: true, force: true });
+
+  const fallbackSecretDir = mkdtempSync(join(tmpdir(), 'polaris-secret-owner-only-'));
+  const unavailableSafeStorage: SafeStorageLike = {
+    isEncryptionAvailable: () => false,
+    encryptString: () => { throw new Error('must not encrypt'); },
+    decryptString: () => { throw new Error('must not decrypt'); },
+  };
+  const fallbackKey = loadOrCreateEngineEncryptionKey({
+    dataDir: fallbackSecretDir,
+    platform: 'darwin',
+    safeStorage: unavailableSafeStorage,
+    allowSafeStorage: false,
+  });
+  check(
+    'ad-hoc macOS 回退仍生成独立 Fernet key 而非公开默认值',
+    /^[A-Za-z0-9_-]{43}=$/.test(fallbackKey) && fallbackKey !== 'change-me-fernet-key',
+  );
+  rmSync(fallbackSecretDir, { recursive: true, force: true });
+
+  // 升级保护：旧库里一旦有按公开 dev secret 加密的载荷，首次建随机 key
+  // 必须 fail closed，且不能落 key 文件或改数据库。无敏感值的旧库则可升级。
+  const legacySecretDir = mkdtempSync(join(tmpdir(), 'polaris-secret-legacy-db-'));
+  const legacyEngineDir = join(legacySecretDir, 'engine');
+  mkdirSync(legacyEngineDir, { recursive: true });
+  const legacyDbPath = join(legacyEngineDir, 'polaris.db');
+  const legacyDb = new DatabaseSync(legacyDbPath);
+  legacyDb.exec(`
+    CREATE TABLE llm_providers (api_key_encrypted TEXT);
+    INSERT INTO llm_providers (api_key_encrypted) VALUES ('legacy-ciphertext');
+  `);
+  legacyDb.close();
+  let legacyDatabaseError = '';
+  try {
+    loadOrCreateEngineEncryptionKey({
+      dataDir: legacySecretDir,
+      platform: 'darwin',
+      safeStorage: unavailableSafeStorage,
+      allowSafeStorage: false,
+    });
+  } catch (error) {
+    legacyDatabaseError = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    '旧库含加密凭据时阻止换钥匙且不落新 key',
+    legacyDatabaseError.includes(LEGACY_ENGINE_SECRETS_ERROR)
+      && !existsSync(join(legacySecretDir, 'secrets', 'engine-fernet-key')),
+    legacyDatabaseError,
+  );
+  const verifyLegacyDb = new DatabaseSync(legacyDbPath, { readOnly: true });
+  const legacyRow = verifyLegacyDb.prepare(
+    'SELECT api_key_encrypted FROM llm_providers LIMIT 1',
+  ).get() as { api_key_encrypted?: unknown } | undefined;
+  verifyLegacyDb.close();
+  check('升级保护不修改旧密文', legacyRow?.api_key_encrypted === 'legacy-ciphertext');
+  rmSync(legacySecretDir, { recursive: true, force: true });
+
+  const legacyJsonDir = mkdtempSync(join(tmpdir(), 'polaris-secret-legacy-json-'));
+  const legacyJsonEngineDir = join(legacyJsonDir, 'engine');
+  mkdirSync(legacyJsonEngineDir, { recursive: true });
+  const legacyJsonDb = new DatabaseSync(join(legacyJsonEngineDir, 'polaris.db'));
+  legacyJsonDb.exec(`
+    CREATE TABLE system_settings (key TEXT PRIMARY KEY, value JSON);
+    INSERT INTO system_settings (key, value)
+    VALUES ('document_processing', '{"credentials":[{"secret":"legacy-ciphertext"}]}');
+  `);
+  legacyJsonDb.close();
+  let legacyJsonError = '';
+  try {
+    loadOrCreateEngineEncryptionKey({
+      dataDir: legacyJsonDir,
+      platform: 'darwin',
+      safeStorage: unavailableSafeStorage,
+      allowSafeStorage: false,
+    });
+  } catch (error) {
+    legacyJsonError = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    '旧 system_settings JSON 中的凭据同样阻止换钥匙',
+    legacyJsonError.includes(LEGACY_ENGINE_SECRETS_ERROR),
+    legacyJsonError,
+  );
+  rmSync(legacyJsonDir, { recursive: true, force: true });
+
+  const cleanLegacyDir = mkdtempSync(join(tmpdir(), 'polaris-secret-clean-db-'));
+  const cleanEngineDir = join(cleanLegacyDir, 'engine');
+  mkdirSync(cleanEngineDir, { recursive: true });
+  const cleanDb = new DatabaseSync(join(cleanEngineDir, 'polaris.db'));
+  cleanDb.exec('CREATE TABLE llm_providers (api_key_encrypted TEXT)');
+  cleanDb.close();
+  const cleanUpgradeKey = loadOrCreateEngineEncryptionKey({
+    dataDir: cleanLegacyDir,
+    platform: 'darwin',
+    safeStorage: unavailableSafeStorage,
+    allowSafeStorage: false,
+  });
+  check(
+    '不含加密载荷的旧库可安全生成每安装随机 key',
+    /^[A-Za-z0-9_-]{43}=$/.test(cleanUpgradeKey),
+  );
+  rmSync(cleanLegacyDir, { recursive: true, force: true });
+  let pickerOptions: { properties?: string[] } | undefined;
+  const picked = await pickDirectory('obsidian-vault', async (options) => {
+    pickerOptions = options;
+    return { canceled: false, filePaths: ['/tmp/test-vault'] };
+  });
+  check(
+    'Vault 目录选择器限定为原生目录',
+    picked.path === '/tmp/test-vault'
+      && pickerOptions?.properties?.includes('openDirectory') === true,
+  );
+  const cancelledPick = await pickDirectory('obsidian-vault', async () => ({
+    canceled: true,
+    filePaths: [],
+  }));
+  check('Vault 目录选择取消返回 null', cancelledPick.path === null);
+  let invalidPurposeError = '';
+  try {
+    await pickDirectory('arbitrary-directory', async () => ({
+      canceled: false,
+      filePaths: ['/tmp/should-not-be-reachable'],
+    }));
+  } catch (error) {
+    invalidPurposeError = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    'Vault 目录选择器拒绝非法 purpose',
+    invalidPurposeError.includes('ERR_INVALID_PARAMS'),
+    invalidPurposeError,
+  );
+  let pickerFailure = '';
+  try {
+    await pickDirectory('obsidian-vault', async () => {
+      throw new Error('dialog-unavailable');
+    });
+  } catch (error) {
+    pickerFailure = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    'Vault 目录选择器保留原生异常',
+    pickerFailure === 'dialog-unavailable',
+    pickerFailure,
   );
   check(
     'tectonic 探测已真的执行（本地编译落地时直接用）',

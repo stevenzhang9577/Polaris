@@ -115,7 +115,7 @@ async def create_or_reuse_asset(
         raise AssetPermissionError("LIBRARY_ASSET_MANAGE_FORBIDDEN")
     if sharing_scope not in SHARING_SCOPES:
         raise AssetError("invalid sharing scope")
-    if source not in {"oa", "upload", "extension", "arxiv", "manual", "unknown"}:
+    if source not in {"oa", "upload", "extension", "arxiv", "manual", "unknown", "zotero"}:
         raise AssetError("invalid asset source")
     normalized_identity = identity_key.strip().lower() if identity_key else None
     if (
@@ -190,8 +190,9 @@ async def create_or_reuse_asset(
         existing_grant.can_process = True
         existing_grant.revoked_by = None
         existing_grant.granted_by = user.id
-    # Keep the legacy reader path working while the asset APIs migrate callers.
-    if not paper.pdf_path:
+    # The legacy Paper path is global. Only public assets may populate it; writing a private or
+    # library-scoped Zotero path here would bypass AssetGrant in older readers/exporters.
+    if sharing_scope == "public" and not paper.pdf_path:
         paper.pdf_path = str(path)
     await session.flush()
     return asset

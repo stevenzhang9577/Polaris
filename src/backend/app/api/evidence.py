@@ -9,10 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth import current_active_user
 from app.core.db import get_session
 from app.models.evidence import PaperEvidenceAnchor
+from app.models.paper_assets import AssetGrant
+from app.models.paper_content import PaperContentChunk, PaperContentVersion
 from app.models.user import User
 from app.schemas.evidence import EvidenceResolution
 from app.services import libraries as libraries_service
-from app.services import paper_assets as asset_service
 from app.services import paper_content as content_service
 from app.services import papers as papers_service
 from app.services.evidence import resolve_evidence_anchor
@@ -39,24 +40,42 @@ async def resolve_library_evidence(
     )
     if paper is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="PAPER_NOT_FOUND")
+    # An anchor's quoted text belongs to the immutable content version behind its
+    # original chunk.  A globally deduplicated Paper can have private assets in
+    # several libraries, so matching only ``paper_id`` would expose another
+    # library's quote.  Require an active read grant for that exact origin asset.
     anchor = await session.scalar(
-        select(PaperEvidenceAnchor).where(
+        select(PaperEvidenceAnchor)
+        .join(PaperContentChunk, PaperContentChunk.id == PaperEvidenceAnchor.chunk_id)
+        .join(
+            PaperContentVersion,
+            PaperContentVersion.id == PaperContentChunk.content_version_id,
+        )
+        .join(AssetGrant, AssetGrant.asset_id == PaperContentVersion.asset_id)
+        .where(
             PaperEvidenceAnchor.id == anchor_id,
             PaperEvidenceAnchor.paper_id == paper_id,
+            PaperContentVersion.paper_id == paper_id,
+            AssetGrant.library_id == library_id,
+            AssetGrant.status == "active",
+            AssetGrant.can_read.is_(True),
         )
     )
     if anchor is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="EVIDENCE_NOT_FOUND")
-    version = await content_service.current_content_version(session, paper_id=paper_id)
+    version = await content_service.latest_readable_content_version(
+        session,
+        paper_id=paper_id,
+        library_id=library_id,
+        ready_only=True,
+    )
     chunks = (
         await content_service.list_content_chunks(session, version_id=version.id)
         if version is not None
         else []
     )
     result = await resolve_evidence_anchor(session, anchor, current_chunks=chunks)
-    if version is None or await asset_service.readable_asset(
-        session, asset_id=version.asset_id, library_id=library_id
-    ) is None:
+    if version is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="EVIDENCE_ASSET_NOT_FOUND")
     resolved_chunk = next(
         (chunk for chunk in chunks if chunk.id == result.chunk_id),

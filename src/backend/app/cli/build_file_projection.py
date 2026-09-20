@@ -71,11 +71,16 @@ async def _run(args: argparse.Namespace) -> None:
                     print(f"papers: {i}/{len(papers)}")
 
             # ---- 笔记 / 划线 ----
-            note_ids = select(PaperNote.paper_id).union(select(PaperHighlight.paper_id))
+            note_ids = select(PaperNote.paper_id).where(PaperNote.deleted_at.is_(None)).union(
+                select(PaperHighlight.paper_id)
+            )
             if args.library:
                 note_ids = (
                     select(PaperNote.paper_id)
-                    .where(PaperNote.paper_id.in_(_member_paper_ids(args.library)))
+                    .where(
+                        PaperNote.paper_id.in_(_member_paper_ids(args.library)),
+                        PaperNote.deleted_at.is_(None),
+                    )
                     .union(
                         select(PaperHighlight.paper_id).where(
                             PaperHighlight.paper_id.in_(_member_paper_ids(args.library))

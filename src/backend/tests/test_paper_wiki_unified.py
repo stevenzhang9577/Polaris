@@ -99,6 +99,10 @@ async def test_second_user_recompile_overwrites_and_takes_over_compiled_by(clien
     )
     assert resp.status_code == 200, resp.text
 
+    detail = await client.get(f"/api/papers/{paper_id}", headers=bob_headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["can_manage_summary"] is True
+
     resp = await client.post(f"/api/papers/{paper_id}/recompile", headers=bob_headers)
     assert resp.status_code == 200, resp.text
     assert await _wiki_row_count(paper_id) == 1

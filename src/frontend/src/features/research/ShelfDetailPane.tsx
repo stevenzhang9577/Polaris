@@ -349,7 +349,13 @@ export function ShelfDetailPane({
             {tr('原文链接', 'Source link')}
           </a>
         )}
-        {paper && <PdfUploadButton paperId={paper.id} pdfAvailable={paper.pdf_available} />}
+        {paper && (
+          <PdfUploadButton
+            paperId={paper.id}
+            pdfAvailable={paper.pdf_available}
+            canManage={paper.can_manage_summary === true}
+          />
+        )}
         {onShelf ? (
           <button
             className="btn btn-ghost sm"

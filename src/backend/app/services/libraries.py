@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from sqlalchemy import Select, delete, func, or_, select
+from sqlalchemy import Select, and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.library_direction import (
@@ -90,10 +90,23 @@ async def get_library_for_project(
 
 
 async def get_source_library_ids(session: AsyncSession, topic_id: uuid.UUID) -> list[uuid.UUID]:
-    """课题关联的全部库 id（按关联建立时间；空=无语料）。"""
+    """课题当前获授权的关联库 id（按关联建立时间；空=无语料）。
+
+    关联行不是永久授权：公共库改回私有、或历史异常行指向他人私有库时，所有课题语料
+    消费端都必须立即忽略它，不能只在论文详情接口补一层过滤。
+    """
     stmt = (
         select(TopicSourceLibrary.library_id)
-        .where(TopicSourceLibrary.topic_id == topic_id)
+        .join(DirectionLibrary, DirectionLibrary.id == TopicSourceLibrary.library_id)
+        .join(Project, Project.id == TopicSourceLibrary.topic_id)
+        .where(
+            TopicSourceLibrary.topic_id == topic_id,
+            or_(
+                DirectionLibrary.is_public.is_(True),
+                DirectionLibrary.submitted_by == Project.owner_id,
+                DirectionLibrary.submitted_by.is_(None),
+            ),
+        )
         .order_by(TopicSourceLibrary.created_at)
     )
     return list((await session.execute(stmt)).scalars().all())
@@ -102,11 +115,19 @@ async def get_source_library_ids(session: AsyncSession, topic_id: uuid.UUID) -> 
 async def get_source_libraries(
     session: AsyncSession, topic_id: uuid.UUID
 ) -> list[DirectionLibrary]:
-    """课题关联的全部库对象（按关联建立时间；空=无语料）。"""
+    """课题当前获授权的关联库对象（按关联建立时间；空=无语料）。"""
     stmt = (
         select(DirectionLibrary)
         .join(TopicSourceLibrary, TopicSourceLibrary.library_id == DirectionLibrary.id)
-        .where(TopicSourceLibrary.topic_id == topic_id)
+        .join(Project, Project.id == TopicSourceLibrary.topic_id)
+        .where(
+            TopicSourceLibrary.topic_id == topic_id,
+            or_(
+                DirectionLibrary.is_public.is_(True),
+                DirectionLibrary.submitted_by == Project.owner_id,
+                DirectionLibrary.submitted_by.is_(None),
+            ),
+        )
         .order_by(TopicSourceLibrary.created_at)
     )
     return list((await session.execute(stmt)).scalars().all())
@@ -255,10 +276,24 @@ def dedupe_member_rows(
     return list(best.values())
 
 
+def linkable_library_clause(user_id: uuid.UUID):
+    """Libraries a user may attach to one of their projects.
+
+    Public libraries are discoverable/shareable, private libraries remain creator-only, and
+    legacy unowned libraries stay usable in single-user/Desktop installations.
+    """
+    return or_(
+        DirectionLibrary.is_public.is_(True),
+        DirectionLibrary.submitted_by == user_id,
+        DirectionLibrary.submitted_by.is_(None),
+    )
+
+
 def visible_library_clause(user_id: uuid.UUID):
     """「这个库我够得着吗」——库作用域读取口的统一条件，作用于 ``DirectionLibrary.id``。
 
-    够得着 = 库被我的某个课题关联 ∪ 我创建的库 ∪ 无主库。
+    够得着 = 被我的课题关联的公共库 ∪ 我创建的库 ∪ 无主库。异常关联到他人的
+    私有库不能扩大权限；关联写入口也使用 :func:`linkable_library_clause` 拦截。
 
     「我课题的库」走关联表 ``topic_source_libraries`` —— 课题与库是多对多关联，
     不是 project_id 回指。按 project_id 判会漏掉课题关联的独立库（那才是常态：
@@ -274,7 +309,10 @@ def visible_library_clause(user_id: uuid.UUID):
     # admin 全局可见旁路已随 role 移除（#614）；无主库（submitted_by 为空）保持
     # 全员可见——与 library_visible_to / can_manage_library 同口径，别让列表与详情打架
     return or_(
-        DirectionLibrary.id.in_(my_topic_libraries),
+        and_(
+            DirectionLibrary.id.in_(my_topic_libraries),
+            DirectionLibrary.is_public.is_(True),
+        ),
         DirectionLibrary.submitted_by == user_id,
         DirectionLibrary.submitted_by.is_(None),
     )
@@ -329,7 +367,13 @@ async def _library_stats(
     # 最近编译时间取解读行（论文级唯一一份）的 updated_at：库内任一论文被重编译都算
     paper_rows = await session.execute(
         select(LibraryPaper.library_id, func.count(), func.max(PaperWiki.updated_at))
-        .outerjoin(PaperWiki, PaperWiki.paper_id == LibraryPaper.paper_id)
+        .outerjoin(
+            PaperWiki,
+            and_(
+                PaperWiki.paper_id == LibraryPaper.paper_id,
+                PaperWiki.deleted_at.is_(None),
+            ),
+        )
         .where(
             LibraryPaper.library_id.in_(library_ids),
             LibraryPaper.status.in_(PAPER_STATUS_GROUPS["library"]),

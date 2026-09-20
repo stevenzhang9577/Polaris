@@ -1,6 +1,19 @@
-import { app, clipboard, net, shell } from 'electron';
+import {
+  app,
+  clipboard,
+  dialog,
+  net,
+  shell,
+  type OpenDialogOptions,
+  type OpenDialogReturnValue,
+} from 'electron';
 
-import type { HostInfo, ServerProbe } from '../../shared/contract';
+import {
+  ERR_INVALID_PARAMS,
+  type HostInfo,
+  type PickDirectoryResult,
+  type ServerProbe,
+} from '../../shared/contract';
 import { readConfig, writeConfig } from '../store';
 import { effectiveVersion } from '../updates/renderer-store';
 import { recreateWindow } from '../window';
@@ -84,4 +97,28 @@ export function setBadgeCount(count: number): void {
   // Windows 上返回 false，这里不当作错误。
   if (process.platform === 'win32') return;
   app.setBadgeCount(Math.max(0, Math.floor(count)));
+}
+
+type ShowDirectoryDialog = (options: OpenDialogOptions) => Promise<OpenDialogReturnValue>;
+
+/**
+ * 原生目录选择器。只开放明确的业务 purpose；本函数不保存路径，选中结果交给本地
+ * 后端验证 `.obsidian` 标记与路径边界后再持久化。
+ *
+ * ``showDialog`` 是窄测试缝：冒烟测试可验证选项和取消语义而不真的弹窗。
+ */
+export async function pickDirectory(
+  purpose: string,
+  showDialog: ShowDirectoryDialog = (options) => dialog.showOpenDialog(options),
+): Promise<PickDirectoryResult> {
+  if (purpose !== 'obsidian-vault') {
+    throw new Error(`${ERR_INVALID_PARAMS}: unsupported directory purpose`);
+  }
+  const result = await showDialog({
+    title: '选择 Obsidian Vault',
+    buttonLabel: '选择 Vault',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (result.canceled || result.filePaths.length !== 1) return { path: null };
+  return { path: result.filePaths[0] };
 }

@@ -18,6 +18,7 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.orm.attributes import set_committed_value
@@ -102,7 +103,11 @@ class Paper(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     @property
     def wiki_content(self) -> str | None:
         """解读正文（没有解读为 None）——全平台唯一一份，见 :class:`PaperWiki`。"""
-        return self.wiki.content if self.wiki is not None else None
+        return (
+            self.wiki.content
+            if self.wiki is not None and self.wiki.deleted_at is None
+            else None
+        )
 
 
 class PaperWiki(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -126,8 +131,70 @@ class PaperWiki(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     compiled_by: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL")
     )
+    # 当前展示版本。保留 content/model/compiled_by 作为兼容缓存，老读路径无需 join；
+    # 每次切换版本时由 paper_summaries service 原子同步这些字段。
+    current_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("paper_wiki_revisions.id", ondelete="SET NULL"), index=True
+    )
+    # Vault 删除和显式 DELETE 只隐藏解读，保留 30 天版本历史；到期维护任务再物理清理。
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     paper: Mapped[Paper] = relationship(back_populates="wiki")
+    current_revision: Mapped["PaperWikiRevision | None"] = relationship(
+        foreign_keys=[current_revision_id], post_update=True
+    )
+
+
+SUMMARY_SOURCE_LEVELS = ("fulltext", "abstract", "obsidian", "legacy")
+SUMMARY_REVISION_STATUSES = ("queued", "generating", "ready", "failed", "stale")
+
+
+class PaperWikiRevision(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """论文解读的不可变版本记录。
+
+    ``queued`` / ``generating`` 行在生成完成前允许补齐结果字段；进入 ``ready`` 后正文
+    不再覆盖。激活旧版本只移动 ``PaperWiki.current_revision_id`` 和兼容缓存，不改历史行。
+    """
+
+    __tablename__ = "paper_wiki_revisions"
+    __table_args__ = (
+        Index("ix_paper_wiki_revisions_paper_created", "paper_id", "created_at"),
+        Index(
+            "uq_paper_wiki_revisions_one_inflight",
+            "paper_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'generating')"),
+            sqlite_where=text("status IN ('queued', 'generating')"),
+        ),
+    )
+
+    paper_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("papers.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    content_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("paper_content_versions.id", ondelete="SET NULL"), index=True
+    )
+    source_level: Mapped[str] = mapped_column(String(16), nullable=False, default="legacy")
+    content: Mapped[str | None] = mapped_column(Text)
+    tldr: Mapped[str | None] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(128))
+    prompt_version: Mapped[str | None] = mapped_column(String(64))
+    schema_version: Mapped[str | None] = mapped_column(String(64))
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    source_library_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("direction_libraries.id", ondelete="SET NULL"), index=True
+    )
+    source_project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="SET NULL"), index=True
+    )
+    source_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    evidence_manifest: Mapped[dict[str, Any] | None] = mapped_column(JSONVariant)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued", index=True)
+    stage: Mapped[str | None] = mapped_column(String(24), default="materialize")
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_detail: Mapped[str | None] = mapped_column(Text)
 
 
 def new_paper(**fields: Any) -> Paper:
@@ -196,6 +263,9 @@ class PaperNote(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Notes deleted from Polaris or an editable Obsidian projection remain recoverable for the
+    # retention window.  Every ordinary read path explicitly excludes tombstones.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
 HIGHLIGHT_COLORS = ("yellow", "green", "blue", "pink", "purple")

@@ -39,6 +39,12 @@ from app.models.manuscript import (
     ManuscriptTemplate,
 )
 from app.models.mcp_server import McpServer
+from app.models.obsidian_vault import (
+    ObsidianVaultConnection,
+    VaultConflict,
+    VaultFileState,
+    VaultLibraryBinding,
+)
 from app.models.paper import (
     Concept,
     Paper,
@@ -47,6 +53,8 @@ from app.models.paper import (
     PaperNote,
     PaperTag,
     PaperUserMeta,
+    PaperWiki,
+    PaperWikiRevision,
     UserPaperTag,
     paper_concepts,
     paper_tag_links,
@@ -71,6 +79,7 @@ from app.models.topic_shelf import TopicPaper
 from app.models.user import User
 from app.models.vectors import IdeaVector, PaperChunkVector, PaperVector
 from app.models.voyage import VoyageMessage, VoyageRun, VoyageStep
+from app.models.zotero_local import ZoteroItemLink, ZoteroLocalBinding, ZoteroSyncRun
 
 __all__ = [
     "Activity",
@@ -120,6 +129,7 @@ __all__ = [
     "ManuscriptFileVersion",
     "ManuscriptTemplate",
     "ModelRoute",
+    "ObsidianVaultConnection",
     "Paper",
     "PdfBlob",
     "CITATION_INTENTS",
@@ -133,6 +143,8 @@ __all__ = [
     "PaperNote",
     "PaperTag",
     "PaperUserMeta",
+    "PaperWiki",
+    "PaperWikiRevision",
     "PaperVector",
     "Project",
     "ConnectionCredential",
@@ -153,6 +165,12 @@ __all__ = [
     "VoyageMessage",
     "VoyageRun",
     "VoyageStep",
+    "VaultConflict",
+    "VaultFileState",
+    "VaultLibraryBinding",
+    "ZoteroItemLink",
+    "ZoteroLocalBinding",
+    "ZoteroSyncRun",
     "paper_concepts",
     "paper_tag_links",
 ]

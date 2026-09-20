@@ -197,6 +197,33 @@ async def test_source_libraries_read_write_api(client):
     assert resp.json() == []
 
 
+async def test_source_libraries_cannot_link_another_users_private_library(client):
+    owner = await _hdr(client, "p7-private-owner@example.com")
+    private_response = await client.post(
+        "/api/libraries",
+        json={"name": "owner-only", "statement": "Private research corpus."},
+        headers=owner,
+    )
+    assert private_response.status_code == 201, private_response.text
+    private_library_id = private_response.json()["id"]
+
+    outsider = await _hdr(client, "p7-private-outsider@example.com")
+    project_response = await client.post(
+        "/api/projects", json={"name": "outsider-project"}, headers=outsider
+    )
+    assert project_response.status_code == 201, project_response.text
+    project_id = project_response.json()["id"]
+
+    response = await client.put(
+        f"/api/projects/{project_id}/source-libraries",
+        json={"library_ids": [private_library_id]},
+        headers=outsider,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+
+
 async def test_source_libraries_requires_membership(client):
     """非课题成员不能读/写别人课题的关联库。"""
     owner = await _hdr(client, "p7u-owner7@example.com")

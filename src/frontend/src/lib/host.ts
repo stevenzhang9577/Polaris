@@ -137,6 +137,16 @@ export function setBadgeCount(count: number): void {
   void bridge()?.invoke('host.setBadgeCount', { count });
 }
 
+/** 打开桌面原生目录选择器；用户取消返回 null，宿主错误交给调用方展示。 */
+export async function pickObsidianVaultDirectory(): Promise<string | null> {
+  const b = bridge();
+  if (!b) throw new Error('DESKTOP_HOST_UNAVAILABLE');
+  const result = (await b.invoke('host.pickDirectory', {
+    purpose: 'obsidian-vault',
+  })) as { path: string | null };
+  return result.path;
+}
+
 /** 本地引擎信息（contract.ts 的 LocalBackendInfo 镜像）。 */
 export interface LocalBackendInfo {
   baseUrl: string | null;
@@ -156,6 +166,10 @@ export async function kernelLocalBackend(): Promise<LocalBackendInfo | null> {
 export interface EngineBootstrapStatus {
   phase: string;
   done: boolean;
+  /** 仅用于需要用户处理、且已由宿主脱敏的可恢复故障。 */
+  errorCode?: string;
+  /** 宿主提供的安全提示；前端只会展示已知 errorCode 对应的固定文案。 */
+  message?: string;
 }
 
 /**
@@ -294,6 +308,10 @@ export function onHostEvent(handler: (event: HostEvent) => void): () => void {
 
 /** 插件管理能力键（isCapabilityAvailable 用）。 */
 export const CAPABILITY_PLUGINS_MANAGE = 'plugins.manage';
+/** 桌面端可选择并持续同步用户已有的 Obsidian Vault。 */
+export const CAPABILITY_OBSIDIAN_VAULT_SYNC = 'obsidian.vault.sync';
+/** 本机 Codex / Claude Code 配置只读发现与导入（仅 Desktop 本地引擎）。 */
+export const CAPABILITY_LLM_LOCAL_CONFIG_IMPORT = 'llm.local-config-import';
 
 /** 单个插件条目的运行时视图。disabled 是持久开关（用户意图），state 是运行事实。 */
 export interface PluginEntryInfo {

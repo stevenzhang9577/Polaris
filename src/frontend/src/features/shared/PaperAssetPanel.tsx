@@ -89,6 +89,7 @@ function sourceLabel(source: string): string {
     upload: tr('用户上传', 'Upload'),
     extension: tr('扩展归档', 'Extension'),
     arxiv: 'arXiv',
+    zotero: 'Zotero',
     manual: tr('手动导入', 'Manual'),
   };
   return labels[source] ?? source;

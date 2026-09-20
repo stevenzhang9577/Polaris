@@ -2,22 +2,34 @@
 
 import uuid
 
+import pytest
 from sqlalchemy import select
 
 from app.core.db import get_sessionmaker
 from app.models.library import UserLibraryEntry
-from app.models.library_direction import LibraryPaper
+from app.models.library_direction import DirectionLibrary, LibraryPaper
+from app.models.obsidian_vault import ObsidianVaultConnection, VaultFileState
 from app.models.paper import (
     Paper,
     PaperChunk,
     PaperHighlight,
     PaperNote,
     PaperUserMeta,
+    PaperWiki,
+    PaperWikiRevision,
     paper_concepts,
+)
+from app.models.paper_assets import AssetGrant, PaperAsset, PdfBlob
+from app.models.paper_content import (
+    PaperContentChunk,
+    PaperContentChunkVector,
+    PaperContentVersion,
+    PaperContentVersionVector,
 )
 from app.models.publication import UserPublication
 from app.models.topic_shelf import TopicPaper
 from app.models.user import User
+from app.models.zotero_local import ZoteroItemLink, ZoteroLocalBinding
 from app.services import paper_merge as merge_service
 from app.services.libraries import get_library_for_project
 from tests.conftest import add_concept, add_paper, ensure_project_library, register_and_login
@@ -276,3 +288,307 @@ async def test_duplicate_candidates_and_merge_api(client):
     # 合并后候选清空
     resp = await client.get(f"/api/libraries/{library_id}/duplicate-candidates", headers=headers)
     assert resp.json() == []
+
+
+async def test_merge_preserves_assets_content_revisions_and_zotero_links(app):
+    async with get_sessionmaker()() as session:
+        user = User(
+            email="merge-content@example.com",
+            hashed_password="test",
+            is_active=True,
+            is_verified=True,
+            is_superuser=False,
+        )
+        library_a = DirectionLibrary(name="Merge content A", submitted_by=None)
+        library_b = DirectionLibrary(name="Merge content B", submitted_by=None)
+        keep = Paper(title="Keep content", dedup_key="title:keep-content")
+        drop = Paper(title="Drop content", dedup_key="title:drop-content")
+        session.add_all([user, library_a, library_b, keep, drop])
+        await session.flush()
+        blob = PdfBlob(
+            sha256="c" * 64,
+            byte_size=42,
+            storage_key="pdf-blobs/cc/content.pdf",
+        )
+        session.add(blob)
+        await session.flush()
+        keep_asset = PaperAsset(
+            paper_id=keep.id,
+            blob_id=blob.id,
+            source="zotero",
+            sharing_scope="private",
+            state="ready",
+        )
+        drop_asset = PaperAsset(
+            paper_id=drop.id,
+            blob_id=blob.id,
+            source="zotero",
+            sharing_scope="public",
+            state="ready",
+            is_preferred=True,
+        )
+        session.add_all([keep_asset, drop_asset])
+        await session.flush()
+        session.add_all(
+            [
+                AssetGrant(
+                    asset_id=keep_asset.id,
+                    library_id=library_a.id,
+                    status="revoked",
+                    can_read=False,
+                    can_process=False,
+                ),
+                AssetGrant(
+                    asset_id=drop_asset.id,
+                    library_id=library_a.id,
+                    status="active",
+                    can_read=True,
+                    can_process=True,
+                    granted_by=user.id,
+                ),
+                AssetGrant(
+                    asset_id=drop_asset.id,
+                    library_id=library_b.id,
+                    status="active",
+                    can_read=True,
+                    can_process=True,
+                    granted_by=user.id,
+                ),
+            ]
+        )
+        keep_version = PaperContentVersion(
+            paper_id=keep.id,
+            asset_id=keep_asset.id,
+            version_no=1,
+            parser="test",
+            status="ready",
+            is_current=True,
+        )
+        drop_version = PaperContentVersion(
+            paper_id=drop.id,
+            asset_id=drop_asset.id,
+            version_no=1,
+            parser="test",
+            status="ready",
+            is_current=True,
+        )
+        session.add_all([keep_version, drop_version])
+        await session.flush()
+        drop_chunk = PaperContentChunk(
+            content_version_id=drop_version.id,
+            seq=0,
+            text="drop full text chunk",
+        )
+        session.add(drop_chunk)
+        await session.flush()
+        session.add_all(
+            [
+                PaperContentVersionVector(
+                    content_version_id=drop_version.id,
+                    space="test-space",
+                    dim=1,
+                    embedding=[0.1],
+                    model="test",
+                ),
+                PaperContentChunkVector(
+                    chunk_id=drop_chunk.id,
+                    space="test-space",
+                    dim=1,
+                    embedding=[0.2],
+                    model="test",
+                ),
+            ]
+        )
+        keep_ready = PaperWikiRevision(
+            paper_id=keep.id,
+            content_version_id=keep_version.id,
+            source_level="fulltext",
+            content="keep ready",
+            status="ready",
+            stage="complete",
+        )
+        keep_inflight = PaperWikiRevision(
+            paper_id=keep.id,
+            source_level="abstract",
+            status="queued",
+            stage="materialize",
+        )
+        drop_ready = PaperWikiRevision(
+            paper_id=drop.id,
+            content_version_id=drop_version.id,
+            source_level="fulltext",
+            content="drop ready",
+            status="ready",
+            stage="complete",
+        )
+        drop_inflight = PaperWikiRevision(
+            paper_id=drop.id,
+            source_level="abstract",
+            status="generating",
+            stage="compile",
+        )
+        session.add_all([keep_ready, keep_inflight, drop_ready, drop_inflight])
+        await session.flush()
+        session.add_all(
+            [
+                PaperWiki(
+                    paper_id=keep.id,
+                    content=keep_ready.content or "",
+                    current_revision_id=keep_ready.id,
+                ),
+                PaperWiki(
+                    paper_id=drop.id,
+                    content=drop_ready.content or "",
+                    current_revision_id=drop_ready.id,
+                ),
+            ]
+        )
+        binding = ZoteroLocalBinding(
+            library_id=library_a.id,
+            collection_key="ROOT",
+            collection_name="Root",
+        )
+        session.add(binding)
+        await session.flush()
+        zotero_link = ZoteroItemLink(
+            binding_id=binding.id,
+            item_key="DROPITEM",
+            item_version=1,
+            paper_id=drop.id,
+            status="active",
+        )
+        session.add(zotero_link)
+        await session.commit()
+        ids = {
+            "keep": keep.id,
+            "drop": drop.id,
+            "keep_asset": keep_asset.id,
+            "drop_asset": drop_asset.id,
+            "drop_version": drop_version.id,
+            "drop_chunk": drop_chunk.id,
+            "drop_ready": drop_ready.id,
+            "drop_inflight": drop_inflight.id,
+            "keep_inflight": keep_inflight.id,
+            "zotero_link": zotero_link.id,
+            "library_a": library_a.id,
+            "library_b": library_b.id,
+        }
+
+        report = await merge_service.merge_papers(
+            session, keep_id=ids["keep"], drop_id=ids["drop"]
+        )
+        assert report["content_assets"] == {
+            "assets_repointed": 0,
+            "assets_merged": 1,
+            "grants_repointed": 1,
+            "grants_merged": 1,
+            "content_versions_repointed": 1,
+        }
+        assert report["summary_revisions"] == {
+            "repointed": 2,
+            "inflight_cancelled": 1,
+        }
+        assert report["zotero_links_repointed"] == 1
+
+    async with get_sessionmaker()() as session:
+        assert await session.get(Paper, ids["drop"]) is None
+        assets = list(
+            (
+                await session.execute(
+                    select(PaperAsset).where(PaperAsset.paper_id == ids["keep"])
+                )
+            ).scalars()
+        )
+        assert [asset.id for asset in assets] == [ids["keep_asset"]]
+        assert assets[0].sharing_scope == "public"
+        assert assets[0].is_preferred is True
+        assert await session.get(PaperAsset, ids["drop_asset"]) is None
+        grants = list(
+            (
+                await session.execute(
+                    select(AssetGrant).where(AssetGrant.asset_id == ids["keep_asset"])
+                )
+            ).scalars()
+        )
+        assert {grant.library_id for grant in grants} == {
+            ids["library_a"],
+            ids["library_b"],
+        }
+        assert all(grant.status == "active" and grant.can_read for grant in grants)
+        moved_version = await session.get(PaperContentVersion, ids["drop_version"])
+        assert moved_version is not None
+        assert moved_version.paper_id == ids["keep"]
+        assert moved_version.asset_id == ids["keep_asset"]
+        assert moved_version.version_no == 2
+        assert moved_version.is_current is False
+        assert await session.get(PaperContentChunk, ids["drop_chunk"]) is not None
+        assert await session.scalar(
+            select(PaperContentVersionVector).where(
+                PaperContentVersionVector.content_version_id == ids["drop_version"]
+            )
+        ) is not None
+        assert await session.scalar(
+            select(PaperContentChunkVector).where(
+                PaperContentChunkVector.chunk_id == ids["drop_chunk"]
+            )
+        ) is not None
+        revisions = {
+            row.id: row
+            for row in (
+                await session.execute(
+                    select(PaperWikiRevision).where(
+                        PaperWikiRevision.paper_id == ids["keep"]
+                    )
+                )
+            ).scalars()
+        }
+        assert ids["drop_ready"] in revisions
+        assert revisions[ids["drop_ready"]].content_version_id == ids["drop_version"]
+        assert revisions[ids["drop_inflight"]].status == "failed"
+        assert (
+            revisions[ids["drop_inflight"]].error_code
+            == "PAPER_MERGED_INFLIGHT_CANCELLED"
+        )
+        assert revisions[ids["keep_inflight"]].status == "queued"
+        link = await session.get(ZoteroItemLink, ids["zotero_link"])
+        assert link is not None and link.paper_id == ids["keep"]
+
+
+async def test_merge_refuses_projected_obsidian_paper_without_disk_rekey(app):
+    async with get_sessionmaker()() as session:
+        user = User(
+            email="merge-vault@example.com",
+            hashed_password="test",
+            is_active=True,
+            is_verified=True,
+            is_superuser=False,
+        )
+        library = DirectionLibrary(name="Merge Vault")
+        keep = Paper(title="Keep vault", dedup_key="title:keep-vault")
+        drop = Paper(title="Drop vault", dedup_key="title:drop-vault")
+        session.add_all([user, library, keep, drop])
+        await session.flush()
+        connection = ObsidianVaultConnection(user_id=user.id, vault_path="/not-accessed")
+        session.add(connection)
+        await session.flush()
+        session.add(
+            VaultFileState(
+                connection_id=connection.id,
+                library_id=library.id,
+                entity_type="summary",
+                entity_id=drop.id,
+                relative_path="library/papers/drop.md",
+                base_content="summary\n",
+                base_hash="a" * 64,
+                polaris_hash="a" * 64,
+                vault_hash="a" * 64,
+            )
+        )
+        await session.commit()
+        keep_id, drop_id = keep.id, drop.id
+
+        with pytest.raises(ValueError, match="PAPER_MERGE_OBSIDIAN_REKEY_REQUIRED"):
+            await merge_service.merge_papers(
+                session, keep_id=keep_id, drop_id=drop_id
+            )
+        assert await session.get(Paper, drop_id) is not None

@@ -1,13 +1,39 @@
 """LLM 配置与记账：provider 凭据（Fernet 加密）、环节路由表、用量流水、调用日志。"""
 
 import uuid
+from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
 from app.models.base import JSONVariant, TimestampMixin, UUIDPrimaryKeyMixin
+
+
+def _transport_default(context) -> str:  # noqa: ANN001
+    return {
+        "anthropic": "anthropic_messages",
+        "fake": "fake",
+    }.get(context.get_current_parameters().get("kind"), "chat_completions")
+
+
+def _auth_scheme_default(context) -> str:  # noqa: ANN001
+    return {
+        "anthropic": "x_api_key",
+        "fake": "none",
+    }.get(context.get_current_parameters().get("kind"), "bearer")
 
 
 class LLMProviderConfig(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -29,6 +55,23 @@ class LLMProviderConfig(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             sqlite_where=text("owner_id IS NOT NULL"),
             postgresql_where=text("owner_id IS NOT NULL"),
         ),
+        Index(
+            "uq_llm_providers_global_import_source_key",
+            "import_source",
+            "import_source_key",
+            unique=True,
+            sqlite_where=text("owner_id IS NULL AND import_source IS NOT NULL"),
+            postgresql_where=text("owner_id IS NULL AND import_source IS NOT NULL"),
+        ),
+        Index(
+            "uq_llm_providers_owner_import_source_key",
+            "owner_id",
+            "import_source",
+            "import_source_key",
+            unique=True,
+            sqlite_where=text("owner_id IS NOT NULL AND import_source IS NOT NULL"),
+            postgresql_where=text("owner_id IS NOT NULL AND import_source IS NOT NULL"),
+        ),
     )
 
     # 归属：NULL = 平台全局（管理员管）；<user> = 该用户自管的私有 provider。
@@ -38,6 +81,17 @@ class LLMProviderConfig(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)  # openai_compat|anthropic|fake
+    # API wire protocol is explicit rather than inferred from ``kind``.  In
+    # particular Codex custom providers speak the Responses API while most
+    # legacy OpenAI-compatible gateways still expose Chat Completions.
+    transport: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_transport_default
+    )
+    # Authentication header shape.  Claude-compatible gateways may use either
+    # the native x-api-key header or a bearer token.
+    auth_scheme: Mapped[str] = mapped_column(
+        String(24), nullable=False, default=_auth_scheme_default
+    )
     base_url: Mapped[str | None] = mapped_column(String(1024))
     # 可选的 Provider 级客户端标识；仅在显式配置时覆盖 HTTP 客户端默认值。
     user_agent: Mapped[str | None] = mapped_column(String(255))
@@ -46,6 +100,13 @@ class LLMProviderConfig(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # 该 provider 可用的模型 id 列表（字符串数组；None = 未配置，前端不给候选）
     models: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    # Provenance for Desktop local-config imports.  These fields contain no
+    # path or credential values; source_key is the provider/profile identifier
+    # inside the source config and fingerprint hashes only non-secret metadata.
+    import_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    import_source_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    import_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     routes: Mapped[list["ModelRoute"]] = relationship(
         back_populates="provider", cascade="all, delete-orphan"

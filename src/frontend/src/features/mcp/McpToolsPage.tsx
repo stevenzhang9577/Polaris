@@ -225,6 +225,14 @@ export function McpToolsContent() {
       ),
     [httpUrl, token],
   );
+  const codexConfig = useMemo(() => {
+    const quote = (value: string) => value.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+    return [
+      '[mcp_servers.polaris]',
+      `url = "${quote(httpUrl)}"`,
+      'bearer_token_env_var = "POLARIS_MCP_TOKEN"',
+    ].join('\n');
+  }, [httpUrl]);
 
   const selfcheck = useMutation({
     mutationFn: () =>
@@ -250,8 +258,8 @@ export function McpToolsContent() {
     <div>
       <div style={{ fontSize: 12.5, color: 'var(--text-3)', lineHeight: 1.55, marginBottom: 14, maxWidth: 720 }}>
         {tr(
-          '把平台的只读检索能力（文献 / 概念 / 知识 / 课题状态）暴露为 MCP 工具，供 Claude Desktop、Cursor 等外部客户端调用。',
-          'Expose the platform’s read-only retrieval (papers / concepts / knowledge / topic state) as MCP tools for external clients like Claude Desktop and Cursor.',
+          '把平台的只读检索能力（论文总结 / 全文 / 概念 / 知识 / 课题状态）暴露为 MCP 工具，供 Claude Code、Codex、Cursor 等外部客户端调用。',
+          'Expose the platform’s read-only retrieval (paper summaries / full text / concepts / knowledge / topic state) as MCP tools for Claude Code, Codex, Cursor, and other clients.',
         )}
       </div>
 
@@ -286,7 +294,7 @@ export function McpToolsContent() {
         )}
         <CopyRow label={tr('访问令牌（你的登录 Bearer token）', 'Access token (your bearer token)')} value={token} secret />
         <div style={{ minWidth: 0 }}>
-          <div className="h-eyebrow">{tr('客户端配置（Cursor / 支持 HTTP 的客户端）', 'Client config (Cursor / HTTP clients)')}</div>
+          <div className="h-eyebrow">{tr('Claude Code / Cursor 配置（JSON）', 'Claude Code / Cursor config (JSON)')}</div>
           <pre
             style={{
               ...CODE_BOX,
@@ -305,10 +313,30 @@ export function McpToolsContent() {
             </button>
           </div>
         </div>
+        <div style={{ minWidth: 0 }}>
+          <div className="h-eyebrow">{tr('Codex 配置（~/.codex/config.toml）', 'Codex config (~/.codex/config.toml)')}</div>
+          <pre
+            style={{
+              ...CODE_BOX,
+              margin: '6px 0 0',
+              padding: 12,
+              maxWidth: '100%',
+              overflowX: 'auto',
+              lineHeight: 1.55,
+            }}
+          >
+            {codexConfig}
+          </pre>
+          <div style={{ marginTop: 8 }}>
+            <button className="btn btn-soft sm" onClick={() => copy(codexConfig)}>
+              <Icon name="file" /> {tr('复制 Codex 配置', 'Copy Codex config')}
+            </button>
+          </div>
+        </div>
         <div style={{ fontSize: 12.5, color: 'var(--text-3)', lineHeight: 1.55 }}>
           {tr(
-            '调用工具时需在参数里带 project_id（目标课题 uuid），服务端会校验该课题是否归你所有。本地桌面客户端也可用 stdio：python -m app.mcp（详见 docs/concepts.md）。',
-            'Each tool call takes a project_id (target topic uuid); the server verifies the topic belongs to you. Local desktop clients can also use stdio: python -m app.mcp (see docs/concepts.md).',
+            '把上面的配置分别放入项目 .mcp.json 或 ~/.codex/config.toml；Codex 启动环境需设置 POLARIS_MCP_TOKEN 为上方令牌，避免把令牌明文写进配置。调用工具时需带 project_id；本机也可用 stdio：python -m app.mcp（详见 docs/mcp.md）。',
+            'Put the matching block in the project .mcp.json or ~/.codex/config.toml. Set POLARIS_MCP_TOKEN in the Codex process environment to the token above instead of storing it in the file. Tool calls take a project_id; local clients may also use stdio via python -m app.mcp (see docs/mcp.md).',
           )}
         </div>
       </div>

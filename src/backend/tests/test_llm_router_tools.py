@@ -258,4 +258,4 @@ def test_provider_cache_key_annotation_matches_the_real_key():
     from app.core.llm.router import _ProviderKey
 
     key_type = typing.get_args(typing.get_args(_ProviderKey)[0])
-    assert len(key_type) == 6, f"标注是 {len(key_type)} 元组，实际键是 6 元组"
+    assert len(key_type) == 8, f"标注是 {len(key_type)} 元组，实际键是 8 元组"

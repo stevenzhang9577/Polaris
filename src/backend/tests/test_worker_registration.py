@@ -31,6 +31,20 @@ def test_daily_wiki_ingest_is_registered():
     assert "daily_wiki_ingest" in registered_function_names()
 
 
+def test_zotero_summary_and_vault_tasks_are_registered():
+    """Desktop/Server 共用的新任务不能只在入队方或 cron 单边登记。"""
+    assert {
+        "zotero_local_sync_task",
+        "generate_paper_summary_task",
+        "recover_paper_summary_jobs_task",
+        "purge_deleted_paper_summaries_task",
+        "purge_obsidian_vault_tombstones_task",
+        "purge_deleted_paper_notes_task",
+        "sync_obsidian_vault_paper_task",
+        "sync_obsidian_vault_library_task",
+    } <= registered_function_names()
+
+
 def test_every_enqueued_task_name_is_registered():
     """扫全仓的 enqueue("...")，任何一个没注册的名字都会被静默丢弃。"""
     unregistered: dict[str, list[str]] = {}

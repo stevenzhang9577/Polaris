@@ -45,6 +45,7 @@ from app.models.daily_feed import (
 )
 from app.models.library_direction import DirectionLibrary, LibraryPaper
 from app.models.paper import Paper, PaperWiki, new_paper
+from app.models.paper_assets import PaperAsset
 from app.models.system_setting import SystemSetting
 from app.models.topic_shelf import TopicPaper
 from app.models.user import User
@@ -1450,9 +1451,15 @@ async def compile_entry_wiki(
         raise CompileInProgressError(str(entry_id))
     _COMPILING.add(entry_id)
     try:
+        has_assets = (
+            await session.scalar(
+                select(PaperAsset.id).where(PaperAsset.paper_id == paper.id).limit(1)
+            )
+            is not None
+        )
         # 没 PDF 就先抓一次（顺带抽全文/分块）：图文解读的前提。best-effort——
         # 无 arxiv_id / 下载失败时照常往下走，产出纯文字稿而不是整体失败。
-        if not paper.pdf_path:
+        if not has_assets and not paper.pdf_path:
             from app.services.papers import (
                 PdfFetchFailedError,
                 PdfSourceUnsupportedError,
@@ -1467,7 +1474,13 @@ async def compile_entry_wiki(
                 raise
             except Exception:  # noqa: BLE001 — 抓取异常不阻断编译
                 logger.warning("daily compile: fetch_pdf failed for %s", paper.id, exc_info=True)
-        if paper.pdf_path and Path(paper.pdf_path).exists():
+        has_assets = (
+            await session.scalar(
+                select(PaperAsset.id).where(PaperAsset.paper_id == paper.id).limit(1)
+            )
+            is not None
+        )
+        if not has_assets and paper.pdf_path and Path(paper.pdf_path).exists():
             # 从未提取过，或上一轮一张重要图都没选出来 → 重提候选（对齐 recompile_paper）
             if paper.figures is None or not any(f.get("important") for f in paper.figures):
                 candidates = await extract_figures(str(paper.id), Path(paper.pdf_path))
@@ -1477,7 +1490,16 @@ async def compile_entry_wiki(
             if paper.figures:
                 await annotate_figures(paper, paper.figures, user_id=user_id)
             await session.commit()
-        compiled = await compile_paper(paper, user_id=user_id)
+        from app.services.paper_summaries import current_summary_source
+
+        source = await current_summary_source(session, paper)
+        compiled = await compile_paper(
+            paper,
+            user_id=user_id,
+            source_text=source.text,
+            source_level=source.source_level,
+            include_figures=not has_assets,
+        )
     finally:
         _COMPILING.discard(entry_id)
     wiki = await upsert_wiki(
@@ -1486,6 +1508,9 @@ async def compile_entry_wiki(
         content=compiled.content,
         model=compiled.model or None,
         compiled_by=user_id,
+        source_level=source.source_level,
+        content_version_id=source.content_version_id,
+        source_fingerprint=source.fingerprint,
     )
     await session.commit()
     # 单篇概念上链：正文里的 [[双链]] 建词条并关联。不传成员行 → 记账落平台级
@@ -1493,8 +1518,10 @@ async def compile_entry_wiki(
     await link_paper_concepts(session, paper, llm=get_llm_router(), user_id=user_id)
     # 常驻文件投影（#719）：解读更新 → 刷新含它的库 vault（池论文常不属于任何库→跳过）
     from app.services.file_projection import refresh_wiki_vaults_for_paper
+    from app.services.obsidian_vault_bridge import enqueue_paper_projection
 
     await refresh_wiki_vaults_for_paper(session, paper.id)
+    await enqueue_paper_projection(paper_id=paper.id, entity_type="summary")
     return wiki
 
 

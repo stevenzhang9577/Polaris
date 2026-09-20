@@ -677,7 +677,10 @@ async def sync_obsidian_vault(
         existing_wikis = set(
             (
                 await session.execute(
-                    select(PaperWiki.paper_id).where(PaperWiki.paper_id.in_(paper_ids))
+                    select(PaperWiki.paper_id).where(
+                        PaperWiki.paper_id.in_(paper_ids),
+                        PaperWiki.deleted_at.is_(None),
+                    )
                 )
             )
             .scalars()
@@ -872,7 +875,12 @@ async def sync_obsidian_vault(
                 stats.figures_copied += 1
 
         wiki = (
-            await session.execute(select(PaperWiki).where(PaperWiki.paper_id == paper.id))
+            await session.execute(
+                select(PaperWiki).where(
+                    PaperWiki.paper_id == paper.id,
+                    PaperWiki.deleted_at.is_(None),
+                )
+            )
         ).scalar_one_or_none()
         if source.wiki_raw:
             rendered = render_markdown(
@@ -880,20 +888,20 @@ async def sync_obsidian_vault(
                 snapshot=snapshot,
                 figure_index=figure_index,
             )
-            if wiki is None:
-                session.add(
-                    PaperWiki(
-                        paper_id=paper.id,
-                        content=rendered,
-                        model="obsidian-vault-import",
-                        compiled_by=project.owner_id,
-                    )
+            if wiki is None or overwrite_wiki:
+                from app.services.paper_summaries import append_ready_revision
+
+                await append_ready_revision(
+                    session,
+                    paper=paper,
+                    content=rendered,
+                    model="obsidian-vault-import",
+                    created_by=project.owner_id,
+                    source_level="obsidian",
                 )
+            if wiki is None:
                 stats.wikis_created += 1
             elif overwrite_wiki:
-                wiki.content = rendered
-                wiki.model = "obsidian-vault-import"
-                wiki.compiled_by = project.owner_id
                 stats.wikis_overwritten += 1
             else:
                 stats.wikis_preserved += 1

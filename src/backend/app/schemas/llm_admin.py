@@ -9,12 +9,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.core.llm.base import EffortLevel
 
 ProviderKind = Literal["openai_compat", "anthropic", "fake"]
+ProviderTransport = Literal["chat_completions", "responses", "anthropic_messages", "fake"]
+ProviderAuthScheme = Literal["bearer", "x_api_key", "none"]
 UserAgent = Annotated[str, Field(max_length=255, pattern=r"^[^\r\n]*$")]
 
 
 class ProviderCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     kind: ProviderKind
+    transport: ProviderTransport | None = None
+    auth_scheme: ProviderAuthScheme | None = None
     base_url: str | None = None
     user_agent: UserAgent | None = None
     api_key: str | None = None  # 只写不读；入库前 Fernet 加密
@@ -25,6 +29,8 @@ class ProviderCreate(BaseModel):
 class ProviderUpdate(BaseModel):
     name: str | None = None
     kind: ProviderKind | None = None
+    transport: ProviderTransport | None = None
+    auth_scheme: ProviderAuthScheme | None = None
     base_url: str | None = None
     user_agent: UserAgent | None = None  # 空字符串 = 恢复 HTTP 客户端默认值
     api_key: str | None = None  # 空字符串 = 不变
@@ -38,11 +44,17 @@ class ProviderRead(BaseModel):
     id: uuid.UUID
     name: str
     kind: str
+    transport: str
+    auth_scheme: str
     base_url: str | None
     user_agent: str | None
     api_key_masked: str
     enabled: bool
     models: list[str] | None = None
+    import_source: str | None = None
+    import_source_key: str | None = None
+    import_fingerprint: str | None = None
+    imported_at: datetime | None = None
 
 
 class RouteItem(BaseModel):
@@ -50,9 +62,56 @@ class RouteItem(BaseModel):
     provider_id: uuid.UUID
     model: str = Field(min_length=1, max_length=255)
     temperature: float | None = None  # None = 用 provider 默认
+    context_window: int | None = Field(default=None, ge=1)
     # 推理档位；None = 不发送该参数（用模型默认）。某个模型具体支持哪几档由服务端校验，
     # 这里只挡明显非法的取值。
     effort: EffortLevel | None = None
+
+
+LocalConfigSource = Literal["codex", "claude_code"]
+CredentialStatus = Literal["available", "missing", "not_required", "unsupported"]
+
+
+class LocalConfigPreview(BaseModel):
+    """A deliberately redacted view of one user-level local model config."""
+
+    source: LocalConfigSource
+    source_key: str
+    display_name: str
+    kind: ProviderKind
+    transport: ProviderTransport
+    auth_scheme: ProviderAuthScheme
+    endpoint_origin: str | None = None
+    models: list[str] = Field(default_factory=list)
+    default_model: str | None = None
+    effort: EffortLevel | None = None
+    credential_status: CredentialStatus
+    importable: bool
+    warnings: list[str] = Field(default_factory=list)
+    fingerprint: str
+    existing_provider_id: uuid.UUID | None = None
+
+
+class LocalConfigDiscovery(BaseModel):
+    configs: list[LocalConfigPreview] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class LocalConfigImportRequest(BaseModel):
+    source: LocalConfigSource
+    source_key: str = Field(min_length=1, max_length=255)
+    # Empty means "import/update the provider connection only".
+    stages: list[str] = Field(default_factory=list)
+    overwrite_routes: bool = False
+
+
+class LocalConfigImportResult(BaseModel):
+    provider: ProviderRead
+    routes: list[RouteItem]
+    created: bool
+    updated_stages: list[str]
+    skipped_stages: list[str]
+    probe: "TestModelResult"
 
 
 TestCapability = Literal["chat", "embedding", "rerank"]

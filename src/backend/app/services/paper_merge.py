@@ -19,6 +19,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.library import UserLibraryEntry
 from app.models.library_direction import LibraryPaper
+from app.models.obsidian_vault import VaultFileState
 from app.models.paper import (
     Paper,
     PaperChunk,
@@ -26,12 +27,16 @@ from app.models.paper import (
     PaperNote,
     PaperUserMeta,
     PaperWiki,
+    PaperWikiRevision,
     paper_concepts,
     paper_tag_links,
 )
+from app.models.paper_assets import AssetGrant, PaperAsset
+from app.models.paper_content import PaperContentVersion
 from app.models.publication import UserPublication
 from app.models.topic_shelf import TopicPaper
 from app.models.vectors import PaperVector
+from app.models.zotero_local import ZoteroItemLink
 
 # 内容池行上「keep 缺则用 drop 补」的字段（判断性字段在成员行，另行处理）
 _FILLABLE_PAPER_FIELDS = (
@@ -123,6 +128,181 @@ async def _repoint_associations(
     return int(repointed or 0), int(deduped or 0)
 
 
+async def _merge_assets_and_content_versions(
+    session: AsyncSession, *, keep_id: uuid.UUID, drop_id: uuid.UUID
+) -> dict[str, int]:
+    """Move immutable PDF provenance without losing grants or parsed descendants."""
+    keep_assets = {
+        (asset.blob_id, asset.source): asset
+        for asset in (
+            await session.execute(select(PaperAsset).where(PaperAsset.paper_id == keep_id))
+        ).scalars()
+    }
+    drop_assets = list(
+        (
+            await session.execute(select(PaperAsset).where(PaperAsset.paper_id == drop_id))
+        ).scalars()
+    )
+    asset_targets: dict[uuid.UUID, PaperAsset] = {}
+    duplicate_assets: list[PaperAsset] = []
+    assets_repointed = assets_merged = grants_repointed = grants_merged = 0
+    scope_rank = {"private": 0, "library": 1, "public": 2}
+
+    for asset in drop_assets:
+        target = keep_assets.get((asset.blob_id, asset.source))
+        if target is None:
+            asset.paper_id = keep_id
+            keep_assets[(asset.blob_id, asset.source)] = asset
+            target = asset
+            assets_repointed += 1
+        else:
+            duplicate_assets.append(asset)
+            assets_merged += 1
+            if not target.source_locator and asset.source_locator:
+                target.source_locator = asset.source_locator
+            if not target.identity_key and asset.identity_key:
+                target.identity_key = asset.identity_key
+            if asset.identity_status == "verified":
+                target.identity_status = "verified"
+            if scope_rank.get(asset.sharing_scope, 0) > scope_rank.get(
+                target.sharing_scope, 0
+            ):
+                target.sharing_scope = asset.sharing_scope
+            target.is_preferred = target.is_preferred or asset.is_preferred
+            if target.state != "ready" and asset.state == "ready":
+                target.state = "ready"
+            if asset.metadata_snapshot:
+                target.metadata_snapshot = dict(asset.metadata_snapshot) | dict(
+                    target.metadata_snapshot or {}
+                )
+
+            target_grants = {
+                grant.library_id: grant
+                for grant in (
+                    await session.execute(
+                        select(AssetGrant).where(AssetGrant.asset_id == target.id)
+                    )
+                ).scalars()
+            }
+            grants = list(
+                (
+                    await session.execute(
+                        select(AssetGrant).where(AssetGrant.asset_id == asset.id)
+                    )
+                ).scalars()
+            )
+            for grant in grants:
+                existing = target_grants.get(grant.library_id)
+                if existing is None:
+                    grant.asset_id = target.id
+                    target_grants[grant.library_id] = grant
+                    grants_repointed += 1
+                    continue
+                if grant.status == "active":
+                    existing.status = "active"
+                    existing.revoked_by = None
+                existing.can_read = existing.can_read or grant.can_read
+                existing.can_process = existing.can_process or grant.can_process
+                existing.granted_by = existing.granted_by or grant.granted_by
+                if grant.metadata_snapshot:
+                    existing.metadata_snapshot = dict(grant.metadata_snapshot) | dict(
+                        existing.metadata_snapshot or {}
+                    )
+                await session.delete(grant)
+                grants_merged += 1
+        asset_targets[asset.id] = target
+
+    keep_versions = list(
+        (
+            await session.execute(
+                select(PaperContentVersion)
+                .where(PaperContentVersion.paper_id == keep_id)
+                .order_by(PaperContentVersion.version_no, PaperContentVersion.id)
+            )
+        ).scalars()
+    )
+    drop_versions = list(
+        (
+            await session.execute(
+                select(PaperContentVersion)
+                .where(PaperContentVersion.paper_id == drop_id)
+                .order_by(PaperContentVersion.version_no, PaperContentVersion.id)
+            )
+        ).scalars()
+    )
+    next_version_no = max((row.version_no for row in keep_versions), default=0)
+    keep_has_current = any(row.is_current for row in keep_versions)
+    inherited_current_id = None
+    if not keep_has_current:
+        current_candidates = [row for row in drop_versions if row.is_current]
+        if current_candidates:
+            inherited_current_id = current_candidates[-1].id
+    for version in drop_versions:
+        next_version_no += 1
+        version.paper_id = keep_id
+        version.asset_id = asset_targets[version.asset_id].id
+        version.version_no = next_version_no
+        version.is_current = version.id == inherited_current_id
+    await session.flush()
+    for asset in duplicate_assets:
+        await session.delete(asset)
+
+    return {
+        "assets_repointed": assets_repointed,
+        "assets_merged": assets_merged,
+        "grants_repointed": grants_repointed,
+        "grants_merged": grants_merged,
+        "content_versions_repointed": len(drop_versions),
+    }
+
+
+async def _merge_summary_revisions(
+    session: AsyncSession, *, keep_id: uuid.UUID, drop_id: uuid.UUID
+) -> dict[str, int]:
+    """Preserve history while keeping the per-paper in-flight uniqueness invariant."""
+    keep_has_inflight = (
+        await session.scalar(
+            select(PaperWikiRevision.id)
+            .where(
+                PaperWikiRevision.paper_id == keep_id,
+                PaperWikiRevision.status.in_(("queued", "generating")),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+    drop_inflight = list(
+        (
+            await session.execute(
+                select(PaperWikiRevision).where(
+                    PaperWikiRevision.paper_id == drop_id,
+                    PaperWikiRevision.status.in_(("queued", "generating")),
+                )
+            )
+        ).scalars()
+    )
+    cancelled = 0
+    if keep_has_inflight:
+        for revision in drop_inflight:
+            revision.status = "failed"
+            revision.stage = None
+            revision.error_code = "PAPER_MERGED_INFLIGHT_CANCELLED"
+            revision.error_detail = "SUMMARY_GENERATION_CANCELLED_BY_PAPER_MERGE"
+            cancelled += 1
+        await session.flush()
+    moved = int(
+        (
+            await session.execute(
+                update(PaperWikiRevision)
+                .where(PaperWikiRevision.paper_id == drop_id)
+                .values(paper_id=keep_id)
+            )
+        ).rowcount
+        or 0
+    )
+    return {"repointed": moved, "inflight_cancelled": cancelled}
+
+
 async def merge_papers(
     session: AsyncSession, *, keep_id: uuid.UUID, drop_id: uuid.UUID
 ) -> dict[str, Any]:
@@ -133,6 +313,20 @@ async def merge_papers(
     drop = await session.get(Paper, drop_id)
     if keep is None or drop is None:
         raise ValueError("paper not found")
+
+    # Managed Vault documents carry the Paper id in both their filename/frontmatter and the DB
+    # merge base. Until the bridge can atomically rekey both sides, refusing is the only
+    # non-destructive behavior; a DB-only repoint would strand user edits on the next sync.
+    has_drop_vault_state = await session.scalar(
+        select(VaultFileState.id)
+        .where(
+            VaultFileState.entity_id == drop_id,
+            VaultFileState.entity_type.in_(("summary", "notes")),
+        )
+        .limit(1)
+    )
+    if has_drop_vault_state is not None:
+        raise ValueError("PAPER_MERGE_OBSIDIAN_REKEY_REQUIRED")
 
     report: dict[str, Any] = {
         "kept_id": str(keep_id),
@@ -180,6 +374,11 @@ async def merge_papers(
     drop_wiki = (
         await session.execute(select(PaperWiki).where(PaperWiki.paper_id == drop_id))
     ).scalar_one_or_none()
+    # 历史版本永不因去重合并丢失。先改归属，再处理兼容投影；否则删除 drop 论文的
+    # ON DELETE CASCADE 会把刚搬过去的 current revision 一并删掉。
+    report["summary_revisions"] = await _merge_summary_revisions(
+        session, keep_id=keep_id, drop_id=drop_id
+    )
     wiki_moved = False
     if drop_wiki is not None:
         if keep_wiki is None:
@@ -311,6 +510,19 @@ async def merge_papers(
     report["vectors_moved"] = await _merge_paper_vectors(
         session, keep_id=keep_id, drop_id=drop_id
     )
+
+    # ---- 7b. PDF provenance / immutable parsed content / Zotero identity ----
+    report["content_assets"] = await _merge_assets_and_content_versions(
+        session, keep_id=keep_id, drop_id=drop_id
+    )
+    zotero_links = (
+        await session.execute(
+            update(ZoteroItemLink)
+            .where(ZoteroItemLink.paper_id == drop_id)
+            .values(paper_id=keep_id)
+        )
+    ).rowcount
+    report["zotero_links_repointed"] = int(zotero_links or 0)
 
     # ---- 8. 内容池行缺项回填（keep 缺 → 用 drop 的） ----
     filled: list[str] = []

@@ -11,18 +11,26 @@ from worker.tasks import (
     daily_wiki_ingest,
     dispatch_literature_discovery_schedules,
     full_export,
+    generate_paper_summary_task,
     index_papers_fulltext_task,
     match_user_publications,
     parse_paper_content_task,
     ping_task,
+    purge_deleted_paper_notes_task,
+    purge_deleted_paper_summaries_task,
+    purge_obsidian_vault_tombstones_task,
     reconcile_stale_voyages,
     reconcile_stuck_voyages,
+    recover_paper_summary_jobs_task,
     resume_voyage,
     run_literature_discovery,
     run_voyage,
+    sync_obsidian_vault_library_task,
+    sync_obsidian_vault_paper_task,
     translate_literature_hit,
     watch_unanswered_managed_commands,
     zotero_import,
+    zotero_local_sync_task,
 )
 
 # 航程任务超时：GPU 训练轮合法地跑数小时；1h 的默认会把轮询任务掐死→ARQ 按任务
@@ -47,6 +55,14 @@ class WorkerSettings:
         func(translate_literature_hit, timeout=600),
         # Zotero 导入：整库几百条 + 逐篇补全（LLM 打分限并发 3），1h 上限不够用
         func(zotero_import, timeout=4 * 3600),
+        func(zotero_local_sync_task, timeout=4 * 3600),
+        func(generate_paper_summary_task, timeout=2 * 3600),
+        recover_paper_summary_jobs_task,
+        purge_deleted_paper_summaries_task,
+        purge_obsidian_vault_tombstones_task,
+        purge_deleted_paper_notes_task,
+        sync_obsidian_vault_paper_task,
+        sync_obsidian_vault_library_task,
         # 全量导出：全库扫描 + 拷 PDF，默认 1h 上限够用（超大库另议）
         full_export,
     ]
@@ -65,6 +81,14 @@ class WorkerSettings:
         ),
         cron(daily_feed_sync, minute=_CHECKPOINT_MINUTES),
         cron(daily_publication_match, minute=_CHECKPOINT_MINUTES),
+        # Local API 在 Server 档明确 no-op；Desktop 另由 FastAPI lifespan 的内联
+        # 调度器触发。把 cron 也保留使共享 worker 契约完整，且未来独立本地 worker
+        # 无需再补一次注册。
+        cron(zotero_local_sync_task, minute=_CHECKPOINT_MINUTES),
+        cron(purge_deleted_paper_summaries_task, hour=3, minute=17),
+        cron(purge_obsidian_vault_tombstones_task, hour=3, minute=19),
+        cron(purge_deleted_paper_notes_task, hour=3, minute=21),
+        cron(recover_paper_summary_jobs_task, minute={7, 17, 27, 37, 47, 57}),
         # 僵死回收：启动对账只救 worker 重启的孤儿；运行中途丢任务（LLM 调用悬死、
         # ARQ 指数延迟重试）的僵死靠周期兜底（判据=终端 30 分钟无动静，见 tasks.py）
         cron(reconcile_stale_voyages, minute={5, 15, 25, 35, 45, 55}),

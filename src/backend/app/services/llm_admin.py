@@ -17,10 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.llm import call_log
 from app.core.llm.anthropic import AnthropicProvider
-from app.core.llm.base import LLMProvider, Message
+from app.core.llm.base import LLMProvider, Message, ToolUseBlock
 from app.core.llm.fake import FakeProvider
 from app.core.llm.openai_compat import OpenAICompatProvider
+from app.core.llm.openai_responses import OpenAIResponsesProvider
 from app.core.llm.router import get_llm_router, is_plugin_stage, known_stages
+from app.core.llm.tool_stream import ToolCallAccumulator
 from app.core.security import decrypt_secret, encrypt_secret
 from app.models.base import utcnow
 from app.models.llm_config import LLMCallLog, LLMProviderConfig, LLMUsage, ModelRoute
@@ -30,6 +32,49 @@ from app.schemas.llm_admin import ProviderCreate, ProviderUpdate, RouteItem
 
 class InvalidRouteError(Exception):
     """路由表引用了非法 stage 或不存在的 provider。"""
+
+
+class InvalidProviderError(Exception):
+    """Provider family, transport and authentication are inconsistent."""
+
+
+_DEFAULT_TRANSPORT = {
+    "openai_compat": "chat_completions",
+    "anthropic": "anthropic_messages",
+    "fake": "fake",
+}
+_DEFAULT_AUTH_SCHEME = {
+    "openai_compat": "bearer",
+    "anthropic": "x_api_key",
+    "fake": "none",
+}
+_VALID_TRANSPORTS = {
+    "openai_compat": {"chat_completions", "responses"},
+    "anthropic": {"anthropic_messages"},
+    "fake": {"fake"},
+}
+_VALID_AUTH_SCHEMES = {
+    "openai_compat": {"bearer", "none"},
+    "anthropic": {"x_api_key", "bearer", "none"},
+    "fake": {"none"},
+}
+
+
+def normalize_provider_protocol(
+    kind: str, transport: str | None, auth_scheme: str | None
+) -> tuple[str, str]:
+    """Fill defaults and reject combinations the runtime cannot represent."""
+    normalized_transport = transport or _DEFAULT_TRANSPORT[kind]
+    normalized_auth = auth_scheme or _DEFAULT_AUTH_SCHEME[kind]
+    if normalized_transport not in _VALID_TRANSPORTS[kind]:
+        raise InvalidProviderError(
+            f"transport {normalized_transport!r} is not valid for provider kind {kind!r}"
+        )
+    if normalized_auth not in _VALID_AUTH_SCHEMES[kind]:
+        raise InvalidProviderError(
+            f"auth_scheme {normalized_auth!r} is not valid for provider kind {kind!r}"
+        )
+    return normalized_transport, normalized_auth
 
 
 def mask_api_key(key: str | None) -> str:
@@ -107,10 +152,15 @@ async def get_provider(
 async def create_provider(
     session: AsyncSession, data: ProviderCreate, owner_id: uuid.UUID | None = None
 ) -> LLMProviderConfig:
+    transport, auth_scheme = normalize_provider_protocol(
+        data.kind, data.transport, data.auth_scheme
+    )
     provider = LLMProviderConfig(
         owner_id=owner_id,
         name=data.name,
         kind=data.kind,
+        transport=transport,
+        auth_scheme=auth_scheme,
         base_url=data.base_url,
         user_agent=_normalize_user_agent(data.user_agent),
         api_key_encrypted=encrypt_secret(data.api_key) if data.api_key else None,
@@ -127,10 +177,24 @@ async def create_provider(
 async def update_provider(
     session: AsyncSession, provider: LLMProviderConfig, data: ProviderUpdate
 ) -> LLMProviderConfig:
+    next_kind = data.kind or provider.kind
+    next_transport = data.transport
+    next_auth_scheme = data.auth_scheme
+    if data.kind is not None and data.transport is None:
+        next_transport = _DEFAULT_TRANSPORT[data.kind]
+    if data.kind is not None and data.auth_scheme is None:
+        next_auth_scheme = _DEFAULT_AUTH_SCHEME[data.kind]
+    transport, auth_scheme = normalize_provider_protocol(
+        next_kind,
+        next_transport if next_transport is not None else provider.transport,
+        next_auth_scheme if next_auth_scheme is not None else provider.auth_scheme,
+    )
     if data.name is not None:
         provider.name = data.name
     if data.kind is not None:
         provider.kind = data.kind
+    provider.transport = transport
+    provider.auth_scheme = auth_scheme
     if data.base_url is not None:
         provider.base_url = data.base_url
     if data.user_agent is not None:
@@ -199,6 +263,7 @@ async def replace_routes(
                 provider_id=item.provider_id,
                 model=item.model,
                 temperature=item.temperature,
+                context_window=item.context_window,
                 effort=item.effort,
             )
         )
@@ -215,16 +280,28 @@ _TEST_TIMEOUT_S = 20.0
 def _build_provider(provider: LLMProviderConfig) -> LLMProvider:
     """按 provider 配置直接构造实例（不经过路由表；openai_compat 天然带强制流式回退）。"""
     api_key = decrypt_secret(provider.api_key_encrypted) if provider.api_key_encrypted else ""
+    if provider.kind == "openai_compat" and provider.transport == "responses":
+        from app.core.config import get_settings
+
+        base_url = provider.base_url or get_settings().openai_compat_base_url
+        return OpenAIResponsesProvider(
+            base_url=base_url,
+            api_key=api_key,
+            auth_scheme=provider.auth_scheme,
+        )
     if provider.kind == "openai_compat":
         from app.core.config import get_settings
 
         base_url = provider.base_url or get_settings().openai_compat_base_url
-        return OpenAICompatProvider(base_url=base_url, api_key=api_key)
+        return OpenAICompatProvider(
+            base_url=base_url, api_key=api_key, auth_scheme=provider.auth_scheme
+        )
     if provider.kind == "anthropic":
         return AnthropicProvider(
             api_key=api_key,
             base_url=provider.base_url,
             user_agent=provider.user_agent,
+            auth_scheme=provider.auth_scheme,
         )
     return FakeProvider()
 
@@ -244,6 +321,30 @@ async def probe_model(
                 await llm.embed(["ping"], model=model)
             elif capability == "rerank":
                 await llm.rerank("ping", ["ping"], model=model)
+            elif capability == "agent_tools":
+                accumulator = ToolCallAccumulator()
+                async for event in llm.stream_events(
+                    [Message(role="user", content="Call the probe tool once.")],
+                    model=model,
+                    max_tokens=64,
+                    tools=[
+                        {
+                            "name": "polaris_probe",
+                            "description": "Connectivity probe; call once with an empty object.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                    tool_choice="required",
+                ):
+                    accumulator.feed(event)
+                if not any(
+                    isinstance(block, ToolUseBlock) for block in accumulator.finish()
+                ):
+                    raise RuntimeError("provider did not return the required tool call")
             else:
                 messages = [Message(role="user", content="ping")]
                 await llm.complete(messages, model=model, max_tokens=8)

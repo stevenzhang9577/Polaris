@@ -30,9 +30,11 @@ function uploadError(error: unknown): string {
 export function PdfUploadButton({
   paperId,
   pdfAvailable,
+  canManage = true,
 }: {
   paperId: string;
   pdfAvailable: boolean;
+  canManage?: boolean;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [linkOpen, setLinkOpen] = useState(false);
@@ -66,7 +68,7 @@ export function PdfUploadButton({
     onError: (error) => toast(`${tr('按链接取 PDF 失败：', 'Fetching the PDF failed: ')}${uploadError(error)}`, 'error'),
   });
 
-  if (pdfAvailable) return null;
+  if (pdfAvailable || !canManage) return null;
 
   const busy = mutation.isPending || urlMutation.isPending;
 

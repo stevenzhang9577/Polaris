@@ -48,8 +48,11 @@ ready-made config block to copy.
 ```toml
 [mcp_servers.polaris]
 url = "https://polaris.example.edu/mcp"
-http_headers = { Authorization = "Bearer <YOUR_TOKEN>" }
+bearer_token_env_var = "POLARIS_MCP_TOKEN"
 ```
+
+Set `POLARIS_MCP_TOKEN` in the environment that launches Codex. This keeps the token out of the
+checked-in or user-readable config file.
 
 If it does not, use the stdio transport below.
 
@@ -112,7 +115,7 @@ installation, and skill-provider instructions.
 
 ## 2. Tools
 
-The legacy catalog contains 46 tools in ten groups. The DSH profiles hide the
+The legacy catalog contains 47 tools in ten groups. The DSH profiles hide the
 skill, planning, and sub-agent tools because Harness already provides those
 natively. Names are stable within a versioned profile; treat them as API.
 
@@ -133,6 +136,7 @@ token or `POLARIS_MCP_USER_EMAIL`; the caller never supplies a user ID.
 | `search_chunks` | Passage-level search — lands on the paragraph rather than the paper. |
 | `grep_fulltext` | Literal string match across the full texts, with a small context window per hit. Better than semantic search for exact terms, model names, dataset names, or formula symbols. |
 | `get_paper` | Metadata, authors, status, abstract, concept tags. `in_library` tells you whether the paper is actually collected into a library — `false` means it is still only a daily-pool candidate. |
+| `read_paper_summary` | The active versioned summary, including whether it is full-text or abstract-level, whether its source is stale, and its evidence references. Use this for the summary shown in Polaris and synchronized to Obsidian. |
 | `read_wiki` | The platform's compiled reading note for a paper (falls back to the abstract). |
 | `read_fulltext` | Full text; give a `query` for the most relevant passage, or page through it. |
 | `related_papers` | Nearest neighbours by shared concepts. |

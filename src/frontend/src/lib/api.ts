@@ -655,6 +655,12 @@ export interface GateRead {
 // ============================================================
 
 export type LlmProviderKind = 'openai_compat' | 'anthropic' | 'fake';
+export type LlmProviderTransport =
+  | 'chat_completions'
+  | 'responses'
+  | 'anthropic_messages'
+  | 'fake';
+export type LlmProviderAuthScheme = 'bearer' | 'x_api_key' | 'none';
 
 /** 与后端 `app/core/llm/router.py` 的 STAGES 保持一致（大白话名字见 lib/stageLabels.ts）。
  *
@@ -716,17 +722,25 @@ export interface LlmProviderRead {
   id: string;
   name: string;
   kind: LlmProviderKind;
+  transport: LlmProviderTransport;
+  auth_scheme: LlmProviderAuthScheme;
   base_url: string | null;
   user_agent: string | null;
   api_key_masked: string | null;
   enabled: boolean;
   /** 可用模型 id 列表（null = 未配置） */
   models: string[] | null;
+  import_source: 'codex' | 'claude_code' | null;
+  import_source_key: string | null;
+  import_fingerprint: string | null;
+  imported_at: string | null;
 }
 
 export interface LlmProviderInput {
   name: string;
   kind: LlmProviderKind;
+  transport?: LlmProviderTransport;
+  auth_scheme?: LlmProviderAuthScheme;
   base_url?: string;
   /** 可选；仅 Anthropic Provider 使用，空字符串恢复客户端默认值 */
   user_agent?: string;
@@ -749,8 +763,57 @@ export interface LlmRoute {
   provider_id: string;
   model: string;
   temperature?: number | null;
+  context_window?: number | null;
   /** null / 缺省 = 不发送该参数，用模型默认档位 */
   effort?: LlmEffort | null;
+}
+
+export type LocalLlmConfigSource = 'codex' | 'claude_code';
+export type LocalLlmCredentialStatus =
+  | 'available'
+  | 'missing'
+  | 'not_required'
+  | 'unsupported';
+
+/** Desktop 本地后端发现的配置摘要。任何密钥值都不得出现在这个契约中。 */
+export interface LocalLlmConfigPreview {
+  source: LocalLlmConfigSource;
+  source_key: string;
+  display_name: string;
+  kind: LlmProviderKind;
+  transport: LlmProviderTransport;
+  auth_scheme: LlmProviderAuthScheme;
+  endpoint_origin: string | null;
+  models: string[];
+  default_model: string | null;
+  effort: LlmEffort | null;
+  credential_status: LocalLlmCredentialStatus;
+  importable: boolean;
+  warnings: string[];
+  fingerprint: string;
+  existing_provider_id: string | null;
+}
+
+export interface LocalLlmConfigDiscovery {
+  configs: LocalLlmConfigPreview[];
+  /** 脱敏后的 ``source:reason`` 诊断；界面仍须按白名单转成固定文案。 */
+  errors: string[];
+}
+
+export interface LocalLlmConfigImportInput {
+  source: LocalLlmConfigSource;
+  source_key: string;
+  stages: string[];
+  overwrite_routes?: boolean;
+}
+
+export interface LocalLlmConfigImportResult {
+  provider: LlmProviderRead;
+  routes: LlmRoute[];
+  created: boolean;
+  updated_stages: string[];
+  skipped_stages: string[];
+  probe: LlmTestResult;
 }
 
 export type LlmTestCapability = 'chat' | 'embedding' | 'rerank';
@@ -1074,11 +1137,61 @@ export interface PaperDetail extends PaperRead {
   /** 最后一次编译解读的人；存量数据/用户已删为 null（重新编译前的覆盖提示用） */
   compiled_by_name?: string | null;
   pdf_available: boolean;
+  /** Linked through a local Zotero collection. */
+  zotero_source?: boolean;
+  zotero_item_key?: string | null;
+  zotero_pdf_status?: 'on_demand' | 'materialized' | 'missing' | 'error' | null;
+  /** Selected visible Zotero binding used for lazy PDF materialization. */
+  zotero_library_id?: string | null;
+  can_materialize_zotero?: boolean;
+  /** Shared-summary mutations require manage access to at least one collecting library. */
+  can_manage_summary?: boolean;
   concepts: PaperConceptRef[];
   /** 论文图片列表（后端未就绪时可能缺失） */
   figures?: FigureInfo[];
   /** 手动添加后若仍需分阶段后处理，返回可订阅进度的任务 id；已处理完整时为 null。 */
   task_id?: string | null;
+}
+
+export type PaperSummarySourceLevel = 'fulltext' | 'abstract' | 'obsidian' | 'legacy';
+export type PaperSummaryStatus = 'queued' | 'generating' | 'ready' | 'failed' | 'stale';
+
+/** 一次不可变的论文解读修订；PaperWiki 只保存当前指针与兼容缓存。 */
+export interface PaperSummaryRevision {
+  id: string;
+  paper_id: string;
+  content_version_id: string | null;
+  source_level: PaperSummarySourceLevel;
+  content: string | null;
+  tldr: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  schema_version: string | null;
+  created_by: string | null;
+  source_fingerprint: string | null;
+  evidence_manifest: Record<string, unknown> | null;
+  status: PaperSummaryStatus;
+  stage: 'materialize' | 'parse' | 'compile' | 'project' | 'complete' | null;
+  error_code: string | null;
+  error_detail: string | null;
+  is_current: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PaperSummaryCurrent {
+  paper_id: string;
+  current_revision: PaperSummaryRevision;
+  stale: boolean;
+  deleted_at: string | null;
+  restore_until: string | null;
+}
+
+export interface PaperSummaryQueued {
+  paper_id: string;
+  revision_id: string;
+  status: PaperSummaryStatus;
+  stage: 'materialize' | 'parse' | 'compile' | 'project' | string;
 }
 
 export interface PaperAssetRead {
@@ -1469,6 +1582,124 @@ export interface DirectionLibraryDetail extends DirectionLibrarySummary {
   monthly_budget: number | null;
   /** 收录配置全量（P8：库为权威源），供「收录设置」编辑 */
   definition: ProjectDefinition | null;
+}
+
+// ============================================================
+// Desktop integrations: Zotero Local API + editable Obsidian Vault
+// ============================================================
+
+export interface ZoteroLocalProbe {
+  available: boolean;
+  api_version: number | null;
+  zotero_version: string | null;
+  instance_id: string | null;
+}
+
+export interface ZoteroCollection {
+  key: string;
+  name: string;
+  parent_key: string | null;
+  version: number;
+  child_count: number;
+}
+
+export interface ZoteroLocalBinding {
+  id: string;
+  library_id: string;
+  zotero_library_id: string;
+  zotero_library_type: string;
+  zotero_instance_id: string | null;
+  collection_key: string;
+  collection_name: string;
+  include_descendants: boolean;
+  last_library_version: number | null;
+  status: string;
+  last_synced_at: string | null;
+  next_sync_at: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ZoteroSyncRun {
+  id: string;
+  binding_id: string;
+  status: string;
+  full: boolean;
+  total: number;
+  processed: number;
+  created: number;
+  updated: number;
+  existing: number;
+  ignored: number;
+  missing: number;
+  failed: number;
+  error_samples: Array<Record<string, unknown>> | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ZoteroMaterializeResult {
+  paper_id: string;
+  asset_id: string;
+  attachment_key: string;
+  attachment_version: number | null;
+  byte_size: number;
+  source_locator: string;
+}
+
+export interface ObsidianVaultConnection {
+  id: string;
+  /** Local-only path returned by the embedded Desktop backend. */
+  vault_path: string;
+  status: string;
+  watching: boolean;
+  last_synced_at: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface VaultLibraryBinding {
+  id: string;
+  library_id: string;
+  library_name?: string | null;
+  enabled: boolean;
+  last_synced_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ObsidianVaultStatus {
+  connection: ObsidianVaultConnection | null;
+  bindings: VaultLibraryBinding[];
+  conflict_count: number;
+}
+
+export interface VaultSyncResult {
+  files_written: number;
+  files_imported: number;
+  files_unchanged: number;
+  files_deleted: number;
+  conflicts: number;
+  errors: string[];
+}
+
+export interface VaultConflict {
+  id: string;
+  entity_type: string;
+  entity_id: string;
+  relative_path: string;
+  base_content: string;
+  polaris_content: string;
+  vault_content: string;
+  status: 'open' | 'resolved' | string;
+  resolution: string | null;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 // ============================================================
@@ -3826,6 +4057,27 @@ export const api = {
   recompilePaper(id: string): Promise<PaperDetail> {
     return request<PaperDetail>(`/papers/${id}/recompile`, { method: 'POST' });
   },
+  /** 异步生成新解读修订；全文不可用时后端明确降级为摘要级。 */
+  generatePaperSummary(id: string): Promise<PaperSummaryQueued> {
+    return request<PaperSummaryQueued>(`/papers/${id}/summaries`, { method: 'POST' });
+  },
+  getPaperSummary(id: string): Promise<PaperSummaryCurrent> {
+    return request<PaperSummaryCurrent>(`/papers/${id}/summary`);
+  },
+  listPaperSummaries(id: string): Promise<PaperSummaryRevision[]> {
+    return request<PaperSummaryRevision[]>(`/papers/${id}/summaries`);
+  },
+  activatePaperSummary(id: string, revisionId: string): Promise<PaperSummaryCurrent> {
+    return request<PaperSummaryCurrent>(`/papers/${id}/summaries/${revisionId}/activate`, {
+      method: 'POST',
+    });
+  },
+  deletePaperSummary(id: string): Promise<void> {
+    return request<void>(`/papers/${id}/summary`, { method: 'DELETE' });
+  },
+  restorePaperSummary(id: string): Promise<PaperSummaryCurrent> {
+    return request<PaperSummaryCurrent>(`/papers/${id}/summary/restore`, { method: 'POST' });
+  },
   /** 这篇论文的两种向量各自建没建、何时建的、用的哪个模型（只读，权限同看论文）。 */
   getPaperIndexStatus(id: string): Promise<PaperIndexStatus> {
     return request<PaperIndexStatus>(`/papers/${id}/index-status`);
@@ -4344,6 +4596,36 @@ export const api = {
   getLibraryPaper(id: string, paperId: string): Promise<PaperDetail> {
     return request<PaperDetail>(`/libraries/${id}/papers/${paperId}`);
   },
+  probeZoteroLocal(): Promise<ZoteroLocalProbe> {
+    return request<ZoteroLocalProbe>('/zotero-local/probe');
+  },
+  listZoteroCollections(): Promise<ZoteroCollection[]> {
+    return request<ZoteroCollection[]>('/zotero-local/collections');
+  },
+  getZoteroBinding(libraryId: string): Promise<ZoteroLocalBinding> {
+    return request<ZoteroLocalBinding>(`/libraries/${libraryId}/zotero-local-binding`);
+  },
+  putZoteroBinding(
+    libraryId: string,
+    input: { collection_key: string },
+  ): Promise<ZoteroLocalBinding> {
+    return requestJson<ZoteroLocalBinding>(`/libraries/${libraryId}/zotero-local-binding`, 'PUT', input);
+  },
+  deleteZoteroBinding(libraryId: string): Promise<void> {
+    return request<void>(`/libraries/${libraryId}/zotero-local-binding`, { method: 'DELETE' });
+  },
+  startZoteroSync(libraryId: string, full = false): Promise<ZoteroSyncRun> {
+    return requestJson<ZoteroSyncRun>(`/libraries/${libraryId}/zotero-local-sync`, 'POST', { full });
+  },
+  getZoteroSyncStatus(libraryId: string): Promise<ZoteroSyncRun | null> {
+    return request<ZoteroSyncRun | null>(`/libraries/${libraryId}/zotero-local-sync/status`);
+  },
+  materializeZoteroPaper(libraryId: string, paperId: string): Promise<ZoteroMaterializeResult> {
+    return request<ZoteroMaterializeResult>(
+      `/libraries/${libraryId}/papers/${paperId}/zotero-local-materialize`,
+      { method: 'POST' },
+    );
+  },
   /** 库作用域的召回/彻底删除（精确锁定本库成员行，避免跨库误删）。 */
   restoreLibraryPaper(id: string, paperId: string): Promise<PaperDetail> {
     return request<PaperDetail>(`/libraries/${id}/papers/${paperId}/restore`, { method: 'POST' });
@@ -4514,6 +4796,35 @@ export const api = {
   /** 库作用域 Obsidian 导出（独立库也可用；只读端点，全实验室可读）。 */
   downloadLibraryObsidianExport(libraryId: string): Promise<Blob> {
     return requestBlob(`/libraries/${libraryId}/export/obsidian`);
+  },
+  getObsidianVault(): Promise<ObsidianVaultStatus> {
+    return request<ObsidianVaultStatus>('/obsidian-vault');
+  },
+  putObsidianVault(vaultPath: string): Promise<ObsidianVaultStatus> {
+    return requestJson<ObsidianVaultStatus>('/obsidian-vault', 'PUT', { vault_path: vaultPath });
+  },
+  deleteObsidianVault(): Promise<void> {
+    return request<void>('/obsidian-vault', { method: 'DELETE' });
+  },
+  setObsidianLibrary(libraryId: string, enabled: boolean): Promise<VaultLibraryBinding> {
+    return requestJson<VaultLibraryBinding>(`/obsidian-vault/libraries/${libraryId}`, 'PUT', { enabled });
+  },
+  removeObsidianLibrary(libraryId: string): Promise<void> {
+    return request<void>(`/obsidian-vault/libraries/${libraryId}`, { method: 'DELETE' });
+  },
+  syncObsidianVault(libraryId?: string): Promise<VaultSyncResult> {
+    return requestJson<VaultSyncResult>('/obsidian-vault/sync', 'POST', {
+      library_id: libraryId ?? null,
+    });
+  },
+  listObsidianConflicts(status = 'open'): Promise<VaultConflict[]> {
+    return request<VaultConflict[]>(`/obsidian-vault/conflicts?status=${encodeURIComponent(status)}`);
+  },
+  resolveObsidianConflict(
+    conflictId: string,
+    input: { strategy: 'polaris' | 'vault' | 'merged'; content?: string },
+  ): Promise<VaultConflict> {
+    return requestJson<VaultConflict>(`/obsidian-vault/conflicts/${conflictId}/resolve`, 'POST', input);
   },
 
   // —— 一键全量导出（#690）：入队后走 /paper-tasks/{task_id}/events 订阅进度 ——
@@ -5002,6 +5313,16 @@ export const api = {
   },
   testLlmModel(input: LlmTestModelInput): Promise<LlmTestResult> {
     return requestJson<LlmTestResult>('/admin/llm/test-model', 'POST', input);
+  },
+  discoverLocalLlmConfigs(): Promise<LocalLlmConfigDiscovery> {
+    return request<LocalLlmConfigDiscovery>('/admin/llm/local-configs');
+  },
+  importLocalLlmConfig(input: LocalLlmConfigImportInput): Promise<LocalLlmConfigImportResult> {
+    return requestJson<LocalLlmConfigImportResult>(
+      '/admin/llm/local-configs/import',
+      'POST',
+      input,
+    );
   },
   getLlmUsage(opts: { projectId?: string; userId?: string; days?: number } = {}): Promise<LlmUsageRow[]> {
     const params = new URLSearchParams();

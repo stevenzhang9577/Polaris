@@ -32,6 +32,7 @@ from app.api import (
     mcp_meta,
     mcp_servers,
     notes,
+    obsidian_vault,
     onboarding,
     paper_assets,
     papers,
@@ -48,6 +49,7 @@ from app.api import (
     users_profile,
     voyages,
     wiki,
+    zotero_local,
 )
 
 api_router = APIRouter()
@@ -70,6 +72,7 @@ api_router.include_router(structured_content.router)
 api_router.include_router(libraries.router)
 api_router.include_router(publications.router)
 api_router.include_router(notes.router)
+api_router.include_router(obsidian_vault.router)
 api_router.include_router(highlights.router)
 api_router.include_router(concepts.router)
 api_router.include_router(ingest.router)
@@ -98,3 +101,4 @@ api_router.include_router(experiment_backends.router)
 api_router.include_router(disciplines.router)
 api_router.include_router(literature_sources.router)
 api_router.include_router(onboarding.router)
+api_router.include_router(zotero_local.router)
