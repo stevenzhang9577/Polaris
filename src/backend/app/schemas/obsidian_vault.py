@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 class ObsidianVaultConfigure(BaseModel):
     vault_path: str = Field(min_length=1, max_length=4096)
+    managed_directory: str = Field(default="Polaris", min_length=1, max_length=128)
 
 
 class ObsidianVaultConnectionRead(BaseModel):
@@ -16,6 +17,7 @@ class ObsidianVaultConnectionRead(BaseModel):
 
     id: uuid.UUID
     vault_path: str
+    managed_directory: str = "Polaris"
     status: str
     watching: bool = False
     last_synced_at: datetime | None

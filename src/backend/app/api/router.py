@@ -10,6 +10,7 @@ from app.api import (
     chat_bots,
     concepts,
     daily,
+    desktop_runtime,
     disciplines,
     download_client,
     evidence,
@@ -45,6 +46,7 @@ from app.api import (
     shelf,
     ssh_credentials,
     structured_content,
+    summary_batches,
     tts,
     users_profile,
     voyages,
@@ -53,6 +55,8 @@ from app.api import (
 )
 
 api_router = APIRouter()
+api_router.include_router(summary_batches.router)
+api_router.include_router(desktop_runtime.router)
 api_router.include_router(health.router)
 api_router.include_router(chat_agent.router)
 api_router.include_router(auth.router)

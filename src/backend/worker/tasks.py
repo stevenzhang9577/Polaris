@@ -139,16 +139,36 @@ async def generate_paper_summary_task(
     project_id: str | None = None,
 ) -> None:
     """Generate one persisted summary revision and switch it current only after success."""
+    from app.models.paper import PaperWikiRevision
     from app.services.paper_summaries import generate_queued_revision
+    from app.services.summary_batches import summary_capacity
 
     async with get_sessionmaker()() as session:
-        await generate_queued_revision(
-            session,
-            revision_id=uuid.UUID(revision_id),
-            user_id=uuid.UUID(user_id) if user_id else None,
-            library_id=uuid.UUID(library_id) if library_id else None,
-            project_id=uuid.UUID(project_id) if project_id else None,
-        )
+        revision = await session.get(PaperWikiRevision, uuid.UUID(revision_id))
+        if revision is None or revision.status not in {"queued", "generating"}:
+            return
+        owner_id = revision.created_by or (uuid.UUID(user_id) if user_id else None)
+        paper_id = revision.paper_id
+
+    async def generate():
+        async with get_sessionmaker()() as session:
+            await generate_queued_revision(
+                session, revision_id=uuid.UUID(revision_id), user_id=owner_id,
+                library_id=uuid.UUID(library_id) if library_id else None,
+                project_id=uuid.UUID(project_id) if project_id else None,
+            )
+
+    if owner_id is None:  # Legacy system-owned jobs predate user attribution.
+        await generate()
+    else:
+        async with summary_capacity(owner_id, paper_id):
+            await generate()
+
+
+async def run_paper_summary_batch_task(ctx: dict[str, Any], batch_id: str) -> None:
+    from app.services.summary_batches import run_batch
+
+    await run_batch(uuid.UUID(batch_id))
 
 
 async def recover_paper_summary_jobs_task(
@@ -168,10 +188,23 @@ async def recover_paper_summary_jobs_task(
     from app.models.base import utcnow
     from app.models.library_direction import DirectionLibrary, LibraryPaper
     from app.models.paper import PaperWikiRevision
+    from app.models.summary_batch import SummaryBatch, SummaryBatchItem, SummaryGenerationLease
     from app.models.zotero_local import ZoteroLocalBinding
+    from app.services.summary_batches import recover_batches
 
     now = utcnow()
     stmt = select(PaperWikiRevision).where(
+        ~select(SummaryGenerationLease.id).where(
+            SummaryGenerationLease.paper_id == PaperWikiRevision.paper_id,
+            SummaryGenerationLease.expires_at > now,
+        ).exists(),
+        ~select(SummaryBatchItem.id).join(
+            SummaryBatch, SummaryBatch.id == SummaryBatchItem.batch_id
+        ).where(
+            SummaryBatchItem.revision_id == PaperWikiRevision.id,
+            SummaryBatchItem.status.in_(("pending", "running")),
+            SummaryBatch.user_id == PaperWikiRevision.created_by,
+        ).exists(),
         or_(
             PaperWikiRevision.status.in_(("queued", "generating")),
             (
@@ -189,7 +222,13 @@ async def recover_paper_summary_jobs_task(
                 ),
                 (
                     (PaperWikiRevision.status == "generating")
-                    & (PaperWikiRevision.updated_at < now - timedelta(hours=2))
+                    & (
+                        (PaperWikiRevision.updated_at < now - timedelta(hours=2))
+                        | (
+                            PaperWikiRevision.created_by.is_not(None)
+                            & (PaperWikiRevision.updated_at < now - timedelta(minutes=5))
+                        )
+                    )
                 ),
                 (
                     (PaperWikiRevision.status == "ready")
@@ -258,6 +297,7 @@ async def recover_paper_summary_jobs_task(
             str(project_id) if project_id else None,
             _job_id=f"paper-summary-recovery-{revision_id}-{bucket}",
         )
+    await recover_batches(ctx["redis"])
     return len(revisions)
 
 

@@ -32,9 +32,14 @@ const cacheDir = join(desktopDir, '.cache', 'uv', UV_VERSION);
 const outDir = join(desktopDir, 'resources', 'uv');
 
 /** platform/arch → uv release 的目标三元组。只列桌面端会发布的组合。 */
-function targetsFor(platform, arch) {
+function targetsFor(platform, arch, packageArch = 'universal') {
   if (platform === 'darwin') {
-    // universal 包：两个架构都要，之后 lipo 合并
+    if (packageArch === 'arm64') return ['aarch64-apple-darwin'];
+    if (packageArch === 'x64') return ['x86_64-apple-darwin'];
+    if (packageArch !== 'universal') {
+      throw new Error(`fetch-uv: 不支持的 macOS 打包架构 ${packageArch}`);
+    }
+    // Universal 包：两个架构都要，之后 lipo 合并。
     return ['aarch64-apple-darwin', 'x86_64-apple-darwin'];
   }
   const cpu = { x64: 'x86_64', arm64: 'aarch64' }[arch];
@@ -123,8 +128,12 @@ async function fetchTarget(target) {
 }
 
 async function main() {
-  console.log(`fetch-uv: uv ${UV_VERSION} for ${process.platform}/${process.arch}`);
-  const targets = targetsFor(process.platform, process.arch);
+  const archArg = process.argv.find((arg) => arg.startsWith('--arch='));
+  const packageArch = archArg ? archArg.slice('--arch='.length) : 'universal';
+  console.log(
+    `fetch-uv: uv ${UV_VERSION} for ${process.platform}/${process.arch} package=${packageArch}`,
+  );
+  const targets = targetsFor(process.platform, process.arch, packageArch);
   const bins = [];
   for (const target of targets) bins.push(await fetchTarget(target));
 
@@ -133,7 +142,7 @@ async function main() {
   const outName = process.platform === 'win32' ? 'uv.exe' : 'uv';
   const outBin = join(outDir, outName);
 
-  if (process.platform === 'darwin') {
+  if (process.platform === 'darwin' && bins.length > 1) {
     // 合成 universal：分架构的两个 Mach-O lipo 到一个文件
     execFileSync('lipo', ['-create', ...bins, '-output', outBin], { stdio: 'inherit' });
   } else {

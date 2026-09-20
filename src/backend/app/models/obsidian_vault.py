@@ -28,6 +28,9 @@ class ObsidianVaultConnection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     # Desktop-only local path.  It must never be copied into remote settings or logs.
     vault_path: Mapped[str] = mapped_column(Text, nullable=False)
+    managed_directory: Mapped[str] = mapped_column(
+        String(128), default="Polaris", server_default="Polaris", nullable=False
+    )
     status: Mapped[str] = mapped_column(
         String(24), default="ready", server_default="ready", nullable=False
     )

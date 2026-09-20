@@ -38,7 +38,8 @@ import {
 } from '@polaris/kernel';
 
 import type { EngineBootstrapStatus, KernelStatus, LocalBackendInfo } from '../shared/contract';
-import { bootstrapEngine } from './engine-bootstrap';
+import type { EngineCommand } from './engine-bootstrap';
+import { PythonRuntimeManager } from './python-runtime-manager';
 import {
   configuredEngineEncryptionKey,
   LEGACY_ENGINE_SECRETS_ERROR,
@@ -47,6 +48,50 @@ import {
 } from './engine-secret';
 
 let kernel: Kernel | null = null;
+let pythonManager: PythonRuntimeManager | null = null;
+
+export function pythonRuntimeManager(): PythonRuntimeManager {
+  if (!app.isPackaged || process.env.POLARIS_DESKTOP_ENGINE) throw new Error('PYTHON_MANAGEMENT_UNAVAILABLE');
+  pythonManager ??= new PythonRuntimeManager(app.getPath('userData'), process.resourcesPath, {
+    deactivate: async () => {
+      await kernelConfigTree()?.store['legacy-engine']?.update({ disabled: true });
+      bootstrapStatus = { phase: 'failed', done: true };
+    },
+    drain: async (paused) => {
+      const base = localBackend().baseUrl;
+      if (!base) return 0;
+      const session = await fetch(`${base}/api/auth/local-session`, { method: 'POST', signal: AbortSignal.timeout(5000) });
+      if (!session.ok) throw new Error('PYTHON_DRAIN_AUTH_FAILED');
+      const { access_token: token } = await session.json() as { access_token: string };
+      const response = await fetch(`${base}/api/desktop-runtime/drain`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ paused }), signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) throw new Error('PYTHON_DRAIN_FAILED');
+      return ((await response.json()) as { active: number }).active;
+    },
+    activate: async (command: EngineCommand) => {
+      if (startingKernel) await startingKernel;
+      const entry = kernelConfigTree()?.store['legacy-engine'];
+      if (!entry) throw new Error('PYTHON_ENGINE_ENTRY_MISSING');
+      // Resolve the existing per-install key before touching the live engine.
+      const key = configuredEngineEncryptionKey() ?? loadOrCreateEngineEncryptionKey({
+        dataDir: app.getPath('userData'), platform: process.platform, safeStorage,
+        allowSafeStorage: process.platform !== 'darwin',
+      });
+      bootstrapStatus = { phase: 'engine', done: false };
+      await entry.update({ disabled: true });
+      try {
+        await withEngineEncryptionKey(key, () => entry.update({ config: command, disabled: null }));
+        if (!localBackend().baseUrl) throw new Error('PYTHON_ENGINE_NOT_HEALTHY');
+        bootstrapStatus = { phase: 'ready', done: true };
+      } catch (error) {
+        bootstrapStatus = { phase: 'failed', done: true };
+        throw error;
+      }
+    },
+  });
+  return pythonManager;
+}
 
 /**
  * 市场安装物的落盘根（#708）：userData/plugins/<包名>/<版本>/。刻意在
@@ -121,15 +166,15 @@ function parseEngineSpec(raw: string | undefined): LegacyEngineConfig | null {
  */
 async function bootstrapPackagedEngine(): Promise<LegacyEngineConfig | null> {
   try {
-    const config = await bootstrapEngine({
-      resourcesDir: process.resourcesPath,
-      dataDir: app.getPath('userData'),
-      onProgress: ({ phase, line }) => {
+    const config = await pythonRuntimeManager().boot(({ phase, line }) => {
         bootstrapStatus = { phase, done: false };
         // 首启会下载 Python 工具链，日志与首启等待页是仅有的可观测面
         if (line) console.log(`[engine-bootstrap] ${line}`);
-      },
     });
+    if (!config) {
+      bootstrapStatus = { phase: 'choose-python', done: false };
+      return null;
+    }
     // 环境装好 ≠ 可用：引擎进程还要跑迁移并通过健康检查（下方 entry.update
     // 才等它），done 必须等引擎真的健康——否则首启等待页会提前放行，
     // 前端探测拿到 null 又回落远端，等待整段白等。

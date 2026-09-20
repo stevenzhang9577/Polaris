@@ -13,6 +13,7 @@ import {
   CAPABILITY_LLM_LOCAL_CONFIG_IMPORT,
   CAPABILITY_OBSIDIAN_VAULT_SYNC,
   CAPABILITY_PLUGINS_MANAGE,
+  CAPABILITY_PYTHON_ENVIRONMENT_MANAGE,
   CONTRACT_VERSION,
   type CapabilityManifest,
   type CapabilityState,
@@ -55,6 +56,7 @@ export async function capabilityManifest(): Promise<CapabilityManifest> {
     platform: process.platform as HostInfo['platform'],
     contract: CONTRACT_VERSION,
     capabilities: {
+      [CAPABILITY_PYTHON_ENVIRONMENT_MANAGE]: { available: app.isPackaged && !process.env.POLARIS_DESKTOP_ENGINE },
       // detail 里已经带上了「本机有没有 tectonic」，本地编译落地时把 available
       // 翻成 found 即可，前端判断逻辑一行不用改。
       [CAPABILITY_LATEX_COMPILE]: {

@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.config import get_settings
+from app.core.db import get_sessionmaker
 from app.models.base import utcnow
 from app.models.paper import (
     SUMMARY_SOURCE_LEVELS,
@@ -42,6 +43,47 @@ _READY_CONTENT_STATUSES = frozenset({"ready", "ready_fallback", "vector_ready"})
 _ACTIVATABLE_REVISION_STATUSES = frozenset({"ready", "stale"})
 _TLDR_RE = re.compile(r"^## TL;DR\s*\n(.+?)(?=\n##\s|\Z)", re.MULTILINE | re.DOTALL)
 _EVIDENCE_RE = re.compile(r"\n?<!-- polaris-ai-evidence:(\{.*?\}) -->\s*$", re.DOTALL)
+
+RETRYABLE_SUMMARY_ERROR_CODES = frozenset(
+    {
+        "LLM_NOT_CONFIGURED",
+        "LLM_PROVIDER_TIMEOUT",
+        "LLM_PROVIDER_UNAVAILABLE",
+        "LLM_PROVIDER_REQUEST_FAILED",
+    }
+)
+
+
+def summary_failure_code(exc: Exception) -> str:
+    """Return a stable, non-sensitive code that can guide batch recovery."""
+    name = type(exc).__name__
+    detail = f"{name}: {exc}".lower()
+    if name == "PendingRollbackError":
+        return "SUMMARY_DATABASE_TRANSACTION_FAILED"
+    if name == "LLMNotConfiguredError" or "llm not configured" in detail:
+        return "LLM_NOT_CONFIGURED"
+    if name in {"TimeoutError", "ReadTimeout", "ConnectTimeout", "PoolTimeout"} or any(
+        marker in detail for marker in ("timed out", "timeout")
+    ):
+        return "LLM_PROVIDER_TIMEOUT"
+    if any(
+        marker in detail
+        for marker in (
+            "connection refused",
+            "connecterror",
+            "all connection attempts failed",
+            "provider unavailable",
+            "responses request failed after",
+            "network is unreachable",
+        )
+    ):
+        return "LLM_PROVIDER_UNAVAILABLE"
+    if any(
+        marker in detail
+        for marker in ("openai responses ", "openai_compat ", "provider request failed")
+    ):
+        return "LLM_PROVIDER_REQUEST_FAILED"
+    return "SUMMARY_GENERATION_FAILED"
 
 
 class SummaryNotFoundError(LookupError):
@@ -585,9 +627,18 @@ async def generate_queued_revision(
         revision.error_detail = None
         await session.commit()
 
-        materializer = materialize or _materialize_zotero_source
         try:
-            await materializer(session, paper, user_id, library_id)
+            if materialize is None:
+                # Zotero materialization and vectorization commit in several stages. Keep those
+                # transactions isolated so a failed local asset cannot poison summary generation.
+                async with get_sessionmaker()() as materialize_session:
+                    materialize_paper = await materialize_session.get(Paper, paper_id)
+                    assert materialize_paper is not None
+                    await _materialize_zotero_source(
+                        materialize_session, materialize_paper, user_id, library_id
+                    )
+            else:
+                await materialize(session, paper, user_id, library_id)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - missing/unusable local PDF falls back to metadata
@@ -597,9 +648,11 @@ async def generate_queued_revision(
                 exc_info=True,
             )
             await session.rollback()
-            paper = await session.get(Paper, paper_id)
-            revision = await session.get(PaperWikiRevision, revision_id)
-            assert paper is not None and revision is not None
+        paper = await session.get(Paper, paper_id, populate_existing=True)
+        revision = await session.get(
+            PaperWikiRevision, revision_id, populate_existing=True
+        )
+        assert paper is not None and revision is not None
         revision.stage = "parse"
         await session.commit()
 
@@ -703,9 +756,9 @@ async def generate_queued_revision(
         if failed is not None and failed.status not in _ACTIVATABLE_REVISION_STATUSES:
             failed.status = "failed"
             failed.stage = None
-            failed.error_code = type(exc).__name__[:64]
+            failed.error_code = summary_failure_code(exc)
             # API/MCP clients receive a stable code; provider responses and local paths remain
             # server-side diagnostics only.
-            failed.error_detail = "SUMMARY_GENERATION_FAILED"
+            failed.error_detail = failed.error_code
             await session.commit()
         raise

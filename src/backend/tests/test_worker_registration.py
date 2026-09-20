@@ -36,6 +36,7 @@ def test_zotero_summary_and_vault_tasks_are_registered():
     assert {
         "zotero_local_sync_task",
         "generate_paper_summary_task",
+        "run_paper_summary_batch_task",
         "recover_paper_summary_jobs_task",
         "purge_deleted_paper_summaries_task",
         "purge_obsidian_vault_tombstones_task",

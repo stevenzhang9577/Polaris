@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { PythonEnvironmentSettings } from '../settings/PythonEnvironmentSettings';
 import { Icon } from '../../components/ui/Icon';
 import { LangToggle } from '../../components/ui/LangToggle';
 import { PolarisMark, PolarisWordmark } from '../../components/ui/PolarisLogo';
@@ -14,6 +16,7 @@ import {
   bootstrapGate,
   bootstrapStepIndex,
 } from './engineBootstrap';
+const environmentQueries = new QueryClient();
 
 /**
  * 桌面端首启等待页（#721）：窗口先起、内核在后台准备本机引擎，这里轮询
@@ -80,8 +83,15 @@ export function EngineBootstrapPage({
         <LangToggle />
       </div>
 
-      <div className="auth-card fadeup">
-        {gate === 'failed' ? (
+      <div className="auth-card fadeup" style={{ maxWidth: 680, width: 'min(680px, calc(100vw - 32px))', maxHeight: 'calc(100dvh - 80px)', overflowY: 'auto' }}>
+        {status.phase === 'choose-python' || (gate === 'failed' && failureKind !== 'legacy-encryption-migration') ? (
+          <>
+            <QueryClientProvider client={environmentQueries}><PythonEnvironmentSettings /></QueryClientProvider>
+            <button className="btn btn-ghost sm" style={{ marginTop: 12 }} onClick={onProceed}>
+              {tr('暂用远程服务器（保留本机数据）', 'Use a remote server for now (keep local data)')}
+            </button>
+          </>
+        ) : gate === 'failed' ? (
           <>
             {failureKind === 'legacy-encryption-migration' ? (
               <>

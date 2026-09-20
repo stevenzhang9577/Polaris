@@ -273,6 +273,7 @@ export function PdfReader({
   const [scale, setScale] = useState(1); // 缩放倍率（1 = 适应宽度）
   const [mode, setMode] = useState<ReaderMode>('annotate'); // 标注阅读器 / 标准浏览器
   const [url, setUrl] = useState<string | null>(null);
+  const [pdfRetry, setPdfRetry] = useState(0);
   const [loadPct, setLoadPct] = useState<number | null>(null); // 整包下载时的进度，null = 还没有进度事件
   // 只渲染视口附近的页：每挂一个 <Page> 就要取那一页的数据，全挂等于把整份 PDF 下完，
   // 分段加载就白做了。未渲染的页留一个等高占位块，滚动条长度和跳转位置都不受影响。
@@ -340,7 +341,10 @@ export function PdfReader({
     retry: false,
     staleTime: 4 * 60_000,
   });
-  const hasPdf = paper.pdf_available || asset !== null;
+  const useZoteroOriginal = Boolean(
+    paper.zotero_source && paper.can_materialize_zotero && zoteroLibraryId,
+  );
+  const hasPdf = useZoteroOriginal || paper.pdf_available || asset !== null;
   const hasStructuredContent = Boolean(
     structuredQuery.data && structuredQuery.data.manifest.content_format !== 'unavailable' && structuredQuery.data.content,
   );
@@ -349,25 +353,29 @@ export function PdfReader({
   // 所以这里不能用 blob。对象要 memo：react-pdf 认引用，每次新对象都会重新加载整份。
   const pdfSource = useMemo(() => {
     const src: { url: string; httpHeaders?: Record<string, string> } = {
-      url: asset && libraryId
+      url: useZoteroOriginal
+        ? `${apiBase()}/libraries/${zoteroLibraryId}/papers/${paper.id}/zotero-local-pdf?retry=${pdfRetry}`
+        : asset && libraryId
         ? `${apiBase()}/libraries/${libraryId}/papers/${paper.id}/assets/${asset.id}/download`
         : `${apiBase()}/papers/${paper.id}/pdf`,
     };
     const token = getToken();
     if (token) src.httpHeaders = { Authorization: `Bearer ${token}` };
     return src;
-  }, [asset, libraryId, paper.id]);
+  }, [asset, libraryId, paper.id, useZoteroOriginal, zoteroLibraryId, pdfRetry]);
 
   // 标准阅读器是 <iframe>，带不了 Authorization 头，只能整包下成 blob——所以推迟到
   // 真的切过去才下，默认的标注模式不再为它付这 25MB 的等待。
   const pdfQuery = useQuery({
-    queryKey: ['paper-pdf', paper.id, asset?.id],
-    queryFn: () => asset && libraryId
+    queryKey: ['paper-pdf', paper.id, asset?.id, useZoteroOriginal, zoteroLibraryId],
+    queryFn: () => useZoteroOriginal && zoteroLibraryId
+      ? api.fetchZoteroOriginalPdf(zoteroLibraryId, paper.id)
+      : asset && libraryId
       ? api.downloadLibraryPaperAsset(libraryId, paper.id, asset.id)
       : api.fetchPaperPdf(paper.id),
     enabled: mode === 'standard' && hasPdf,
     retry: false,
-    staleTime: Infinity,
+    staleTime: useZoteroOriginal ? 0 : Infinity,
   });
 
   // blob → objectURL（换论文/卸载时 revoke）
@@ -484,7 +492,7 @@ export function PdfReader({
     },
     onMutate: () => setZoteroFetchError(null),
     onSuccess: () => {
-      toast(tr('Zotero PDF 已复制到 Polaris，正在打开', 'Zotero PDF copied into Polaris and is opening'), 'ok');
+      toast(tr('已关联 Zotero 原 PDF，正在打开（不复制文件）', 'Original Zotero PDF linked; opening without copying'), 'ok');
       setZoteroFetchError(null);
       void queryClient.invalidateQueries({ queryKey: ['paper-assets', zoteroLibraryId, paper.id] });
       void queryClient.invalidateQueries({ queryKey: ['paper-content-version', zoteroLibraryId, paper.id] });
@@ -746,7 +754,7 @@ export function PdfReader({
               ? undefined
               : paper.zotero_source
                 ? paper.can_materialize_zotero === false && zoteroLibraryId
-                  ? tr('你对 Zotero 来源文献库只有读取权限，无法复制该附件。', 'You have read-only access to the Zotero source library and cannot copy its attachment.')
+                  ? tr('你没有访问本机 Zotero 原文件的权限。', 'You do not have access to the local Zotero original.')
                   : tr('Zotero 附件未在本机落地或不可用，请先在 Zotero 中下载该 PDF。', 'The Zotero attachment is unavailable locally. Download it in Zotero first.')
                 : tr('这篇论文不是 arXiv 来源，暂时不支持自动下载 PDF，可以通过右上角原文链接查看。', 'This paper is not from arXiv, so Polaris cannot fetch its PDF automatically. Use the source link instead.')
           }
@@ -762,12 +770,12 @@ export function PdfReader({
                     {materializeZoteroMutation.isPending ? (
                       <>
                         <Icon name="refresh" size={14} style={{ animation: 'spin 1s linear infinite' }} />
-                        {tr('正在从 Zotero 复制…', 'Copying from Zotero…')}
+                        {tr('正在关联 Zotero 原文件…', 'Linking the Zotero original…')}
                       </>
                     ) : (
                       <>
                         <Icon name="download" size={14} />
-                        {tr('从 Zotero 取得 PDF', 'Get PDF from Zotero')}
+                        {tr('打开 Zotero 原 PDF', 'Open original Zotero PDF')}
                       </>
                     )}
                   </button>
@@ -974,7 +982,12 @@ export function PdfReader({
         error={
           // 任何加载失败都会走到这里（文件损坏、网络中断、被拦截），别把话说死成「损坏」
           <div className="muted" style={{ textAlign: 'center', padding: 40, color: '#fca5a5' }}>
-            {tr('PDF 加载失败，请稍后重试。', 'Could not load this PDF — try again later.')}
+            <div>{useZoteroOriginal
+              ? tr('无法读取 Zotero 原 PDF。请启动 Zotero，并确认附件已下载、路径有效；Polaris 不保存 PDF 副本。', 'Cannot read the original PDF. Open Zotero and verify the attachment is downloaded and its path is valid. Polaris does not keep a PDF copy.')
+              : tr('PDF 加载失败，请稍后重试。', 'Could not load this PDF — try again later.')}</div>
+            <button className="btn btn-soft" style={{ marginTop: 12 }} onClick={() => setPdfRetry(value => value + 1)}>
+              {tr('重新读取', 'Retry')}
+            </button>
           </div>
         }
       >

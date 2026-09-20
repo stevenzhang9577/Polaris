@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import PendingRollbackError
 
 from app.core.db import get_sessionmaker
 from app.models.base import utcnow
@@ -335,8 +336,44 @@ async def test_failed_generation_keeps_last_ready_revision(app, monkeypatch):
         failed = await session.get(PaperWikiRevision, queued_id)
         persisted = await session.scalar(select(PaperWiki).where(PaperWiki.paper_id == paper.id))
         assert failed is not None and failed.status == "failed"
+        assert failed.error_code == "LLM_PROVIDER_UNAVAILABLE"
         assert persisted is not None and persisted.current_revision_id == old_revision_id
         assert persisted.content == wiki.content
+
+
+async def test_default_materialization_failure_cannot_poison_generation_session(
+    app, monkeypatch
+):
+    async with get_sessionmaker()() as session:
+        paper = Paper(title="Isolated materialization", abstract="metadata fallback")
+        session.add(paper)
+        await session.flush()
+        queued = await paper_summaries.queue_summary_revision(
+            session, paper=paper, created_by=None
+        )
+        await session.commit()
+        queued_id = queued.id
+        generation_session = session
+
+        async def broken_materializer(source_session, *_args, **_kwargs):
+            assert source_session is not generation_session
+            raise PendingRollbackError("synthetic failed asset transaction")
+
+        async def compile_success(*_args, **_kwargs):
+            return SimpleNamespace(
+                content="## TL;DR\nMetadata fallback succeeded.",
+                model="fake-model",
+            )
+
+        monkeypatch.setattr(
+            paper_summaries, "_materialize_zotero_source", broken_materializer
+        )
+        monkeypatch.setattr("app.services.wiki_compile.compile_paper", compile_success)
+        result = await paper_summaries.generate_queued_revision(
+            session, revision_id=queued_id
+        )
+        assert result.status == "ready"
+        assert result.source_level == "abstract"
 
 
 async def test_delete_after_queue_wins_over_completed_generation(app, monkeypatch):

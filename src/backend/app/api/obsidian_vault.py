@@ -41,7 +41,10 @@ def _require_desktop() -> None:
 
 
 def _bridge_error(exc: bridge.VaultBridgeError) -> HTTPException:
-    if exc.code in {"OBSIDIAN_CONFLICT_CHANGED", "OBSIDIAN_CONFLICT_ALREADY_RESOLVED"}:
+    if exc.code in {
+        "OBSIDIAN_CONFLICT_CHANGED", "OBSIDIAN_CONFLICT_ALREADY_RESOLVED",
+        "OBSIDIAN_DESTINATION_ALREADY_EXISTS",
+    }:
         return HTTPException(status.HTTP_409_CONFLICT, detail=exc.code)
     if exc.code == "OBSIDIAN_CONFLICT_NOT_FOUND":
         return HTTPException(status.HTTP_404_NOT_FOUND, detail=exc.code)
@@ -102,6 +105,7 @@ async def _state_response(
         connection={
             "id": connection.id,
             "vault_path": connection.vault_path,
+            "managed_directory": connection.managed_directory,
             "status": connection.status,
             "watching": bridge.watcher_running(connection.id),
             "last_synced_at": connection.last_synced_at,
@@ -127,6 +131,7 @@ async def get_vault_state(
                 connection_id=connection.id,
                 user_id=user.id,
                 vault_path=connection.vault_path,
+                managed_directory=connection.managed_directory,
             )
         # State response still exposes the persisted error/status; an unavailable removable
         # drive must not make the settings page itself unreachable.
@@ -142,14 +147,16 @@ async def configure_vault(
     _require_desktop()
     try:
         connection = await bridge.configure_connection(
-            session, user_id=user.id, vault_path=data.vault_path
+            session, user_id=user.id, vault_path=data.vault_path,
+            managed_directory=data.managed_directory,
         )
     except bridge.VaultBridgeError as exc:
         raise _bridge_error(exc) from exc
     await session.commit()
     await session.refresh(connection)
     await bridge.start_connection_watcher(
-        connection_id=connection.id, user_id=user.id, vault_path=connection.vault_path
+        connection_id=connection.id, user_id=user.id, vault_path=connection.vault_path,
+        managed_directory=connection.managed_directory,
     )
     for binding in await bridge.list_bindings(session, connection_id=connection.id):
         if binding.enabled:

@@ -115,11 +115,13 @@ export function PaperAssetPanel({
   paperId,
   doi,
   canManage,
+  zoteroPdfStatus,
 }: {
   libraryId: string;
   paperId: string;
   doi?: string | null;
   canManage: boolean;
+  zoteroPdfStatus?: string | null;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
@@ -216,7 +218,11 @@ export function PaperAssetPanel({
         <div>
           <div style={{ fontSize: 12.5, fontWeight: 650 }}>{tr('PDF 资产与全文索引', 'PDF asset and full-text index')}</div>
           <div className="muted" style={{ fontSize: 11.5, marginTop: 3 }}>
-            {preferred
+            {zoteroPdfStatus === 'linked'
+              ? tr('已关联 Zotero 原 PDF · 直接读取，不复制文件', 'Original Zotero PDF linked · read directly without copying')
+              : zoteroPdfStatus === 'unavailable'
+                ? tr('Zotero 原文件暂不可用，请检查路径或在 Zotero 中下载附件', 'Zotero original unavailable; check its path or download the attachment in Zotero')
+              : preferred
               ? `${sourceLabel(preferred.source)} · ${sharingLabel(preferred.sharing_scope)} · ${formatBytes(preferred.byte_size)}`
               : tr('尚未绑定可处理的 PDF', 'No processable PDF is attached')}
           </div>

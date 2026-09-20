@@ -74,6 +74,7 @@ from app.models.research_digest import LibraryResearchDigest
 from app.models.resource import Resource, ResourceLease
 from app.models.review import ReviewMessage, ReviewSession
 from app.models.ssh_credential import ConnectionCredential, SSHCredential
+from app.models.summary_batch import SummaryBatch, SummaryBatchItem, SummaryGenerationLease
 from app.models.system_setting import SystemSetting
 from app.models.topic_shelf import TopicPaper
 from app.models.user import User
@@ -82,6 +83,9 @@ from app.models.voyage import VoyageMessage, VoyageRun, VoyageStep
 from app.models.zotero_local import ZoteroItemLink, ZoteroLocalBinding, ZoteroSyncRun
 
 __all__ = [
+    "SummaryBatch",
+    "SummaryBatchItem",
+    "SummaryGenerationLease",
     "Activity",
     "BuddyMemory",
     "ChatBotConfig",

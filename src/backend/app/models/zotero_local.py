@@ -11,6 +11,20 @@ from app.core.db import Base
 from app.models.base import JSONVariant, TimestampMixin, UUIDPrimaryKeyMixin
 
 
+class ZoteroLibraryImport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable, user-scoped idempotency receipt for library creation."""
+
+    __tablename__ = "zotero_library_imports"
+    __table_args__ = (UniqueConstraint("user_id", "request_id"),)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    request_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    binding_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("zotero_local_bindings.id", ondelete="CASCADE")
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("zotero_sync_runs.id", ondelete="CASCADE"))
+
+
 class ZoteroLocalBinding(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """One Polaris library bound to one collection in the local Zotero library."""
 
@@ -109,6 +123,10 @@ class ZoteroItemLink(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     metadata_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONVariant)
     attachment_key: Mapped[str | None] = mapped_column(String(64))
     attachment_version: Mapped[int | None]
+    # Desktop-only trusted Local API result. Never serialize this absolute path.
+    local_pdf_path: Mapped[str | None] = mapped_column(Text)
+    pdf_status: Mapped[str | None] = mapped_column(String(24))
+    pdf_error: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="active", server_default="active"
     )

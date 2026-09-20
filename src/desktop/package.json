@@ -1,12 +1,14 @@
 {
   "name": "polaris-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "Polaris desktop shell (Electron)",
   "homepage": "https://github.com/ZJU-REAL/Polaris",
   "author": "Polaris contributors <polaris@users.noreply.github.com>",
   "main": "dist/main.cjs",
   "scripts": {
+    "test:python": "esbuild src/python-environment.test.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/python-environment.test.cjs && node --test dist/python-environment.test.cjs",
+    "e2e:packaged-setup": "esbuild e2e/packaged-setup.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/packaged-setup.cjs --packages=external && node dist/packaged-setup.cjs",
     "build:main": "esbuild src/main/index.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/main.cjs --external:electron --external:node-addon-require-builtin --define:import.meta.url=__polarisImportMetaUrl --banner:js=\"const __polarisImportMetaUrl = require('node:url').pathToFileURL(__filename).href;\"",
     "build:preload": "esbuild src/preload/index.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/preload.cjs --external:electron",
     "build:bootstrap-smoke": "esbuild src/bootstrap-smoke.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/bootstrap-smoke.cjs",
@@ -17,12 +19,15 @@
     "lint": "tsc --noEmit",
     "icons": "./scripts/make-icons.sh",
     "stage:resources": "node scripts/fetch-uv.mjs && node scripts/stage-backend.mjs",
+    "stage:resources:mac-arm64": "node scripts/fetch-uv.mjs --arch=arm64 && node scripts/stage-backend.mjs",
     "dist:mac": "pnpm run stage:resources && pnpm run build && electron-builder --mac --universal",
+    "dist:mac:arm64": "pnpm run stage:resources:mac-arm64 && pnpm run build && electron-builder --mac --arm64",
     "dist:win": "pnpm run stage:resources && pnpm run build && electron-builder --win",
     "dist:linux": "pnpm run stage:resources && pnpm run build && electron-builder --linux",
     "build:e2e": "esbuild e2e/e2e.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/e2e.cjs --packages=external",
     "e2e": "pnpm run build:main && pnpm run build:preload && pnpm run build:e2e && node dist/e2e.cjs",
-    "e2e:local-integrations": "esbuild e2e/local-integrations.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/local-integrations-e2e.cjs --packages=external && node dist/local-integrations-e2e.cjs"
+    "e2e:local-integrations": "esbuild e2e/local-integrations.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/local-integrations-e2e.cjs --packages=external && node dist/local-integrations-e2e.cjs",
+    "e2e:summary-batches": "esbuild e2e/summary-batches.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/summary-batches-e2e.cjs --packages=external && node dist/summary-batches-e2e.cjs"
   },
   "devDependencies": {
     "@polaris/kernel": "workspace:*",

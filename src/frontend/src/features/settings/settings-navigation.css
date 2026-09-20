@@ -1,0 +1,18 @@
+/* Settings has many more categories than a normal segmented control. Wrap whole
+   buttons at every window width instead of shrinking Chinese labels into columns. */
+.settings-navigation { min-width: 0; margin-bottom: 22px; }
+.settings-navigation .segmented {
+  max-width: 100%;
+  flex-wrap: wrap;
+  overflow: visible;
+}
+.settings-navigation .segmented > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  line-height: 22px;
+  min-height: 34px;
+}
+.settings-navigation .segmented > button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}

@@ -33,6 +33,7 @@ import {
   type PaperStatusFilter,
   type ReadingStatus,
   type SearchMode,
+  type SummaryBatchFilters,
 } from '../../lib/api';
 import { tr } from '../../lib/i18n';
 import { localOrigin } from '../../lib/endpoint';
@@ -58,6 +59,8 @@ import { ExtensionBatchHistoryModal } from './ExtensionBatchHistoryModal';
 import { ComparisonModal } from './ComparisonModal';
 import { ZoteroLocalSyncModal } from './ZoteroLocalSyncModal';
 import { PaperSummaryPanel } from './PaperSummaryPanel';
+import { SummaryBatchPanel } from './SummaryBatchPanel';
+import { isPaperSelected, selectedPaperCount, summarySelectionPayload, togglePaperId, type SummarySelection } from './summarySelection';
 
 /* ============================================================
    论文库 Tab：左列表（过滤/搜索/排序/加载更多 + 添加文献/导出）
@@ -677,8 +680,8 @@ function PapersTrashModal({ pid, libraryId, open, onClose }: { pid: string; libr
 
 /* ---------------- 列表行 ---------------- */
 
-/* memo：父组件（大量筛选/选中 state）任一变更都会触发全列表重渲染。
-   忽略函数 props 的比较是安全的：两个 handler 只捕获稳定引用与 p.id。 */
+/* Selection handlers are stable; compare them because all-pages and explicit
+   selection deliberately use different toggle semantics. */
 const PaperRow = memo(function PaperRow({
   p,
   active,
@@ -692,7 +695,7 @@ const PaperRow = memo(function PaperRow({
   checked: boolean;
   selectMode: boolean;
   onClick: () => void;
-  onToggleCheck: () => void;
+  onToggleCheck: (id: string) => void;
 }) {
   return (
     <div
@@ -712,9 +715,10 @@ const PaperRow = memo(function PaperRow({
         {/* 占位常驻：切换多选时行内容不左右跳（#132） */}
         <input
           type="checkbox"
+          aria-label={tr(`选择论文：${p.title}`, `Select paper: ${p.title}`)}
           checked={checked}
           onClick={(e) => e.stopPropagation()}
-          onChange={onToggleCheck}
+          onChange={() => onToggleCheck(p.id)}
           style={{ width: 13, height: 13, margin: 0, flexShrink: 0, accentColor: 'var(--accent)', cursor: 'pointer', visibility: selectMode ? 'visible' : 'hidden' }}
         />
         {p.starred && <Icon name="starFill" size={11} style={{ color: 'var(--warn-tx)', flexShrink: 0 }} />}
@@ -781,7 +785,7 @@ const PaperRow = memo(function PaperRow({
     </div>
   );
 }, (prev, next) =>
-  prev.p === next.p && prev.active === next.active && prev.checked === next.checked && prev.selectMode === next.selectMode,
+  prev.p === next.p && prev.active === next.active && prev.checked === next.checked && prev.selectMode === next.selectMode && prev.onToggleCheck === next.onToggleCheck,
 );
 
 /* ---------------- 详情面板 ---------------- */
@@ -947,13 +951,17 @@ function PaperDetailPane({
                 title={paper.zotero_item_key ? `Zotero ${paper.zotero_item_key}` : 'Zotero'}
                 style={{ background: 'var(--surface-3)', color: 'var(--text-2)' }}
               >
-                Zotero · {paper.zotero_pdf_status === 'materialized'
-                  ? tr('PDF 已复制', 'PDF copied')
+                Zotero · {paper.zotero_pdf_status === 'linked'
+                  ? tr('PDF 原文件已关联', 'Original PDF linked')
+                  : paper.zotero_pdf_status === 'unavailable'
+                    ? tr('原文件暂不可用', 'Original unavailable')
+                  : paper.zotero_pdf_status === 'materialized'
+                  ? tr('已有历史 PDF 副本', 'Legacy PDF copy available')
                   : paper.zotero_pdf_status === 'missing'
-                    ? tr('已移出 Collection', 'Removed from collection')
+                    ? tr('来源或 PDF 不可用', 'Source or PDF unavailable')
                     : paper.zotero_pdf_status === 'error'
                       ? tr('同步异常', 'Sync error')
-                      : tr('PDF 按需复制', 'PDF on demand')}
+                      : tr('阅读 Zotero 原 PDF', 'Read original Zotero PDF')}
               </span>
             )}
             {(paper.note_count ?? 0) > 0 && (
@@ -1053,6 +1061,7 @@ function PaperDetailPane({
 
         {libraryId && (
           <PaperAssetPanel
+            zoteroPdfStatus={paper.zotero_pdf_status}
             libraryId={libraryId}
             paperId={paper.id}
             doi={paper.doi}
@@ -1278,6 +1287,13 @@ function PaperDetailPane({
 
 export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSelect, onOpenConcept, onWikiLink, advSeed }: PapersTabProps) {
   const zoteroLocalAvailable = localOrigin() !== null;
+  const zoteroBinding = useQuery({
+    queryKey: ['zotero-local-binding', libraryId],
+    queryFn: () => api.getZoteroBinding(libraryId!),
+    enabled: !!libraryId && canManage && zoteroLocalAvailable,
+    retry: false,
+    refetchInterval: 10000,
+  });
   const scopeId = libraryId ?? pid ?? '';
   const [view, setView] = useState<ViewFilter>('all');
   const [sort, setSort] = useState<PaperSort>('relevance');
@@ -1289,7 +1305,7 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
   const [myTagFilter, setMyTagFilter] = useState('');
   const [readingFilter, setReadingFilter] = useState<'' | ReadingStatus>('');
   const [addOpen, setAddOpen] = useState(false);
-  const [zoteroOpen, setZoteroOpen] = useState(false);
+  const [zoteroOpen, setZoteroOpen] = useState(() => new URLSearchParams(window.location.search).get('zotero') === 'sync');
   // 高级检索（作者/机构/发表时间/入库时间）
   const [advOpen, setAdvOpen] = useState(false);
   const [advAuthor, setAdvAuthor] = useState('');
@@ -1336,6 +1352,9 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
   // 多选（批量删除/导出）：默认关闭，底部「多选」按钮开启后行首出现复选框
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [allFilteredSelected, setAllFilteredSelected] = useState(false);
+  const [excludedSelection, setExcludedSelection] = useState<Set<string>>(new Set());
+  const [summaryDraft, setSummaryDraft] = useState<{ selection: SummarySelection; count: number } | null>(null);
   const [trashOpen, setTrashOpen] = useState(false);
   // 对比表（#669）：多选 2..10 篇后从底栏打开；paperIds 用勾选顺序（就是列序）
   const [compareOpen, setCompareOpen] = useState(false);
@@ -1345,8 +1364,10 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
   // 切换方向/视图/搜索时退出多选
   useEffect(() => {
     setSelected(new Set());
+    setAllFilteredSelected(false);
+    setExcludedSelection(new Set());
     setSelectMode(false);
-  }, [scopeId, view, q, myTagFilter, readingFilter]);
+  }, [scopeId, view, q, mode, myTagFilter, readingFilter, author, affiliation, advPubFrom, advPubTo, advCreatedFrom, advCreatedTo]);
 
   const bulkDeleteMutation = useMutation({
     mutationFn: () => (libraryId ? api.batchDeleteLibraryPapers(libraryId, [...selected]) : api.batchDeletePapers(scopeId, [...selected])),
@@ -1411,24 +1432,30 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
   const myTagsQuery = useQuery({ queryKey: ['my-tags'], queryFn: () => api.listMyTags(), retry: false });
   const myTags = myTagsQuery.data ?? [];
 
+  // Share the exact filter object between the visible list and the all-pages batch request.
+  const listFilters = useMemo<SummaryBatchFilters>(() => {
+    const vq = viewQuery(view);
+    return {
+      ...vq,
+      q: q || undefined,
+      sort,
+      my_tag: myTagFilter || undefined,
+      reading_status: readingFilter || undefined,
+      author: author || undefined,
+      affiliation: affiliation || undefined,
+      published_from: advPubFrom ? `${advPubFrom}T00:00:00Z` : undefined,
+      published_to: advPubTo ? `${advPubTo}T23:59:59Z` : undefined,
+      created_from: advCreatedFrom ? `${advCreatedFrom}T00:00:00Z` : vq.created_from,
+      created_to: advCreatedTo ? `${advCreatedTo}T23:59:59Z` : undefined,
+    };
+  }, [view, q, sort, myTagFilter, readingFilter, author, affiliation, advPubFrom, advPubTo, advCreatedFrom, advCreatedTo]);
+
   // —— 关键词/浏览：分页列表 ——
   const listQuery = useInfiniteQuery({
     queryKey: ['papers', scopeId, view, q, sort, myTagFilter, readingFilter, author, affiliation, advPubFrom, advPubTo, advCreatedFrom, advCreatedTo],
     queryFn: ({ pageParam }) => {
-      const vq = viewQuery(view);
       const opts = {
-        ...vq,
-        q: q || undefined,
-        sort,
-        my_tag: myTagFilter || undefined,
-        reading_status: readingFilter || undefined,
-        author: author || undefined,
-        affiliation: affiliation || undefined,
-        published_from: advPubFrom ? `${advPubFrom}T00:00:00Z` : undefined,
-        published_to: advPubTo ? `${advPubTo}T23:59:59Z` : undefined,
-        // 高级检索里显式选了入库日期就以它为准；没选则沿用视图自带的（今日新收录）
-        created_from: advCreatedFrom ? `${advCreatedFrom}T00:00:00Z` : vq.created_from,
-        created_to: advCreatedTo ? `${advCreatedTo}T23:59:59Z` : undefined,
+        ...listFilters,
         page: pageParam,
         size: PAGE_SIZE,
       };
@@ -1455,6 +1482,34 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
     if (semanticActive) return semQuery.data?.papers ?? [];
     return listQuery.data?.pages.flatMap((p) => p.items) ?? [];
   }, [semanticActive, semQuery.data, listQuery.data]);
+
+  const resultTotal = semanticActive ? papers.length : listQuery.data?.pages[0]?.total ?? 0;
+  const selectionCount = selectedPaperCount(allFilteredSelected, resultTotal, selected, excludedSelection);
+  const clearSelection = () => {
+    setSelected(new Set());
+    setAllFilteredSelected(false);
+    setExcludedSelection(new Set());
+  };
+  const selectAllResults = () => {
+    setSelectMode(true);
+    setExcludedSelection(new Set());
+    if (libraryId && !semanticActive) {
+      setAllFilteredSelected(true);
+      setSelected(new Set());
+    } else {
+      // Semantic search is a bounded result set, not a paginated database filter.
+      setAllFilteredSelected(false);
+      setSelected(new Set(papers.map((paper) => paper.id)));
+    }
+  };
+  const openBatchSummary = () => setSummaryDraft({
+    selection: summarySelectionPayload(allFilteredSelected, selected, excludedSelection, listFilters),
+    count: selectionCount,
+  });
+  const toggleSelection = useCallback((paperId: string) => {
+    if (allFilteredSelected) setExcludedSelection((old) => togglePaperId(old, paperId));
+    else setSelected((old) => togglePaperId(old, paperId));
+  }, [allFilteredSelected]);
 
   // 「今日新收录」的顶行说明：这批是什么时候进来的。取最早/最晚的入库时间，
   // 一次同步的论文时间挨得很近，所以多数时候就是一个时刻。
@@ -1679,7 +1734,10 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
               ))}
             </select>
           </div>
-          <div className="row gap8" style={{ marginTop: 10 }}>
+          {zoteroBinding.data && <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+            Zotero · {zoteroBinding.data.collection_name} · {zoteroBinding.data.status === 'syncing' ? tr('同步中', 'Syncing') : zoteroBinding.data.last_error ? tr('同步异常，可在同步设置中重试', 'Sync failed; retry in sync settings') : zoteroBinding.data.last_synced_at ? tr('已同步', 'Synced') : tr('等待首次同步', 'Waiting for initial sync')}
+          </div>}
+          <div className="row gap8 wrap" style={{ marginTop: 10 }}>
             <Segmented<PaperSort>
               options={[
                 { v: 'relevance', label: tr('按相关度', 'By relevance') },
@@ -1691,7 +1749,7 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
             {libraryId && canManage && zoteroLocalAvailable && (
               <button className="btn btn-soft sm" style={{ height: 26, marginLeft: 'auto' }} onClick={() => setZoteroOpen(true)}>
                 <Icon name="refresh" size={12} />
-                Zotero
+                {tr('Zotero 同步设置', 'Zotero sync settings')}
               </button>
             )}
             <button className="btn btn-primary sm" style={{ height: 26, marginLeft: libraryId && canManage && zoteroLocalAvailable ? 0 : 'auto' }} onClick={() => setAddOpen(true)}>
@@ -1699,6 +1757,22 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
               {tr('添加文献', 'Add paper')}
             </button>
           </div>
+          {libraryId && (
+            <div className="row gap6 wrap" style={{ marginTop: 10 }}>
+              <button className="btn btn-soft sm" disabled={isLoading || isError || resultTotal === 0} onClick={selectAllResults}>
+                <Icon name="check" size={12} />
+                {semanticActive ? tr(`全选搜索结果 (${resultTotal})`, `Select search results (${resultTotal})`) : tr(`全选筛选结果 (${resultTotal})`, `Select all results (${resultTotal})`)}
+              </button>
+              {canManage && <button className="btn btn-primary sm" disabled={selectionCount === 0} onClick={openBatchSummary}>
+                <Icon name="sparkle" size={12} />{tr('生成总结', 'Generate summaries')}
+              </button>}
+              {selectionCount > 0 && <button className="btn btn-ghost sm" onClick={clearSelection}>{tr('清空选择', 'Clear selection')}</button>}
+            </div>
+          )}
+          {allFilteredSelected && <div style={{ fontSize: 11, color: 'var(--accent-text)', marginTop: 8, lineHeight: 1.6 }} role="status">
+            {tr(`已选全部筛选结果中的 ${selectionCount} 篇，包含未加载页面。`, `${selectionCount} matching papers selected, including unloaded pages.`)}
+          </div>}
+          {libraryId && canManage && <SummaryBatchPanel libraryId={libraryId} selection={summaryDraft?.selection ?? null} selectedCount={summaryDraft?.count ?? 0} onCloseCreate={() => setSummaryDraft(null)} />}
           {fallbackNotice && (
             <div
               style={{
@@ -1747,17 +1821,10 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
                   key={p.id}
                   p={p}
                   active={p.id === selectedId}
-                  checked={selected.has(p.id)}
+                  checked={isPaperSelected(p.id, allFilteredSelected, selected, excludedSelection)}
                   selectMode={selectMode}
                   onClick={() => onSelect(p.id)}
-                  onToggleCheck={() =>
-                    setSelected((old) => {
-                      const next = new Set(old);
-                      if (next.has(p.id)) next.delete(p.id);
-                      else next.add(p.id);
-                      return next;
-                    })
-                  }
+                  onToggleCheck={toggleSelection}
                 />
               ))}
               {!semanticActive && listQuery.hasNextPage && (
@@ -1787,23 +1854,26 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
 
         {/* —— 底部固定操作栏 —— */}
         <div
-          className="row gap8"
+          className="row gap8 wrap"
           style={{ padding: '9px 14px', borderTop: '0.5px solid var(--border)', flexShrink: 0 }}
         >
           <button
             className={'btn sm ' + (selectMode ? 'btn-primary' : 'btn-ghost')}
-            title={tr('批量删除 / 导出', 'Bulk delete / export')}
+            title={tr('批量总结 / 删除 / 导出', 'Bulk summaries / delete / export')}
             onClick={() => {
               setSelectMode((m) => !m);
-              setSelected(new Set());
+              clearSelection();
             }}
           >
             <Icon name="check" size={13} />
             {selectMode
-              ? tr(`已选 ${selected.size} 篇`, `${selected.size} selected`)
+              ? tr(`已选 ${selectionCount} 篇`, `${selectionCount} selected`)
               : tr('多选', 'Select')}
           </button>
-          {selectMode && (
+          {selectMode && libraryId && canManage && <button className="btn btn-primary sm" disabled={selectionCount === 0} onClick={openBatchSummary}>
+            <Icon name="sparkle" size={12} />{tr('生成总结', 'Generate summaries')}
+          </button>}
+          {selectMode && !allFilteredSelected && (
             <>
               <button
                 className="btn btn-ghost sm"
@@ -1849,6 +1919,9 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
               )}
             </>
           )}
+          {selectMode && allFilteredSelected && <span className="muted" style={{ fontSize: 11 }}>
+            {tr('跨页全选用于批量总结；其他操作请逐篇勾选。', 'All-page selection is for summaries. Select individual papers for other actions.')}
+          </span>}
           {libraryId && canManage && (
             <button className="btn btn-ghost sm" onClick={() => setExtensionHistoryOpen(true)}>
               <Icon name="clock" size={13} />

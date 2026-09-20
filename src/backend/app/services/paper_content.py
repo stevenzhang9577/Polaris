@@ -23,7 +23,7 @@ from app.models.paper_content import (
     PaperContentVersionVector,
 )
 from app.services.evidence import persist_chunk_anchors
-from app.services.paper_assets import storage_path_for_blob
+from app.services.paper_assets import AssetError, resolve_asset_path
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +249,14 @@ async def parse_content_version(
     blob = await session.get(PdfBlob, asset.blob_id)
     if blob is None:
         raise ContentParseError("PDF_BLOB_MISSING")
-    pdf_path = storage_path_for_blob(blob)
+    try:
+        pdf_path = await resolve_asset_path(asset, blob)
+    except AssetError as exc:
+        version.status = "failed"
+        version.error_code = str(exc)
+        version.error_detail = str(exc)
+        await session.commit()
+        raise ContentParseError(str(exc)) from None
     if not pdf_path.is_file():
         raise ContentParseError("PDF_FILE_MISSING")
 
@@ -312,6 +319,15 @@ async def parse_content_version(
             await session.commit()
             raise ContentParseError("PYMUPDF_FAILED") from fallback_exc
 
+    if (asset.metadata_snapshot or {}).get("storage_mode") == "zotero_original":
+        try:
+            await resolve_asset_path(asset, blob)
+        except AssetError as exc:
+            version.status = "failed"
+            version.error_code = str(exc)
+            version.error_detail = str(exc)
+            await session.commit()
+            raise ContentParseError(str(exc)) from None
     return await _persist_parse_result(
         session, version=version, result=result, parser_name=parser_name
     )

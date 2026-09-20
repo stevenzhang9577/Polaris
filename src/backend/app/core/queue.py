@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+from contextvars import ContextVar
 from typing import Any, Protocol
 
 from arq.connections import ArqRedis, RedisSettings, create_pool
@@ -13,6 +14,7 @@ from arq.connections import ArqRedis, RedisSettings, create_pool
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+_inside_worker: ContextVar[bool] = ContextVar("inside_inline_worker", default=False)
 
 # worker 实际注册在 WorkerSettings.functions 里的任务名，单一事实来源。
 # arq 只执行注册过的函数，入队一个没注册的名字会被**静默丢弃**——#216 就是这么
@@ -35,6 +37,7 @@ WORKER_FUNCTIONS = frozenset(
         "zotero_import",
         "zotero_local_sync_task",
         "generate_paper_summary_task",
+        "run_paper_summary_batch_task",
         "recover_paper_summary_jobs_task",
         "purge_deleted_paper_summaries_task",
         "purge_obsidian_vault_tombstones_task",
@@ -118,7 +121,15 @@ class InlineTaskQueue:
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._seq = 0
 
+    @property
+    def active_count(self) -> int:
+        return sum(not task.done() for task in self._tasks.values())
+
     async def enqueue(self, func: str, *args: Any, **kwargs: Any) -> None:
+        from app.core.desktop_runtime import inside_request, paused
+
+        if paused() and not _inside_worker.get() and not inside_request.get():
+            raise RuntimeError("DESKTOP_RUNTIME_SWITCH_PENDING")
         check_task_name(func)
         job_id = kwargs.pop("_job_id", None)
         kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}
@@ -134,7 +145,15 @@ class InlineTaskQueue:
 
         fn = getattr(worker_tasks, func)
         ctx = {"redis": _InlineArqRedis(self)}
-        task = asyncio.create_task(fn(ctx, *args, **kwargs), name=f"inline:{func}")
+
+        async def execute():
+            token = _inside_worker.set(True)
+            try:
+                return await fn(ctx, *args, **kwargs)
+            finally:
+                _inside_worker.reset(token)
+
+        task = asyncio.create_task(execute(), name=f"inline:{func}")
         self._tasks[job_id] = task
         task.add_done_callback(lambda t, jid=job_id: self._finish(jid, t))
 

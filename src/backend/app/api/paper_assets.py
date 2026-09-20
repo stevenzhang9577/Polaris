@@ -209,7 +209,7 @@ async def download_paper_asset(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="ASSET_NOT_FOUND")
     asset, blob = row
     try:
-        path = asset_service.storage_path_for_blob(blob)
+        path = await asset_service.resolve_asset_path(asset, blob)
     except asset_service.AssetError as exc:
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR, detail="ASSET_STORAGE_INVALID"

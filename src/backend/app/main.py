@@ -14,6 +14,7 @@ from app.api.router import api_router
 from app.api.ws import router as ws_router
 from app.core.config import get_settings
 from app.core.db import create_all, dispose_engine, get_sessionmaker
+from app.core.desktop_runtime import DesktopRuntimeBarrier
 from app.core.llm.router import LLMNotConfiguredError
 from app.core.queue import InlineTaskQueue, get_task_queue
 from app.core.redis import close_redis
@@ -118,6 +119,7 @@ def create_app() -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    app.add_middleware(DesktopRuntimeBarrier)
     app.add_middleware(
         CORSMiddleware,
         # dev 全放开；prod 只放行桌面客户端 + POLARIS_CORS_ORIGINS 里显式配置的前端域名。

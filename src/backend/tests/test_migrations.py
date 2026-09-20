@@ -3,13 +3,16 @@
 from pathlib import Path
 
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 
 from alembic import command
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
-HEAD_REVISION = "9a7d4c2e6f10"  # Desktop local LLM config import
+HEAD_REVISION = "bad1bb4329c1"  # Durable summary batches and concurrency leases
+VAULT_DIRECTORY_REVISION = "0a93d8114114"  # Configurable Obsidian managed folder
+ZOTERO_ORIGINAL_PDF_REVISION = "57022e4415e1"
 PRE_LLM_IMPORT_REVISION = "31cf6000d718"  # Zotero Local, summaries, and Obsidian Vault
 PRE_ZOTERO_REVISION = "c1d80a3fb492"  # 每日订阅按人存 (#806)
 SKILLS_DROP_REVISION = "d7f4a16c8e29"  # 技能功能移除 (#755)
@@ -145,6 +148,9 @@ def _inspect_db(db_path: Path) -> tuple[str, dict[str, set[str]]]:
                     "obsidian_vault_library_bindings",
                     "obsidian_vault_file_states",
                     "obsidian_vault_conflicts",
+                    "summary_batches",
+                    "summary_batch_items",
+                    "summary_generation_leases",
                     "library_papers",
                     "daily_feed_entries",
                     "user_publications",
@@ -200,6 +206,81 @@ def _inspect_db(db_path: Path) -> tuple[str, dict[str, set[str]]]:
     finally:
         engine.dispose()
     return version, columns
+
+
+def test_single_migration_head(tmp_path):
+    script = ScriptDirectory.from_config(_make_config(tmp_path / "unused.db"))
+    assert script.get_heads() == [HEAD_REVISION]
+    assert script.get_revision(HEAD_REVISION).down_revision == VAULT_DIRECTORY_REVISION
+    assert script.get_revision(VAULT_DIRECTORY_REVISION).down_revision == (
+        ZOTERO_ORIGINAL_PDF_REVISION
+    )
+
+
+def test_vault_directory_and_summary_batches_preserve_existing_vault_roundtrip(tmp_path):
+    db_path = tmp_path / "vault-batches.db"
+    cfg = _make_config(db_path)
+    command.upgrade(cfg, ZOTERO_ORIGINAL_PDF_REVISION)
+    engine = create_engine(f"sqlite:///{db_path}")
+    user_id = "00000000000000000000000000000001"
+    connection_id = "00000000000000000000000000000002"
+    vault_path = "/synthetic/研究 Vault"
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO users (id, email, hashed_password, is_active, is_superuser, "
+            "is_verified, display_name, username_locked, created_at, updated_at) "
+            "VALUES (:id, 'migration@example.test', 'fake', 1, 0, 1, '', 0, "
+            "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+        ), {"id": user_id})
+        conn.execute(text(
+            "INSERT INTO obsidian_vault_connections "
+            "(id, user_id, vault_path, created_at, updated_at) "
+            "VALUES (:id, :user_id, :path, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+        ), {"id": connection_id, "user_id": user_id, "path": vault_path})
+
+    try:
+        command.upgrade(cfg, "head")
+        version, columns = _inspect_db(db_path)
+        assert version == HEAD_REVISION
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT id, vault_path, managed_directory FROM obsidian_vault_connections"
+            )).one()
+            assert tuple(row) == (connection_id, vault_path, "Polaris")
+            inspector = inspect(conn)
+            for table, expected in (
+                ("summary_batches", {("user_id", "request_id")}),
+                ("summary_batch_items", {("batch_id", "paper_id")}),
+                ("summary_generation_leases", {("user_id", "slot"), ("paper_id",)}),
+            ):
+                actual = {tuple(item["column_names"]) for item in
+                          inspector.get_unique_constraints(table)}
+                assert expected <= actual
+            assert {"runner_token", "runner_expires_at"} <= columns["summary_batches"]
+            lease_fks = {fk["referred_table"] for fk in
+                         inspector.get_foreign_keys("summary_generation_leases")}
+            assert lease_fks == {"users", "papers"}
+
+        command.downgrade(cfg, ZOTERO_ORIGINAL_PDF_REVISION)
+        version, columns = _inspect_db(db_path)
+        assert version == ZOTERO_ORIGINAL_PDF_REVISION
+        assert "managed_directory" not in columns["obsidian_vault_connections"]
+        assert not {"summary_batches", "summary_batch_items", "summary_generation_leases"} & (
+            columns["_tables"]
+        )
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT vault_path FROM obsidian_vault_connections WHERE id=:id"
+            ), {"id": connection_id}).scalar_one() == vault_path
+
+        command.upgrade(cfg, "head")
+        assert _inspect_db(db_path)[0] == HEAD_REVISION
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT managed_directory FROM obsidian_vault_connections WHERE id=:id"
+            ), {"id": connection_id}).scalar_one() == "Polaris"
+    finally:
+        engine.dispose()
 
 
 def test_migrations_sqlite_upgrade_head_and_roundtrip(tmp_path):
@@ -686,6 +767,46 @@ def test_migrations_sqlite_upgrade_head_and_roundtrip(tmp_path):
         "updated_at",
     } <= columns["paper_extractions"]
     assert "ix_paper_extractions_paper_id" in _index_names(db_path, "paper_extractions")
+
+    assert {
+        "user_id", "request_id", "selection", "skip_existing", "status",
+        "runner_token", "runner_expires_at",
+    } <= columns["summary_batches"]
+    assert {"batch_id", "paper_id", "revision_id", "status", "error"} <= columns[
+        "summary_batch_items"
+    ]
+    assert {"user_id", "paper_id", "slot", "expires_at"} <= columns[
+        "summary_generation_leases"
+    ]
+    assert "ix_summary_batch_items_dispatch" in _index_names(db_path, "summary_batch_items")
+    assert "ix_summary_generation_leases_expires_at" in _index_names(
+        db_path, "summary_generation_leases"
+    )
+    command.downgrade(cfg, VAULT_DIRECTORY_REVISION)
+    version, columns = _inspect_db(db_path)
+    assert version == VAULT_DIRECTORY_REVISION
+    assert not {
+        "summary_batches", "summary_batch_items", "summary_generation_leases"
+    } & columns["_tables"]
+    assert "managed_directory" in columns["obsidian_vault_connections"]
+    command.downgrade(cfg, ZOTERO_ORIGINAL_PDF_REVISION)
+    version, columns = _inspect_db(db_path)
+    assert version == ZOTERO_ORIGINAL_PDF_REVISION
+    assert "managed_directory" not in columns["obsidian_vault_connections"]
+
+    assert {"local_pdf_path", "pdf_status", "pdf_error"} <= columns["zotero_item_links"]
+    command.downgrade(cfg, "-1")
+    version, columns = _inspect_db(db_path)
+    assert version == "615363d9c6af"
+    assert "local_pdf_path" not in columns["zotero_item_links"]
+
+    # Import receipts roundtrip independently, without deleting libraries or bindings.
+    assert "zotero_library_imports" in columns["_tables"]
+    command.downgrade(cfg, "-1")
+    version, columns = _inspect_db(db_path)
+    assert version == "9a7d4c2e6f10"
+    assert "zotero_library_imports" not in columns["_tables"]
+    assert "zotero_local_bindings" in columns["_tables"]
 
     # 先退掉 Desktop 本地 LLM 配置导入字段。
     command.downgrade(cfg, "-1")

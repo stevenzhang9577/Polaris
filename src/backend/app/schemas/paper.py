@@ -111,7 +111,9 @@ class PaperDetail(PaperRead):
     pdf_available: bool = False
     zotero_source: bool = False
     zotero_item_key: str | None = None
-    zotero_pdf_status: Literal["on_demand", "materialized", "missing", "error"] | None = None
+    zotero_pdf_status: (
+        Literal["on_demand", "materialized", "linked", "unavailable", "missing", "error"] | None
+    ) = None
     zotero_library_id: uuid.UUID | None = None
     can_materialize_zotero: bool = False
     can_manage_summary: bool = False

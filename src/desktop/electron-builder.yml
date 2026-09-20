@@ -43,6 +43,12 @@ afterPack: build/after-pack.cjs
 
 mac:
   category: public.app-category.productivity
+  # Polaris 自身只提供中英文界面；删除 Electron 的其余 locale 可减少约 50 MB
+  # 解压体积，不影响网页内容、PDF 字体或系统输入法。
+  electronLanguages:
+    - en
+    - zh_CN
+    - zh_TW
   # uv 已在 fetch-uv.mjs 里 lipo 成 fat 二进制、两个分架构包中逐字节相同；
   # @electron/universal 合并时要求这类「相同的 Mach-O」显式列进 x64ArchFiles，
   # 否则按「该 lipo 而没 lipo」处理直接报错中止。

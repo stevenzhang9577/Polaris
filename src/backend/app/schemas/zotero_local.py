@@ -26,6 +26,20 @@ class ZoteroBindingCreate(BaseModel):
     collection_key: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9]+$")
 
 
+class ZoteroLibraryImportCreate(ZoteroBindingCreate):
+    request_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=255)
+    statement: str | None = Field(default=None, max_length=10000)
+    discipline: str | None = Field(default=None, max_length=100)
+
+
+class ZoteroLibraryImportRead(BaseModel):
+    library_id: uuid.UUID
+    binding_id: uuid.UUID
+    run_id: uuid.UUID
+    dispatch_pending: bool = False
+
+
 class ZoteroBindingRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

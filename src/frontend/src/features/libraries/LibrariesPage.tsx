@@ -10,6 +10,8 @@ import { toast } from '../../components/ui/Toast';
 import { fmtTime } from '../../lib/format';
 import { api, ApiError, type DirectionLibrarySummary } from '../../lib/api';
 import { tr } from '../../lib/i18n';
+import { localOrigin } from '../../lib/endpoint';
+import { ImportZoteroLibraryModal } from './ImportZoteroLibraryModal';
 import { StatementInterview } from './StatementInterview';
 import { useLibraries, libraryPath, type LibraryFilters } from './hooks';
 import { DisciplineSelect } from './DisciplineSelect';
@@ -410,6 +412,9 @@ export function LibrariesPage() {
   // role 治理已移除（#614）：批量管理入口对所有登录用户开放，删除权限由后端按创建者校验
   const admin = !!me;
   const [createOpen, setCreateOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const localZotero = localOrigin() !== null;
+  const zoteroBindings = useQuery({ queryKey: ['zotero-bindings'], queryFn: api.listZoteroBindings, enabled: canCreate && localZotero, retry: false, refetchInterval: 10000 });
   // 多选态（仅 admin 可用）：selectMode 打开后每张卡可勾选，顶部出现批量操作栏
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -510,6 +515,8 @@ export function LibrariesPage() {
           />
         </div>
         {canCreate && (
+          <div className="row gap8 wrap" style={{ marginLeft: 'auto' }}>
+          {localZotero && <button className="btn btn-soft sm" onClick={() => setImportOpen(true)}><Icon name="download" size={13} />{tr('导入 Zotero 文献库', 'Import Zotero library')}</button>}
           <button
             className="btn btn-primary sm"
             style={{ marginLeft: 'auto' }}
@@ -518,6 +525,7 @@ export function LibrariesPage() {
             <Icon name="plus" size={13} />
             {tr('新建文献库', 'New library')}
           </button>
+          </div>
         )}
         {admin && sorted.length > 0 && (
           <button
@@ -543,6 +551,7 @@ export function LibrariesPage() {
       </div>
 
       {canCreate && <NewLibraryModal open={createOpen} onClose={() => setCreateOpen(false)} />}
+      {canCreate && localZotero && importOpen && <ImportZoteroLibraryModal onClose={() => setImportOpen(false)} />}
 
       {isLoading ? (
         <div
@@ -578,10 +587,13 @@ export function LibrariesPage() {
           }
           action={
             canCreate ? (
+              <div className="row gap8 wrap" style={{ justifyContent: 'center' }}>
               <button className="btn btn-primary sm" onClick={() => setCreateOpen(true)}>
                 <Icon name="plus" size={13} />
                 {tr('新建文献库', 'New library')}
               </button>
+              {localZotero && <button className="btn btn-soft sm" onClick={() => setImportOpen(true)}><Icon name="download" size={13} />{tr('导入 Zotero 文献库', 'Import Zotero library')}</button>}
+              </div>
             ) : (
               <button className="btn btn-primary sm" onClick={() => navigate('/projects/new')}>
                 <Icon name="plus" size={13} />
@@ -599,6 +611,8 @@ export function LibrariesPage() {
           }}
         >
           {sorted.map((lib) => (
+            <div key={lib.id}>
+            {zoteroBindings.data?.filter((b) => b.library_id === lib.id).map((b) => <div key={b.id} className="muted" style={{ fontSize: 12, marginBottom: 6 }}>Zotero · {b.collection_name} · {b.status === 'syncing' ? tr('同步中', 'Syncing') : b.last_error ? tr('同步异常', 'Sync error') : b.last_synced_at ? tr('已同步', 'Synced') : tr('等待同步', 'Waiting to sync')}</div>)}
             <LibraryCard
               key={lib.id}
               lib={lib}
@@ -618,6 +632,7 @@ export function LibrariesPage() {
                 deleteMutation.mutate([lib]);
               }}
             />
+            </div>
           ))}
         </div>
       )}

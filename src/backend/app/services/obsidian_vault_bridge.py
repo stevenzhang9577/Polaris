@@ -1,6 +1,7 @@
 """Desktop-only bidirectional bridge for an existing Obsidian vault.
 
-Only ``<vault>/Polaris`` is managed.  Database content and Markdown bodies share a persisted
+Only the configured managed subfolder (default ``<vault>/Polaris``) is managed.
+Database content and Markdown bodies share a persisted
 merge base; generated YAML frontmatter is deliberately excluded from the merge.  The module
 does not import FastAPI and can therefore be used by HTTP, CLI, startup reconciliation, and a
 filesystem watcher without duplicating business rules.
@@ -16,6 +17,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import tempfile
 import unicodedata
 import uuid
@@ -28,7 +30,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
 
 import yaml
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.base import utcnow
@@ -327,6 +329,11 @@ class DefaultVaultDomainAdapter:
 
 DEFAULT_DOMAIN_ADAPTER = DefaultVaultDomainAdapter()
 _SYNC_LOCKS: dict[uuid.UUID, asyncio.Lock] = {}
+_ACTIVE_RECONCILIATIONS = 0
+
+
+def active_vault_syncs() -> int:
+    return _ACTIVE_RECONCILIATIONS + sum(lock.locked() for lock in _SYNC_LOCKS.values())
 
 
 def content_hash(content: str) -> str:
@@ -399,18 +406,32 @@ def validate_vault_root(raw_path: str | Path) -> Path:
     return root
 
 
-def managed_root(vault_root: Path, *, create: bool = False) -> Path:
+def validate_managed_directory(value: str) -> str:
+    """One visible folder directly inside the vault, never an arbitrary path."""
+    if (
+        not value or len(value) > 128 or value != value.strip() or value.startswith(".")
+        or value.endswith(".") or re.search(r'[/\\:<>"|?*\x00-\x1f\x7f]', value)
+    ):
+        raise VaultBridgeError("OBSIDIAN_MANAGED_DIRECTORY_INVALID")
+    return value
+
+
+def managed_root(
+    vault_root: Path, managed_directory: str = MANAGED_DIRECTORY, *, create: bool = False
+) -> Path:
     root = vault_root.resolve(strict=True)
-    target = root / MANAGED_DIRECTORY
+    target = root / validate_managed_directory(managed_directory)
     if target.is_symlink():
         raise VaultBridgeError("OBSIDIAN_MANAGED_PATH_SYMLINK")
-    if create:
-        target.mkdir(mode=0o700, exist_ok=True)
     if target.exists():
+        if not target.is_dir():
+            raise VaultBridgeError("OBSIDIAN_MANAGED_PATH_INVALID")
         resolved = target.resolve(strict=True)
         if not resolved.is_relative_to(root):
             raise VaultBridgeError("OBSIDIAN_PATH_OUTSIDE_MANAGED_ROOT")
         return resolved
+    if create:
+        target.mkdir(mode=0o700)
     return target
 
 
@@ -654,35 +675,96 @@ def _document_matches_entity(document: MarkdownDocument, entity: ProjectedEntity
 
 
 async def configure_connection(
-    session: AsyncSession, *, user_id: uuid.UUID, vault_path: str
+    session: AsyncSession, *, user_id: uuid.UUID, vault_path: str,
+    managed_directory: str = MANAGED_DIRECTORY,
 ) -> ObsidianVaultConnection:
+    """Commit a location change while preserving all files, merge bases and conflicts.
+
+    A subfolder rename moves the whole managed tree atomically. Switching Vaults copies it
+    into a new, unused directory and leaves the original untouched. Never adopt or overwrite
+    an existing destination on a location change. The commit stays inside the sync lock;
+    failures compensate the filesystem operation and leave the old location authoritative.
+    """
     root = validate_vault_root(vault_path)
-    managed = managed_root(root, create=True)
+    directory = validate_managed_directory(managed_directory)
+    managed = managed_root(root, directory)
     connection = (
         await session.execute(
             select(ObsidianVaultConnection).where(ObsidianVaultConnection.user_id == user_id)
         )
     ).scalar_one_or_none()
     if connection is None:
-        connection = ObsidianVaultConnection(user_id=user_id, vault_path=str(root))
+        connection = ObsidianVaultConnection(
+            user_id=user_id, vault_path=str(root), managed_directory=directory
+        )
         session.add(connection)
         await session.flush()
-    else:
-        if connection.vault_path != str(root):
-            # Merge bases belong to one concrete vault.  Reusing them after the user switches
-            # directories would interpret an empty new vault as a mass user deletion.
-            await session.execute(
-                delete(VaultConflict).where(VaultConflict.connection_id == connection.id)
-            )
-            await session.execute(
-                delete(VaultFileState).where(VaultFileState.connection_id == connection.id)
-            )
-        connection.vault_path = str(root)
-        connection.status = "ready"
-        connection.last_error = None
-        await session.flush()
-    manifest = render_manifest(connection)
-    atomic_write_text(managed, MANIFEST_FILENAME, manifest)
+        managed = managed_root(root, directory, create=True)
+        atomic_write_text(managed, MANIFEST_FILENAME, render_manifest(connection))
+        await session.commit()
+        return connection
+
+    connection_id = connection.id
+    was_watching = watcher_running(connection_id)
+    # Stop outside the lock: an in-flight watcher callback may itself be holding the lock.
+    await stop_connection_watcher(connection_id)
+    lock = _SYNC_LOCKS.setdefault(connection_id, asyncio.Lock())
+    async with lock:
+        await session.refresh(connection)
+        old_vault = connection.vault_path
+        old_directory = connection.managed_directory
+        old_root: Path | None = None
+        moved = copied = False
+        try:
+            if old_vault != str(root) or old_directory != directory:
+                old_root = managed_root(validate_vault_root(old_vault), old_directory)
+                if managed.exists():
+                    raise VaultBridgeError("OBSIDIAN_DESTINATION_ALREADY_EXISTS")
+                if not old_root.is_dir():
+                    raise VaultBridgeError("OBSIDIAN_MANAGED_SOURCE_MISSING")
+                # Reject symlinks anywhere, including non-Markdown personal files. A copy
+                # must never dereference an external file; a rename must not inherit one.
+                for current, directories, filenames in os.walk(old_root, followlinks=False):
+                    if any((Path(current) / name).is_symlink() for name in directories + filenames):
+                        raise VaultBridgeError("OBSIDIAN_MANAGED_PATH_SYMLINK")
+                if old_vault == str(root):
+                    old_root.rename(managed)
+                    moved = True
+                else:
+                    # Publish only a complete copy. The temporary directory is owned solely
+                    # by this operation and can be removed safely on failure.
+                    staging = Path(tempfile.mkdtemp(prefix=".polaris-relocate-", dir=root))
+                    try:
+                        shutil.copytree(old_root, staging, dirs_exist_ok=True, symlinks=True)
+                        staging.rename(managed)
+                        copied = True
+                    finally:
+                        if staging.exists():
+                            shutil.rmtree(staging)
+            connection.vault_path = str(root)
+            connection.managed_directory = directory
+            connection.status = "ready"
+            connection.last_error = None
+            atomic_write_text(managed, MANIFEST_FILENAME, render_manifest(connection))
+            await session.commit()
+        except BaseException as exc:
+            await session.rollback()
+            if moved and old_root is not None:
+                managed.rename(old_root)
+                await session.refresh(connection)
+                atomic_write_text(old_root, MANIFEST_FILENAME, render_manifest(connection))
+            elif copied:
+                # No user edits can have entered via Polaris before the commit/lock release.
+                # Keep the copy on disk on rollback rather than risking external editor edits.
+                pass
+            if was_watching:
+                await start_connection_watcher(
+                    connection_id=connection_id, user_id=user_id, vault_path=old_vault,
+                    managed_directory=old_directory,
+                )
+            if isinstance(exc, OSError):
+                raise VaultBridgeError("OBSIDIAN_DIRECTORY_CHANGE_FAILED") from None
+            raise
     return connection
 
 
@@ -694,7 +776,7 @@ def render_manifest(connection: ObsidianVaultConnection) -> str:
             "format": "polaris-obsidian-vault",
             "version": BRIDGE_VERSION,
             "connection_id": str(connection.id),
-            "managed_directory": MANAGED_DIRECTORY,
+            "managed_directory": connection.managed_directory,
         },
         ensure_ascii=False,
         indent=2,
@@ -1299,7 +1381,11 @@ async def _sync_connection_unlocked(
     stats = VaultSyncStats()
     try:
         vault = validate_vault_root(connection.vault_path)
-        root = managed_root(vault, create=True)
+        root = managed_root(vault, connection.managed_directory)
+        if not root.is_dir():
+            # Missing a whole managed tree (unmounted storage, external rename or interrupted
+            # relocation) is never a request to delete every summary and private note.
+            raise VaultBridgeError("OBSIDIAN_MANAGED_SOURCE_MISSING")
         atomic_write_text(root, MANIFEST_FILENAME, render_manifest(connection))
         identity_index = _scan_identity_index(root)
         stmt = select(VaultLibraryBinding).where(
@@ -1366,6 +1452,8 @@ async def sync_connection(
     """Serialize watcher, manual, and projection reconciliation for one local connection."""
     lock = _SYNC_LOCKS.setdefault(connection.id, asyncio.Lock())
     async with lock:
+        # A location change may have committed while this reconciliation awaited the lock.
+        await session.refresh(connection, attribute_names=["vault_path", "managed_directory"])
         stats = await _sync_connection_unlocked(
             session,
             connection=connection,
@@ -1601,6 +1689,7 @@ async def _resolve_conflict_unlocked(
     )
     if connection is None or state is None or library is None:
         raise VaultBridgeError("OBSIDIAN_CONFLICT_TARGET_MISSING")
+    await session.refresh(connection, attribute_names=["vault_path", "managed_directory"])
     if not await libraries_service.can_manage_library(
         session, user=user, library=library
     ):
@@ -1615,7 +1704,9 @@ async def _resolve_conflict_unlocked(
         metadata={"title": paper.title if paper else library.name},
         editable=conflict.entity_type != "library_index",
     )
-    root = managed_root(validate_vault_root(connection.vault_path), create=True)
+    root = managed_root(validate_vault_root(connection.vault_path), connection.managed_directory)
+    if not root.is_dir():
+        raise VaultBridgeError("OBSIDIAN_MANAGED_SOURCE_MISSING")
     target = safe_managed_path(root, state.relative_path)
     live_vault = ""
     original_raw: str | None = None
@@ -1769,6 +1860,10 @@ class VaultWatcher:
                 continue
             except TimeoutError:
                 pass
+            from app.core.desktop_runtime import paused
+
+            if paused():
+                continue
             current = await asyncio.to_thread(self._snapshot)
             if current != previous:
                 previous = current
@@ -1790,24 +1885,32 @@ def watcher_running(connection_id: uuid.UUID) -> bool:
 
 
 async def start_connection_watcher(
-    *, connection_id: uuid.UUID, user_id: uuid.UUID, vault_path: str
+    *, connection_id: uuid.UUID, user_id: uuid.UUID, vault_path: str,
+    managed_directory: str = MANAGED_DIRECTORY,
 ) -> None:
     """Start or replace the process-local watcher for one desktop connection."""
     await stop_connection_watcher(connection_id)
-    root = managed_root(validate_vault_root(vault_path), create=True)
+    root = managed_root(validate_vault_root(vault_path), managed_directory)
+    if not root.is_dir():
+        raise VaultBridgeError("OBSIDIAN_MANAGED_SOURCE_MISSING")
 
     async def reconcile() -> None:
         # Delayed import avoids binding the service module to one engine during tests.
         from app.core.db import get_sessionmaker
 
-        async with get_sessionmaker()() as session:
-            connection = await session.get(ObsidianVaultConnection, connection_id)
-            user = await session.get(User, user_id)
-            if connection is None or user is None:
-                _WATCHERS.pop(connection_id, None)
-                return
-            await sync_connection(session, connection=connection, user=user)
-            await session.commit()
+        global _ACTIVE_RECONCILIATIONS
+        _ACTIVE_RECONCILIATIONS += 1
+        try:
+            async with get_sessionmaker()() as session:
+                connection = await session.get(ObsidianVaultConnection, connection_id)
+                user = await session.get(User, user_id)
+                if connection is None or user is None:
+                    _WATCHERS.pop(connection_id, None)
+                    return
+                await sync_connection(session, connection=connection, user=user)
+                await session.commit()
+        finally:
+            _ACTIVE_RECONCILIATIONS -= 1
 
     watcher = VaultWatcher(root, reconcile)
     _WATCHERS[connection_id] = watcher
@@ -1844,6 +1947,7 @@ async def resume_configured_watchers() -> None:
                 connection_id=connection.id,
                 user_id=connection.user_id,
                 vault_path=connection.vault_path,
+                managed_directory=connection.managed_directory,
             )
         except (OSError, VaultBridgeError):
             continue

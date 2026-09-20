@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth import current_active_user
 from app.api.chat_stream import chat_stream_response
 from app.api.chat_stream import sse_frame as _sse_frame
+from app.core.config import get_settings
 from app.core.db import get_session
 from app.core.events import paper_task_channel, paper_task_log_key
 from app.core.llm.router import get_llm_router
@@ -74,8 +75,8 @@ from app.services import paper_content as paper_content_service
 from app.services import paper_enrich as paper_enrich_service
 from app.services import paper_import as paper_import_service
 from app.services import paper_index as paper_index_service
+from app.services import paper_reads as paper_reads_service
 from app.services import paper_summaries as paper_summaries_service
-from app.services import paper_wiki as paper_wiki_service
 from app.services import papers as papers_service
 from app.services import wiki_compile as wiki_compile_service
 from app.services.literature.pdf_extract import figure_path
@@ -127,171 +128,19 @@ async def _reads_with_extras(
     detail: bool = False,
     library_ids: Sequence[uuid.UUID] | None = None,
 ) -> list[PaperRead]:
-    """ORM → schema，回填 tags/my_tags/starred/reading_status/note_count（聚合查询，避免 N+1）。
-
-    library_ids = 本次浏览的库上下文（库标签按它过滤，见 paper_extras_map）；不传时按
-    每篇论文自己解析到的成员行所属库来算，池级可达的无库论文则不显示库标签。
-    """
-    extras = await papers_service.paper_extras_map(
+    return await paper_reads_service.reads_with_extras(
         session,
-        paper_ids=[p.id for p in papers],
-        user_id=user_id,
-        library_ids=(
-            library_ids
-            if library_ids is not None
-            else [p.library_id for p in papers if p.library_id is not None]
-        ),
+        papers,
+        user_id,
+        detail=detail,
+        library_ids=library_ids,
     )
-    if not detail:
-        return [PaperRead.model_validate(p).model_copy(update=extras[p.id]) for p in papers]
-    # 详情多带编译者显示名：重新编译会覆盖别人那份，前端据此提示（人被删则留空）
-    names = await paper_wiki_service.compiler_names(
-        session,
-        (
-            p.paper.wiki.compiled_by
-            for p in papers
-            if p.paper.wiki is not None and p.paper.wiki.deleted_at is None
-        ),
-    )
-    paper_ids = [paper.id for paper in papers]
-    link_stmt = (
-        select(ZoteroItemLink, ZoteroLocalBinding.library_id)
-        .join(ZoteroLocalBinding, ZoteroLocalBinding.id == ZoteroItemLink.binding_id)
-        .where(ZoteroItemLink.paper_id.in_(paper_ids))
-        .order_by(
-            ZoteroItemLink.paper_id,
-            (ZoteroItemLink.status == "active").desc(),
-            ZoteroItemLink.item_key,
-        )
-    )
-    contextual_library_ids = {paper.library_id for paper in papers if paper.library_id}
-    if contextual_library_ids:
-        link_stmt = link_stmt.where(
-            ZoteroLocalBinding.library_id.in_(contextual_library_ids)
-        )
-    else:
-        # Pool-only views (shelf/daily feed) must not reveal an item key from another user's
-        # private library merely because the global Paper row is reachable.
-        link_stmt = link_stmt.where(
-            ZoteroLocalBinding.library_id.in_(
-                libraries_service.visible_library_ids_stmt(user_id)
-            )
-        )
-    zotero_links: dict[uuid.UUID, tuple[ZoteroItemLink, uuid.UUID]] = {}
-    for link, zotero_library_id in (await session.execute(link_stmt)).all():
-        if link.paper_id is not None:
-            zotero_links.setdefault(link.paper_id, (link, zotero_library_id))
-    manageable_library_ids = set(
-        (
-            await session.execute(
-                select(DirectionLibrary.id).where(
-                    or_(
-                        DirectionLibrary.submitted_by.is_(None),
-                        DirectionLibrary.submitted_by == user_id,
-                    )
-                )
-            )
-        ).scalars()
-    )
-    manageable_summary_papers = set(
-        (
-            await session.execute(
-                select(LibraryPaper.paper_id)
-                .join(DirectionLibrary, DirectionLibrary.id == LibraryPaper.library_id)
-                .where(
-                    LibraryPaper.paper_id.in_(paper_ids),
-                    LibraryPaper.trash_reason.is_(None),
-                    libraries_service.visible_library_clause(user_id),
-                )
-            )
-        ).scalars()
-    )
-    materialized_zotero = set(
-        (
-            await session.execute(
-                select(PaperAsset.paper_id, AssetGrant.library_id)
-                .join(AssetGrant, AssetGrant.asset_id == PaperAsset.id)
-                .where(
-                    PaperAsset.paper_id.in_(paper_ids),
-                    PaperAsset.source == "zotero",
-                    PaperAsset.state == "ready",
-                    AssetGrant.status == "active",
-                    AssetGrant.can_read.is_(True),
-                )
-            )
-        ).all()
-    )
-    asset_paper_ids = set(
-        (
-            await session.execute(
-                select(PaperAsset.paper_id).where(PaperAsset.paper_id.in_(paper_ids))
-            )
-        ).scalars()
-    )
-    readable_asset_paper_ids = set(
-        (
-            await session.execute(
-                select(PaperAsset.paper_id)
-                .join(PdfBlob, PdfBlob.id == PaperAsset.blob_id)
-                .join(AssetGrant, AssetGrant.asset_id == PaperAsset.id)
-                .join(DirectionLibrary, DirectionLibrary.id == AssetGrant.library_id)
-                .where(
-                    PaperAsset.paper_id.in_(paper_ids),
-                    PaperAsset.state == "ready",
-                    PdfBlob.state == "ready",
-                    AssetGrant.status == "active",
-                    AssetGrant.can_read.is_(True),
-                    or_(
-                        libraries_service.visible_library_clause(user_id),
-                        DirectionLibrary.is_public.is_(True),
-                    ),
-                )
-            )
-        ).scalars()
-    )
-    out: list[PaperRead] = []
-    for p in papers:
-        by = (
-            p.paper.wiki.compiled_by
-            if p.paper.wiki is not None and p.paper.wiki.deleted_at is None
-            else None
-        )
-        zotero_entry = zotero_links.get(p.id)
-        link = zotero_entry[0] if zotero_entry is not None else None
-        zotero_library_id = zotero_entry[1] if zotero_entry is not None else None
-        zotero_pdf_status = None
-        if link is not None:
-            if link.status in {"missing", "error"}:
-                zotero_pdf_status = link.status
-            elif (p.id, zotero_library_id) in materialized_zotero:
-                zotero_pdf_status = "materialized"
-            else:
-                zotero_pdf_status = "on_demand"
-        update = extras[p.id] | {
-            "compiled_by_name": names.get(by) if by else None,
-            "zotero_source": link is not None,
-            "zotero_item_key": link.item_key if link is not None else None,
-            "zotero_pdf_status": zotero_pdf_status,
-            "zotero_library_id": zotero_library_id,
-            "can_materialize_zotero": bool(
-                zotero_library_id is not None and zotero_library_id in manageable_library_ids
-            ),
-            "can_manage_summary": p.id in manageable_summary_papers,
-            "pdf_available": (
-                p.id in readable_asset_paper_ids
-                if p.id in asset_paper_ids
-                else bool(p.paper.pdf_path and Path(p.paper.pdf_path).is_file())
-            ),
-        }
-        out.append(PaperDetail.model_validate(p).model_copy(update=update))
-    return out
 
 
 async def _paper_detail(
     session: AsyncSession, paper: papers_service.PaperView, user_id: uuid.UUID
 ) -> PaperDetail:
-    (detail,) = await _reads_with_extras(session, [paper], user_id, detail=True)
-    return detail  # type: ignore[return-value]
+    return await paper_reads_service.paper_detail(session, paper, user_id)
 
 
 async def _get_managed_project(session: AsyncSession, project_id: uuid.UUID, user: User):
@@ -326,8 +175,11 @@ async def _get_member_paper(
 
 
 async def _get_summary_writable_paper(
-    session: AsyncSession, paper_id: uuid.UUID, user: User,
-    *, library_id: uuid.UUID | None = None,
+    session: AsyncSession,
+    paper_id: uuid.UUID,
+    user: User,
+    *,
+    library_id: uuid.UUID | None = None,
 ) -> papers_service.PaperView:
     """Return a user-scoped library view for a global-summary mutation, or a uniform 404.
 
@@ -359,7 +211,8 @@ async def _get_summary_writable_paper(
                 .outerjoin(ZoteroLocalBinding, ZoteroLocalBinding.library_id == DirectionLibrary.id)
                 .order_by(
                     ZoteroLocalBinding.id.is_not(None).desc(),
-                    LibraryPaper.created_at, DirectionLibrary.id,
+                    LibraryPaper.created_at,
+                    DirectionLibrary.id,
                 )
             )
         ).scalars()
@@ -371,9 +224,7 @@ async def _get_summary_writable_paper(
             # user's private library. The association itself is not an authorization grant.
             if not libraries_service.library_visible_to(library, user):
                 continue
-        elif not await libraries_service.can_manage_library(
-            session, library=library, user=user
-        ):
+        elif not await libraries_service.can_manage_library(session, library=library, user=user):
             continue
         view = await papers_service.get_library_paper_view(
             session,
@@ -402,9 +253,7 @@ async def list_papers(
     published_to: datetime | None = Query(default=None),
     created_from: datetime | None = Query(default=None),
     created_to: datetime | None = Query(default=None),
-    daily_only: bool = Query(
-        default=False, description="只看从每日论文池自动收录的"
-    ),
+    daily_only: bool = Query(default=False, description="只看从每日论文池自动收录的"),
     last_sync_only: bool = Query(
         default=False,
         description="只看最近一次同步新增的（没同步过则返回空；「最新收录」视图用）",
@@ -692,9 +541,7 @@ async def restore_project_paper(
     return await _paper_detail(session, view, user.id)
 
 
-@router.delete(
-    "/projects/{project_id}/papers/{paper_id}", status_code=status.HTTP_204_NO_CONTENT
-)
+@router.delete("/projects/{project_id}/papers/{paper_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_project_paper(
     project_id: uuid.UUID,
     paper_id: uuid.UUID,
@@ -731,8 +578,7 @@ async def resolve_paper_meta(
         title=str(fields.get("title") or ""),
         year=fields.get("year"),
         authors=[
-            str(a.get("name") if isinstance(a, dict) else a)
-            for a in (fields.get("authors") or [])
+            str(a.get("name") if isinstance(a, dict) else a) for a in (fields.get("authors") or [])
         ][:8],
     )
 
@@ -876,7 +722,7 @@ async def _readable_pdf_path(
     ).first()
     if row is not None:
         try:
-            path = paper_assets_service.storage_path_for_blob(row[1])
+            path = await paper_assets_service.resolve_asset_path(row[0], row[1])
         except paper_assets_service.AssetError:
             return None
         return path if path.is_file() else None
@@ -895,9 +741,38 @@ async def get_paper_pdf(
     user: User = Depends(current_active_user),
 ) -> FileResponse:
     paper = await _get_member_paper(session, paper_id, user, include_pool=True)
-    path = await _readable_pdf_path(
-        session, paper_id=paper_id, user_id=user.id
-    )
+    if get_settings().is_desktop:
+        original_library_id = await session.scalar(
+            select(ZoteroLocalBinding.library_id)
+            .join(ZoteroItemLink, ZoteroItemLink.binding_id == ZoteroLocalBinding.id)
+            .join(DirectionLibrary, DirectionLibrary.id == ZoteroLocalBinding.library_id)
+            .where(
+                ZoteroItemLink.paper_id == paper_id,
+                ZoteroItemLink.status == "active",
+                or_(
+                    DirectionLibrary.submitted_by == user.id,
+                    DirectionLibrary.submitted_by.is_(None),
+                ),
+            )
+            .limit(1)
+        )
+        if original_library_id is not None:
+            from app.services.zotero_local import ZoteroLocalError, original_pdf_path
+
+            try:
+                original = await original_pdf_path(
+                    session, library_id=original_library_id, paper_id=paper_id
+                )
+            except ZoteroLocalError as exc:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, detail=exc.code) from None
+            return FileResponse(
+                original,
+                media_type="application/pdf",
+                filename=f"{paper_id}.pdf",
+                content_disposition_type="inline",
+                headers={"Cache-Control": "private, no-store"},
+            )
+    path = await _readable_pdf_path(session, paper_id=paper_id, user_id=user.id)
     if path is None:
         # No asset rows means this is a pre-asset legacy paper; preserve that reader path.
         has_asset = await session.scalar(
@@ -931,9 +806,7 @@ async def fetch_paper_pdf(
         if await _readable_pdf_path(session, paper_id=paper_id, user_id=user.id) is not None:
             return await _paper_detail(session, view, user.id)
         if not view.paper.arxiv_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, detail="PDF_SOURCE_UNSUPPORTED"
-            )
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="PDF_SOURCE_UNSUPPORTED")
         library = (
             await session.get(DirectionLibrary, view.library_id)
             if view.library_id is not None
@@ -973,9 +846,7 @@ async def fetch_paper_pdf(
             raise
         except Exception as exc:
             await session.rollback()
-            raise HTTPException(
-                status.HTTP_502_BAD_GATEWAY, detail="PDF_FETCH_FAILED"
-            ) from exc
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail="PDF_FETCH_FAILED") from exc
     try:
         await papers_service.fetch_pdf(
             session, view.paper, user_id=user.id, project_id=view.project_id
@@ -1000,9 +871,7 @@ async def upload_paper_pdf(
     if not content:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail="PDF_UPLOAD_EMPTY")
     if len(content) > MAX_PDF_UPLOAD_BYTES:
-        raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="PDF_UPLOAD_TOO_LARGE"
-        )
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="PDF_UPLOAD_TOO_LARGE")
     try:
         await papers_service.upload_pdf(
             session,
@@ -1195,22 +1064,16 @@ async def get_paper_summary(
     user: User = Depends(current_active_user),
 ) -> PaperSummaryRead:
     paper = await _get_member_paper(session, paper_id, user, include_pool=True)
-    current = await paper_summaries_service.get_current_summary(
-        session, paper=paper.paper
-    )
+    current = await paper_summaries_service.get_current_summary(session, paper=paper.paper)
     if current is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="SUMMARY_NOT_FOUND")
     wiki, revision = current
-    result = await _summary_read(
-        session, paper=paper, wiki=wiki, revision=revision
-    )
+    result = await _summary_read(session, paper=paper, wiki=wiki, revision=revision)
     await session.commit()  # persists lazy legacy backfill/stale detection when required
     return result
 
 
-@router.get(
-    "/papers/{paper_id}/summaries", response_model=list[PaperSummaryRevisionRead]
-)
+@router.get("/papers/{paper_id}/summaries", response_model=list[PaperSummaryRevisionRead])
 async def list_paper_summaries(
     paper_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
@@ -1231,9 +1094,7 @@ async def list_paper_summaries(
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 return []
             raise
-    revisions = await paper_summaries_service.list_summary_revisions(
-        session, paper=paper.paper
-    )
+    revisions = await paper_summaries_service.list_summary_revisions(session, paper=paper.paper)
     current_revision_id = wiki[0].current_revision_id if wiki is not None else None
     await session.commit()
     return [
@@ -1258,20 +1119,12 @@ async def activate_paper_summary(
             session, paper=paper.paper, revision_id=revision_id
         )
     except paper_summaries_service.SummaryRevisionNotFoundError as exc:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, detail="SUMMARY_REVISION_NOT_FOUND"
-        ) from exc
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="SUMMARY_REVISION_NOT_FOUND") from exc
     except paper_summaries_service.SummaryRevisionStateError as exc:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, detail="SUMMARY_REVISION_NOT_READY"
-        ) from exc
-    result = await _summary_read(
-        session, paper=paper, wiki=wiki, revision=revision
-    )
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="SUMMARY_REVISION_NOT_READY") from exc
+    result = await _summary_read(session, paper=paper, wiki=wiki, revision=revision)
     await session.commit()
-    await obsidian_vault_service.enqueue_paper_projection(
-        paper_id=paper.id, entity_type="summary"
-    )
+    await obsidian_vault_service.enqueue_paper_projection(paper_id=paper.id, entity_type="summary")
     return result
 
 
@@ -1287,9 +1140,7 @@ async def delete_paper_summary(
     except paper_summaries_service.SummaryNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="SUMMARY_NOT_FOUND") from exc
     await session.commit()
-    await obsidian_vault_service.enqueue_paper_projection(
-        paper_id=paper.id, entity_type="summary"
-    )
+    await obsidian_vault_service.enqueue_paper_projection(paper_id=paper.id, entity_type="summary")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1301,22 +1152,14 @@ async def restore_paper_summary(
 ) -> PaperSummaryRead:
     paper = await _get_summary_writable_paper(session, paper_id, user)
     try:
-        wiki, revision = await paper_summaries_service.restore_summary(
-            session, paper=paper.paper
-        )
+        wiki, revision = await paper_summaries_service.restore_summary(session, paper=paper.paper)
     except paper_summaries_service.SummaryNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="SUMMARY_NOT_FOUND") from exc
     except paper_summaries_service.SummaryRestoreExpiredError as exc:
-        raise HTTPException(
-            status.HTTP_410_GONE, detail="SUMMARY_RETENTION_EXPIRED"
-        ) from exc
-    result = await _summary_read(
-        session, paper=paper, wiki=wiki, revision=revision
-    )
+        raise HTTPException(status.HTTP_410_GONE, detail="SUMMARY_RETENTION_EXPIRED") from exc
+    result = await _summary_read(session, paper=paper, wiki=wiki, revision=revision)
     await session.commit()
-    await obsidian_vault_service.enqueue_paper_projection(
-        paper_id=paper.id, entity_type="summary"
-    )
+    await obsidian_vault_service.enqueue_paper_projection(paper_id=paper.id, entity_type="summary")
     return result
 
 

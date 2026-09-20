@@ -209,6 +209,8 @@ async def test_sync_deduplicates_archives_only_owned_membership_and_restores(
         if request.url.path.endswith("/items"):
             keys = request.url.params.get("itemKey", "").split(",")
             return _response(request, json=[items[key] for key in keys if key in items])
+        if request.url.path.endswith("/children"):
+            return _response(request, json=[])
         raise AssertionError(str(request.url))
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -332,6 +334,8 @@ async def test_removing_one_of_two_links_to_same_paper_keeps_membership(app, mon
         if request.url.path.endswith("/items"):
             keys = request.url.params.get("itemKey", "").split(",")
             return _response(request, json=[items[key] for key in keys if key in items])
+        if request.url.path.endswith("/children"):
+            return _response(request, json=[])
         raise AssertionError(str(request.url))
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))

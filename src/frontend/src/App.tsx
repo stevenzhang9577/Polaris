@@ -4,6 +4,7 @@ import { RouterProvider } from 'react-router-dom';
 import { AuthProvider } from './app/auth';
 import { router } from './app/routes';
 import { ServerSetupPage } from './features/desktop/ServerSetupPage';
+import { PythonRuntimeMonitor } from './features/desktop/PythonRuntimeMonitor';
 import { isDesktop, serverOrigin } from './lib/endpoint';
 import { loadCapabilities, onHostEvent } from './lib/host';
 
@@ -51,6 +52,7 @@ export function App() {
 
   return (
     <QueryClientProvider client={queryClient}>
+      <PythonRuntimeMonitor />
       <AuthProvider>
         <RouterProvider router={router} />
       </AuthProvider>

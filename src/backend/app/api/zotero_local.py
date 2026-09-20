@@ -3,6 +3,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +18,8 @@ from app.schemas.zotero_local import (
     ZoteroBindingCreate,
     ZoteroBindingRead,
     ZoteroCollectionRead,
+    ZoteroLibraryImportCreate,
+    ZoteroLibraryImportRead,
     ZoteroMaterializeRead,
     ZoteroProbeRead,
     ZoteroSyncRequest,
@@ -33,6 +36,7 @@ def _http_error(exc: zotero_service.ZoteroLocalError) -> HTTPException:
         "ZOTERO_LOCAL_DESKTOP_ONLY",
         "ZOTERO_INSTANCE_MISMATCH",
         "ZOTERO_SYNC_IN_PROGRESS",
+        "ZOTERO_IMPORT_REQUEST_CONFLICT",
     }:
         code = status.HTTP_409_CONFLICT
     elif exc.code in {"ZOTERO_LOCAL_UNAVAILABLE", "ZOTERO_LOCAL_REQUEST_FAILED"}:
@@ -88,6 +92,86 @@ async def probe_zotero_local(
         api_version=result.api_version,
         zotero_version=result.zotero_version,
         instance_id=result.instance_id,
+    )
+
+
+@router.get("/zotero-local/bindings", response_model=list[ZoteroBindingRead])
+async def list_my_zotero_bindings(
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+) -> list[ZoteroBindingRead]:
+    _require_desktop()
+    rows = await session.scalars(
+        select(ZoteroLocalBinding)
+        .join(DirectionLibrary)
+        .where(DirectionLibrary.submitted_by == user.id)
+    )
+    return [ZoteroBindingRead.model_validate(row) for row in rows]
+
+
+@router.get("/libraries/{library_id}/papers/{paper_id}/zotero-local-pdf")
+async def read_zotero_original_pdf(
+    library_id: uuid.UUID,
+    paper_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+) -> FileResponse:
+    _require_desktop()
+    await _managed_library(session, library_id=library_id, user=user)
+    try:
+        path = await zotero_service.original_pdf_path(
+            session, library_id=library_id, paper_id=paper_id
+        )
+    except zotero_service.ZoteroLocalError as exc:
+        raise _http_error(exc) from exc
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=f"{paper_id}.pdf",
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@router.post(
+    "/zotero-local/import-library",
+    response_model=ZoteroLibraryImportRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def import_zotero_library(
+    data: ZoteroLibraryImportCreate,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+    queue: TaskQueue = Depends(get_task_queue),
+) -> ZoteroLibraryImportRead:
+    from app.api.libraries import _require_known_discipline
+
+    _require_desktop()
+    _require_known_discipline(data.discipline)
+    try:
+        binding, run = await zotero_service.import_collection_library(
+            session, user_id=user.id, **data.model_dump()
+        )
+    except zotero_service.ZoteroLocalError as exc:
+        raise _http_error(exc) from exc
+    pending = False
+    if run.status == "queued":
+        try:
+            await queue.enqueue(
+                "zotero_local_sync_task",
+                binding_id=str(binding.id),
+                requested_by=str(user.id),
+                full=run.full,
+                run_id=str(run.id),
+                _job_id=f"zotero-local-sync-{binding.id}",
+            )
+        except Exception:  # persisted queued run will be recovered by the scheduler
+            pending = True
+    return ZoteroLibraryImportRead(
+        library_id=binding.library_id,
+        binding_id=binding.id,
+        run_id=run.id,
+        dispatch_pending=pending,
     )
 
 

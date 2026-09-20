@@ -9,7 +9,7 @@
    参数一律当作不可信输入独立校验，不因为「前端已经检查过」而省略。
    ============================================================ */
 
-import { ipcMain } from 'electron';
+import { ipcMain, dialog } from 'electron';
 
 import {
   ERR_INVALID_PARAMS,
@@ -20,7 +20,8 @@ import {
   type RpcRequest,
 } from '../../shared/contract';
 import { capabilityManifest } from '../capabilities';
-import { engineBootstrapStatus, kernelStatus, localBackend } from '../kernel';
+import { engineBootstrapStatus, kernelStatus, localBackend, pythonRuntimeManager } from '../kernel';
+import { discoverPython, inspectPython, validateSelection } from '../python-environment';
 import { applyUpdate, checkForUpdate } from '../updates';
 import { cancelJob } from './events';
 import * as host from './methods.host';
@@ -46,6 +47,25 @@ function asNumber(params: unknown, key: string): number {
 type Handler = (params: unknown) => unknown | Promise<unknown>;
 
 const HANDLERS: Record<MethodName, Handler> = {
+  'host.python.status': () => pythonRuntimeManager().getStatus(),
+  'host.python.detect': (p) => {
+    pythonRuntimeManager();
+    const { pathDirectories } = validateSelection({ mode: 'managed', pathDirectories: (p as { pathDirectories?: unknown })?.pathDirectories ?? [] });
+    return discoverPython(pathDirectories);
+  },
+  'host.python.pick': async () => {
+    pythonRuntimeManager();
+    const result = await dialog.showOpenDialog({ title: '选择 Python 解释器', properties: ['openFile', 'showHiddenFiles'] });
+    return { path: result.canceled ? null : result.filePaths[0] ?? null };
+  },
+  'host.python.validate': (p) => {
+    pythonRuntimeManager();
+    const executable = asString(p, 'executable');
+    validateSelection({ mode: 'local', executable, pathDirectories: [] });
+    return inspectPython(executable);
+  },
+  'host.python.prepare': (p) => pythonRuntimeManager().prepare(p),
+  'host.python.cancel': () => pythonRuntimeManager().cancel(),
   // plugins.*：守卫与语义都在 kernel 的 createPluginMethods 里（#754），两种
   // 传输共用同一份；能力门槛（树不可达 → ERR_CAPABILITY_UNAVAILABLE）也在那里。
   // 摊在最前面：下面的具名键是桌面独有的，任何重名都该以具名的为准。

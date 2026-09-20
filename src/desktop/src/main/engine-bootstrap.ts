@@ -21,9 +21,12 @@
    ============================================================ */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { mkdir, rm } from 'node:fs/promises';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { cp, mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import type { PythonSelection } from '../shared/python-environment';
+import { inspectPython, pythonEnvironment } from './python-environment';
 
 /** 引导要装的 Python 版本。与 backend pyproject 的 requires-python 对齐。 */
 const PYTHON_VERSION = '3.12';
@@ -40,6 +43,9 @@ export interface BootstrapProgress {
 }
 
 export interface BootstrapOptions {
+  selection?: PythonSelection;
+  runtimeDir?: string;
+  signal?: AbortSignal;
   /** 安装包资源目录（Electron 下是 process.resourcesPath）。 */
   resourcesDir: string;
   /** 可写数据根目录（Electron 下是 app.getPath('userData')）。 */
@@ -58,6 +64,8 @@ interface Sentinel {
   uvVersion: string;
   backendHash: string;
   pythonVersion: string;
+  interpreter?: string;
+  dependencyHash?: string;
 }
 
 function readTrimmed(path: string): string {
@@ -70,9 +78,10 @@ function run(
   env: NodeJS.ProcessEnv,
   phase: BootstrapPhase,
   onProgress?: (p: BootstrapProgress) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(argv[0]!, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'], env });
+    const child = spawn(argv[0]!, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'], env, signal });
     const tail: string[] = [];
     const capture = (chunk: Buffer): void => {
       for (const line of chunk.toString().split('\n')) {
@@ -120,21 +129,27 @@ export async function bootstrapEngine(opts: BootstrapOptions): Promise<EngineCom
   const backendHash = readTrimmed(join(backendDir, '.hash'));
 
   const engineDir = join(dataDir, 'engine');
-  const venvDir = join(engineDir, 'venv');
+  const runtimeDir = opts.runtimeDir ?? engineDir;
+  const selection = opts.selection ?? { mode: 'managed', pathDirectories: [] };
+  const candidate = selection.mode === 'local' ? await inspectPython(selection.executable!) : null;
+  if (candidate && !candidate.compatible) throw new Error('PYTHON_INCOMPATIBLE: ' + candidate.reason);
+  const interpreter = candidate ? `${candidate.executable}:${candidate.version}:${candidate.architecture}` : 'managed:3.12';
+  const venvDir = join(runtimeDir, 'venv');
   const venvPython =
     process.platform === 'win32'
       ? join(venvDir, 'Scripts', 'python.exe')
       : join(venvDir, 'bin', 'python');
-  const sentinelPath = join(engineDir, 'bootstrap.json');
+  const sentinelPath = join(runtimeDir, 'bootstrap.json');
 
   onProgress?.({ phase: 'check' });
-  const wanted: Sentinel = { uvVersion, backendHash, pythonVersion: PYTHON_VERSION };
+  const wanted: Sentinel = { uvVersion, backendHash, pythonVersion: PYTHON_VERSION, interpreter,
+    dependencyHash: createHash('sha256').update(readFileSync(join(backendDir, 'pyproject.toml'))).digest('hex') };
   let fresh = true;
   try {
     const current = JSON.parse(readFileSync(sentinelPath, 'utf8')) as Partial<Sentinel>;
     fresh = !(
-      current.uvVersion === wanted.uvVersion &&
-      current.backendHash === wanted.backendHash &&
+      (current.dependencyHash === wanted.dependencyHash || (!current.dependencyHash && current.backendHash === backendHash)) &&
+      (current.interpreter === wanted.interpreter || (!current.interpreter && selection.mode === 'managed')) &&
       current.pythonVersion === wanted.pythonVersion &&
       existsSync(venvPython)
     );
@@ -148,35 +163,47 @@ export async function bootstrapEngine(opts: BootstrapOptions): Promise<EngineCom
     // UV_NO_CONFIG 再挡掉用户自己的 uv.toml（比如镜像源/固定 python 目录），
     // only-managed 保证绝不用系统里碰巧存在的 Python——机器上有没有 Python
     // 结果必须一致。
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      UV_PYTHON_INSTALL_DIR: join(engineDir, 'python'),
-      UV_CACHE_DIR: join(engineDir, 'uv-cache'),
-      UV_PYTHON_PREFERENCE: 'only-managed',
-      UV_NO_CONFIG: '1',
-      // Windows 上 Python 默认 cp1252，读 UTF-8 源码/配置直接 charmap 崩；
-      // 统一强制 UTF-8 模式，其余平台本就是 UTF-8，无副作用
-      PYTHONUTF8: '1',
-    };
-    delete env.VIRTUAL_ENV; // 开发者 shell 里的 venv 不能泄漏进来
+    const env = pythonEnvironment(selection, engineDir);
 
     onProgress?.({ phase: 'python' });
-    await run([uvBin, 'python', 'install', PYTHON_VERSION], env, 'python', onProgress);
+    if (selection.mode === 'managed') await run([uvBin, 'python', 'install', PYTHON_VERSION], env, 'python', onProgress, opts.signal);
 
     onProgress?.({ phase: 'venv' });
     // 重建而不复用：哨兵不匹配意味着依赖集合可能变了，增量升级一个旧 venv
     // 会攒出「卸载不净」的幽灵依赖，全量重来才可复现
     await rm(venvDir, { recursive: true, force: true });
-    await run([uvBin, 'venv', '--python', PYTHON_VERSION, venvDir], env, 'venv', onProgress);
+    await run([uvBin, 'venv', '--python', candidate?.executable ?? PYTHON_VERSION, venvDir], env, 'venv', onProgress, opts.signal);
 
     onProgress?.({ phase: 'install' });
-    await run([uvBin, 'pip', 'install', '--python', venvPython, backendDir], env, 'install', onProgress);
+    // Build backends may write egg-info/build files beside pyproject.toml. Never let
+    // dependency installation mutate the signed App's sealed Resources directory.
+    const installSource = join(runtimeDir, 'install-source');
+    await cp(backendDir, installSource, { recursive: true });
+    try {
+      await run([uvBin, 'pip', 'install', '--python', venvPython, installSource], env, 'install', onProgress, opts.signal);
+    } finally {
+      await rm(installSource, { recursive: true, force: true });
+    }
 
-    writeFileSync(sentinelPath, `${JSON.stringify(wanted, null, 2)}\n`);
+    writeFileSync(sentinelPath + '.tmp', `${JSON.stringify(wanted, null, 2)}\n`, { mode: 0o600 });
+    renameSync(sentinelPath + '.tmp', sentinelPath);
   }
 
   onProgress?.({ phase: 'ready' });
-  return { mode: 'command', command: buildEngineCommand(venvPython, backendDir, engineDir), port: ENGINE_PORT };
+  // Explicit port override also isolates packaged-app tests from a user's live backend.
+  const requestedPort = Number(process.env.POLARIS_DESKTOP_ENGINE_PORT);
+  const port = Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort <= 65535 ? requestedPort : ENGINE_PORT;
+  const command = buildEngineCommand(venvPython, backendDir, engineDir, port);
+  const cleanPath = pythonEnvironment(selection, engineDir).PATH;
+  command[command.length - 1] = [
+    'import os, sys',
+    "[os.environ.pop(k, None) for k in list(os.environ) if k.startswith('PYTHON') or k in ('VIRTUAL_ENV', 'CONDA_PREFIX', 'CONDA_DEFAULT_ENV')]",
+    'sys.dont_write_bytecode = True',
+    "os.environ['PYTHONDONTWRITEBYTECODE'] = '1'",
+    `os.environ['PATH'] = ${JSON.stringify(cleanPath)}`,
+    command[command.length - 1],
+  ].join('\n');
+  return { mode: 'command', command, port };
 }
 
 /**
@@ -192,7 +219,7 @@ export async function bootstrapEngine(opts: BootstrapOptions): Promise<EngineCom
  *   应用更新整包替换时用户的 PDF/导出/实验日志就全没了。setdefault 而非
  *   覆写：给高级用户留 env 改道的口子，与 PROFILE 同一语义。
  */
-function buildEngineCommand(venvPython: string, backendDir: string, engineDir: string): string[] {
+function buildEngineCommand(venvPython: string, backendDir: string, engineDir: string, port: number): string[] {
   const dbPath = join(engineDir, 'polaris.db').split('\\').join('/');
   const snapshotRoot = join(engineDir, 'snapshots').split('\\').join('/');
   const dataDir = join(engineDir, 'data').split('\\').join('/');
@@ -208,13 +235,14 @@ function buildEngineCommand(venvPython: string, backendDir: string, engineDir: s
     // 用户数据目录钉在 userData 下（#718，理由见本函数 docstring）
     `os.environ.setdefault('POLARIS_DATA_DIR', ${JSON.stringify(dataDir)})`,
     `os.chdir(${JSON.stringify(backendDir)})`,
+    `sys.path.insert(0, ${JSON.stringify(backendDir)})`,
     ...buildDataDirMigration(legacyDataDir),
     ...buildMigrationGuard(dbPath, snapshotRoot, "[sys.executable, '-m', 'alembic', 'upgrade', 'head']"),
     'import uvicorn',
-    `uvicorn.run('app.main:app', host='127.0.0.1', port=${ENGINE_PORT})`,
+    `uvicorn.run('app.main:app', host='127.0.0.1', port=${port})`,
   ].join('\n');
   // -X utf8：启动器自身的解释器也走 UTF-8 模式（env 对已启动的进程无效）
-  return [venvPython, '-X', 'utf8', '-c', launcher];
+  return [venvPython, '-I', '-X', 'utf8', '-c', launcher];
 }
 
 /**

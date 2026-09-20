@@ -1140,7 +1140,7 @@ export interface PaperDetail extends PaperRead {
   /** Linked through a local Zotero collection. */
   zotero_source?: boolean;
   zotero_item_key?: string | null;
-  zotero_pdf_status?: 'on_demand' | 'materialized' | 'missing' | 'error' | null;
+  zotero_pdf_status?: 'on_demand' | 'materialized' | 'linked' | 'unavailable' | 'missing' | 'error' | null;
   /** Selected visible Zotero binding used for lazy PDF materialization. */
   zotero_library_id?: string | null;
   can_materialize_zotero?: boolean;
@@ -1192,6 +1192,67 @@ export interface PaperSummaryQueued {
   revision_id: string;
   status: PaperSummaryStatus;
   stage: 'materialize' | 'parse' | 'compile' | 'project' | string;
+}
+
+export interface SummarySettings {
+  concurrency: number;
+}
+
+/** Matches the library list filters, deliberately without pagination. */
+export interface SummaryBatchFilters {
+  status?: PaperStatusFilter;
+  q?: string;
+  sort?: PaperSort;
+  my_tag?: string;
+  starred?: boolean;
+  reading_status?: ReadingStatus;
+  author?: string;
+  affiliation?: string;
+  published_from?: string;
+  published_to?: string;
+  created_from?: string;
+  created_to?: string;
+  daily_only?: boolean;
+  last_sync_only?: boolean;
+}
+
+export interface SummaryBatchInput {
+  request_id: string;
+  paper_ids?: string[];
+  filters?: SummaryBatchFilters;
+  excluded_ids?: string[];
+  skip_existing: boolean;
+}
+
+export interface SummaryBatch {
+  id: string;
+  library_id: string;
+  status: 'queued' | 'running' | 'paused' | 'completed' | 'completed_with_errors';
+  total: number;
+  pending: number;
+  running: number;
+  completed: number;
+  skipped: number;
+  failed: number;
+  concurrency: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SummaryBatchItem {
+  paper_id: string;
+  title: string;
+  status: 'pending' | 'running' | 'completed' | 'skipped' | 'failed';
+  stage: string | null;
+  error: string | null;
+}
+
+export interface SummaryBatchDetail {
+  batch: SummaryBatch;
+  items: SummaryBatchItem[];
+  page: number;
+  size: number;
+  total: number;
 }
 
 export interface PaperAssetRead {
@@ -1654,6 +1715,7 @@ export interface ObsidianVaultConnection {
   id: string;
   /** Local-only path returned by the embedded Desktop backend. */
   vault_path: string;
+  managed_directory: string;
   status: string;
   watching: boolean;
   last_synced_at: string | null;
@@ -3966,6 +4028,9 @@ export const api = {
   fetchPaperPdf(id: string): Promise<Blob> {
     return requestBlob(`/papers/${id}/pdf`);
   },
+  fetchZoteroOriginalPdf(libraryId: string, paperId: string): Promise<Blob> {
+    return requestBlob(`/libraries/${libraryId}/papers/${paperId}/zotero-local-pdf`);
+  },
   /** 按需补下 PDF（仅 arXiv 来源）；已有 PDF 时幂等直接返回。 */
   requestPaperPdf(id: string): Promise<PaperDetail> {
     return request<PaperDetail>(`/papers/${id}/fetch-pdf`, { method: 'POST' });
@@ -4079,6 +4144,24 @@ export const api = {
   },
   restorePaperSummary(id: string): Promise<PaperSummaryCurrent> {
     return request<PaperSummaryCurrent>(`/papers/${id}/summary/restore`, { method: 'POST' });
+  },
+  getSummarySettings(): Promise<SummarySettings> {
+    return request<SummarySettings>('/summary-settings');
+  },
+  putSummarySettings(input: SummarySettings): Promise<SummarySettings> {
+    return requestJson<SummarySettings>('/summary-settings', 'PUT', input);
+  },
+  createSummaryBatch(libraryId: string, input: SummaryBatchInput): Promise<SummaryBatch> {
+    return requestJson<SummaryBatch>(`/libraries/${libraryId}/summary-batches`, 'POST', input);
+  },
+  listSummaryBatches(libraryId: string): Promise<SummaryBatch[]> {
+    return request<SummaryBatch[]>(`/libraries/${libraryId}/summary-batches`);
+  },
+  getSummaryBatch(libraryId: string, batchId: string, page = 1, size = 20): Promise<SummaryBatchDetail> {
+    return request<SummaryBatchDetail>(`/libraries/${libraryId}/summary-batches/${batchId}?page=${page}&size=${size}`);
+  },
+  controlSummaryBatch(libraryId: string, batchId: string, action: 'pause' | 'resume' | 'retry'): Promise<SummaryBatch> {
+    return request<SummaryBatch>(`/libraries/${libraryId}/summary-batches/${batchId}/${action}`, { method: 'POST' });
   },
   /** 这篇论文的两种向量各自建没建、何时建的、用的哪个模型（只读，权限同看论文）。 */
   getPaperIndexStatus(id: string): Promise<PaperIndexStatus> {
@@ -4601,6 +4684,15 @@ export const api = {
   probeZoteroLocal(): Promise<ZoteroLocalProbe> {
     return request<ZoteroLocalProbe>('/zotero-local/probe');
   },
+  listZoteroBindings(): Promise<ZoteroLocalBinding[]> {
+    return request<ZoteroLocalBinding[]>('/zotero-local/bindings');
+  },
+  importZoteroLibrary(input: {
+    request_id: string; collection_key: string; name: string;
+    statement?: string | null; discipline?: string | null;
+  }): Promise<{ library_id: string; binding_id: string; run_id: string; dispatch_pending: boolean }> {
+    return requestJson('/zotero-local/import-library', 'POST', input);
+  },
   listZoteroCollections(): Promise<ZoteroCollection[]> {
     return request<ZoteroCollection[]>('/zotero-local/collections');
   },
@@ -4802,8 +4894,10 @@ export const api = {
   getObsidianVault(): Promise<ObsidianVaultStatus> {
     return request<ObsidianVaultStatus>('/obsidian-vault');
   },
-  putObsidianVault(vaultPath: string): Promise<ObsidianVaultStatus> {
-    return requestJson<ObsidianVaultStatus>('/obsidian-vault', 'PUT', { vault_path: vaultPath });
+  putObsidianVault(vaultPath: string, managedDirectory = 'Polaris'): Promise<ObsidianVaultStatus> {
+    return requestJson<ObsidianVaultStatus>('/obsidian-vault', 'PUT', {
+      vault_path: vaultPath, managed_directory: managedDirectory,
+    });
   },
   deleteObsidianVault(): Promise<void> {
     return request<void>('/obsidian-vault', { method: 'DELETE' });

@@ -277,6 +277,22 @@ def apply_paper_filters(
     return stmt
 
 
+async def last_sync_filter(session: AsyncSession, library_ids: Sequence[uuid.UUID]):
+    """Shared list/selection boundary for the most recent ingest in each library."""
+    from app.models.voyage import VoyageRun
+
+    rows = (await session.execute(
+        select(VoyageRun.library_id, func.max(VoyageRun.created_at))
+        .where(VoyageRun.kind == "wiki_ingest", VoyageRun.library_id.in_(library_ids))
+        .group_by(VoyageRun.library_id)
+    )).all()
+    clauses = [
+        and_(LibraryPaper.library_id == lib_id, LibraryPaper.created_at >= started)
+        for lib_id, started in rows if started is not None
+    ]
+    return or_(*clauses) if clauses else false()
+
+
 async def list_papers(
     session: AsyncSession,
     *,
@@ -322,22 +338,7 @@ async def list_papers(
     # 「上次更新带进来什么」。没跑过同步的库返回空集（0 篇），而不是退化成全部。
     last_sync_clause = None
     if last_sync_only:
-        from app.models.voyage import VoyageRun
-
-        rows = (
-            await session.execute(
-                select(VoyageRun.library_id, func.max(VoyageRun.created_at))
-                .where(VoyageRun.kind == "wiki_ingest", VoyageRun.library_id.in_(library_ids))
-                .group_by(VoyageRun.library_id)
-            )
-        ).all()
-        per_library = [
-            and_(LibraryPaper.library_id == lib_id, LibraryPaper.created_at >= started)
-            for lib_id, started in rows
-            if started is not None
-        ]
-        # 一次都没同步过 → 没有「上次新增」可言，给一个恒假条件而不是放行
-        last_sync_clause = or_(*per_library) if per_library else false()
+        last_sync_clause = await last_sync_filter(session, library_ids)
 
     filter_kwargs = dict(
         library_ids=library_ids,

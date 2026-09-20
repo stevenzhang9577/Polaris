@@ -92,6 +92,7 @@ from app.services import notes as notes_service
 from app.services import paper_enrich as paper_enrich_service
 from app.services import paper_import as paper_import_service
 from app.services import paper_merge as paper_merge_service
+from app.services import paper_reads as paper_reads_service
 from app.services import papers as papers_service
 from app.services import research_digest as research_digest_service
 from app.services import statement_interview as interview
@@ -110,13 +111,7 @@ _HEARTBEAT_SECONDS = 15.0
 async def _paper_detail(
     session: AsyncSession, view: papers_service.PaperView, user_id: uuid.UUID
 ) -> PaperDetail:
-    extras = await papers_service.paper_extras_map(
-        session,
-        paper_ids=[view.id],
-        user_id=user_id,
-        library_ids=[view.library_id] if view.library_id is not None else None,
-    )
-    return PaperDetail.model_validate(view).model_copy(update=extras[view.id])
+    return await paper_reads_service.paper_detail(session, view, user_id)
 
 
 async def _get_library(session: AsyncSession, library_id: uuid.UUID) -> DirectionLibrary:
@@ -151,14 +146,12 @@ async def _get_visible_library(
 async def _reads_with_extras(
     session: AsyncSession, papers: list, user_id: uuid.UUID, *, library_id: uuid.UUID
 ) -> list[PaperRead]:
-    """ORM → schema，回填 tags/my_tags/starred/reading_status/note_count（个人维度，全员可用）。
-
-    库标签只取本库那些（library_id）：一篇论文可能同时在多个库，不限定会串台。
-    """
-    extras = await papers_service.paper_extras_map(
-        session, paper_ids=[p.id for p in papers], user_id=user_id, library_ids=[library_id]
+    return await paper_reads_service.reads_with_extras(
+        session,
+        papers,
+        user_id,
+        library_ids=[library_id],
     )
-    return [PaperRead.model_validate(p).model_copy(update=extras[p.id]) for p in papers]
 
 
 @router.get("/libraries", response_model=list[DirectionLibrarySummary])

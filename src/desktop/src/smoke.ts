@@ -370,7 +370,7 @@ void app.whenReady().then(async () => {
 
   console.log('\n能力清单与 local.*');
   const manifest = await capabilityManifest();
-  check('能力清单使用当前契约版本', manifest.contract === CONTRACT_VERSION && CONTRACT_VERSION === 4);
+  check('能力清单使用当前契约版本', manifest.contract === CONTRACT_VERSION && CONTRACT_VERSION === 5);
 
   // 方法表与契约版本是一对：#705 把 local.* 换成 kernel.*/plugins.* 却没动
   // CONTRACT_VERSION，老外壳因此会照收新界面——插件页按能力表自动隐藏，不报错，
@@ -381,6 +381,12 @@ void app.whenReady().then(async () => {
     'host.info',
     'host.openExternal',
     'host.pickDirectory',
+    'host.python.cancel',
+    'host.python.detect',
+    'host.python.pick',
+    'host.python.prepare',
+    'host.python.status',
+    'host.python.validate',
     'host.setBadgeCount',
     'host.setServerUrl',
     'host.testServer',

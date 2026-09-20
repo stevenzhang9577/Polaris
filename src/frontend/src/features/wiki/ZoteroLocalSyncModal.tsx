@@ -233,14 +233,14 @@ export function ZoteroLocalSyncModal({
                     {binding.data.last_synced_at ? ` · ${tr('上次', 'Last')} ${new Date(binding.data.last_synced_at).toLocaleString()}` : ''}
                   </div>
                 </div>
-                <span className="pill sm">{syncStatusLabel(binding.data.status)}</span>
+                <span className="pill sm">{tr('当前', 'Now')}：{syncStatusLabel(binding.data.status)}</span>
               </div>
               {run && (
                 <div style={{ marginTop: 12, fontSize: 11.5, color: 'var(--text-3)', lineHeight: 1.7 }}>
-                  <div>{tr('运行状态', 'Run status')}：<span>{syncStatusLabel(run.status)}</span></div>
+                  <div>{tr('最近一次同步', 'Latest sync')}：<span>{syncStatusLabel(run.status)}</span></div>
                   <div>
-                    {tr('扫描/新增/更新/归档/失败', 'Scanned/created/updated/archived/failed')}：
-                    <span className="mono">{run.processed}/{run.created}/{run.updated}/{run.missing}/{run.failed}</span>
+                    {tr('扫描/新增/已有/更新/忽略/归档/失败', 'Scanned/created/existing/updated/ignored/archived/failed')}：
+                    <span className="mono">{run.processed}/{run.created}/{run.existing}/{run.updated}/{run.ignored}/{run.missing}/{run.failed}</span>
                   </div>
                   {run.error_samples?.slice(0, 3).map((sample, index) => (
                     <div key={`${run.id}-error-${index}`} style={{ color: 'var(--danger-tx)' }}>

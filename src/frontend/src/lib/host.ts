@@ -13,6 +13,27 @@ export type ServerProbe =
   | { ok: true; version: string }
   | { ok: false; reason: 'invalid-url' | 'unreachable' | 'timeout' | 'not-polaris'; detail?: string };
 
+export interface PythonSelection {
+  mode: 'managed' | 'local'; executable?: string; pathDirectories: string[];
+}
+export interface PythonCandidate {
+  executable: string; version: string; architecture: string; implementation: string;
+  compatible: boolean; reason?: string;
+}
+export interface PythonEnvironmentStatus {
+  current: PythonSelection | null; currentPython?: PythonCandidate; pending: PythonSelection | null;
+  effectivePath: string[]; jobId: string | null; phase: string; message?: string; activeTasks?: number; generation: number;
+}
+export const CAPABILITY_PYTHON_ENVIRONMENT_MANAGE = 'python.environment.manage';
+export const pythonHost = {
+  status: () => bridge()!.invoke('host.python.status') as Promise<PythonEnvironmentStatus>,
+  detect: (pathDirectories: string[]) => bridge()!.invoke('host.python.detect', { pathDirectories }) as Promise<PythonCandidate[]>,
+  pick: () => bridge()!.invoke('host.python.pick') as Promise<{ path: string | null }>,
+  validate: (executable: string) => bridge()!.invoke('host.python.validate', { executable }) as Promise<PythonCandidate>,
+  prepare: (selection: PythonSelection) => bridge()!.invoke('host.python.prepare', selection) as Promise<{ jobId: string }>,
+  cancel: () => bridge()!.invoke('host.python.cancel'),
+};
+
 export type HostEvent =
   | { type: 'host.serverChanged'; serverUrl: string }
   | { type: 'host.openServerSetup' }

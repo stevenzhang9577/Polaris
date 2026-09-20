@@ -46,6 +46,10 @@ import { ExtensionApiKeySettings } from './ExtensionApiKeySettings';
 import { FullExportSettings } from './FullExportSettings';
 import { PluginsSettings } from './PluginsSettings';
 import { ObsidianVaultSettings } from './ObsidianVaultSettings';
+import { PythonEnvironmentSettings } from './PythonEnvironmentSettings';
+import { SummarySettingsPanel } from './SummarySettingsPanel';
+import './settings-navigation.css';
+import { CAPABILITY_PYTHON_ENVIRONMENT_MANAGE } from '../../lib/host';
 import { LocalLlmImport } from './LocalLlmImport';
 import {
   CAPABILITY_OBSIDIAN_VAULT_SYNC,
@@ -2465,7 +2469,7 @@ function MyUsageTab() {
 /** 设置页的标签页。原「管理」那六项自 #755 起也在这里。 */
 type Tab =
   | 'personal' | 'prefs' | 'buddy' | 'speech' | 'bots' | 'ssh' | 'myusage'
-  | 'extension' | 'mcp' | 'export' | 'obsidian' | 'plugins'
+  | 'extension' | 'mcp' | 'export' | 'obsidian' | 'plugins' | 'python' | 'summaries'
   // 原 /admin 的六项（#755）：平台只剩一个使用者，另开一个「管理」入口只是
   // 实验室时代的残留——同一个人要在两个页面之间找同一类配置
   | 'llm' | 'literature' | 'processing' | 'experiment' | 'daily' | 'usage';
@@ -2903,7 +2907,7 @@ export function DailyCategoriesTab() {
   );
 }
 
-const PERSONAL_TABS: Tab[] = ['personal', 'prefs', 'buddy', 'speech', 'bots', 'ssh', 'myusage', 'extension', 'mcp', 'export', 'obsidian', 'plugins'];
+const PERSONAL_TABS: Tab[] = ['personal', 'prefs', 'buddy', 'speech', 'bots', 'ssh', 'myusage', 'extension', 'mcp', 'export', 'obsidian', 'plugins', 'python', 'summaries'];
 
 export function SettingsPage() {
   // 支持 /settings?tab=mcp 这类深链（如旧 /mcp-tools 路由的重定向）
@@ -2918,14 +2922,16 @@ export function SettingsPage() {
   // 异步拉取，本页可能先于它渲染完，这里再取一次并在拿到结果后重读，避免首次进
   // 设置页时 tab 闪失。没接内核的部署探测失败即维持 false，页面上就没有这个 tab。
   const [pluginsAvailable, setPluginsAvailable] = useState(() => isCapabilityAvailable(CAPABILITY_PLUGINS_MANAGE));
+  const [pythonAvailable, setPythonAvailable] = useState(() => isCapabilityAvailable(CAPABILITY_PYTHON_ENVIRONMENT_MANAGE));
   const [obsidianAvailable, setObsidianAvailable] = useState(
     () => localOrigin() !== null && isCapabilityAvailable(CAPABILITY_OBSIDIAN_VAULT_SYNC),
   );
   useEffect(() => {
-    if (pluginsAvailable && obsidianAvailable) return;
+    if (pluginsAvailable && obsidianAvailable && pythonAvailable) return;
     let alive = true;
     void loadCapabilities().then(() => {
       if (alive) {
+        setPythonAvailable(isCapabilityAvailable(CAPABILITY_PYTHON_ENVIRONMENT_MANAGE));
         setPluginsAvailable(isCapabilityAvailable(CAPABILITY_PLUGINS_MANAGE));
         setObsidianAvailable(
           localOrigin() !== null && isCapabilityAvailable(CAPABILITY_OBSIDIAN_VAULT_SYNC),
@@ -2935,10 +2941,10 @@ export function SettingsPage() {
     return () => {
       alive = false;
     };
-  }, [obsidianAvailable, pluginsAvailable]);
+  }, [obsidianAvailable, pluginsAvailable, pythonAvailable]);
   // 深链 ?tab=plugins 在能力缺失（web 端、清单未就绪）时回落默认 tab，不崩也不留空白；
   // 清单稍后就绪且能力在，effectiveTab 自动切回 plugins。
-  const effectiveTab: Tab = (tab === 'plugins' && !pluginsAvailable) || (tab === 'obsidian' && !obsidianAvailable)
+  const effectiveTab: Tab = (tab === 'plugins' && !pluginsAvailable) || (tab === 'obsidian' && !obsidianAvailable) || (tab === 'python' && !pythonAvailable)
     ? 'personal'
     : tab;
 
@@ -2952,6 +2958,7 @@ export function SettingsPage() {
   const items: { v: Tab; label: string }[] = [
     { v: 'personal', label: tr('个人信息', 'Profile') },
     { v: 'prefs', label: tr('界面偏好', 'Interface') },
+    ...(pythonAvailable ? [{ v: 'python' as Tab, label: tr('本地运行环境', 'Local runtime') }] : []),
     { v: 'buddy', label: 'PolarisBuddy' },
     { v: 'speech', label: tr('语音听读', 'Speech') },
     { v: 'bots', label: tr('群机器人', 'Group bots') },
@@ -2964,6 +2971,7 @@ export function SettingsPage() {
     ...(pluginsAvailable ? [{ v: 'plugins' as Tab, label: tr('插件', 'Plugins') }] : []),
     // —— 原「管理」页的六项，并入同一个入口 ——
     { v: 'llm', label: tr('模型与路由', 'Models & routing') },
+    { v: 'summaries', label: tr('论文总结', 'Paper summaries') },
     { v: 'literature', label: tr('文献检索', 'Literature search') },
     { v: 'processing', label: tr('文档处理', 'Document processing') },
     { v: 'experiment', label: tr('实验设置', 'Experiments') },
@@ -2974,11 +2982,12 @@ export function SettingsPage() {
   return (
     <div className="page fadeup">
       <PageHead eyebrow="Polaris · Settings" title={tr('设置', 'Settings')} />
-      <div className="row" style={{ gap: 12, marginBottom: 22, flexWrap: 'wrap', alignItems: 'center' }}>
+      <nav className="settings-navigation" aria-label={tr('设置分类', 'Settings categories')}>
         <Segmented options={items} value={effectiveTab} onChange={setTab} />
-      </div>
+      </nav>
       {effectiveTab === 'personal' && <PersonalTab />}
       {effectiveTab === 'prefs' && <PreferencesTab />}
+      {effectiveTab === 'python' && <PythonEnvironmentSettings />}
       {effectiveTab === 'buddy' && <BuddySettings />}
       {effectiveTab === 'speech' && <PersonalSpeechSettings />}
       {effectiveTab === 'bots' && <ChatBotsTab />}
@@ -2990,6 +2999,7 @@ export function SettingsPage() {
       {effectiveTab === 'obsidian' && <ObsidianVaultSettings />}
       {effectiveTab === 'plugins' && <PluginsSettings />}
       {effectiveTab === 'llm' && <LlmTab />}
+      {effectiveTab === 'summaries' && <SummarySettingsPanel />}
       {effectiveTab === 'literature' && <LiteratureSearchSettingsPanel />}
       {effectiveTab === 'processing' && <DocumentProcessingSettingsPanel />}
       {effectiveTab === 'experiment' && <ExperimentSettings />}

@@ -33,7 +33,8 @@ export interface HostInfo {
  * 4：新增 llm.local-config-import 桌面能力。虽未增加 IPC 方法，旧外壳也不能
  * 接收会展示本地配置导入入口的新 renderer，所以必须涨契约。
  */
-export const CONTRACT_VERSION = 4;
+export const CONTRACT_VERSION = 5;
+export const CAPABILITY_PYTHON_ENVIRONMENT_MANAGE = 'python.environment.manage';
 
 /** 单个能力的可用性。detail 给前端做提示（如 tectonic 装了但缓存是空的）。 */
 export interface CapabilityState {
@@ -219,6 +220,12 @@ export type ServerProbe =
   | { ok: false; reason: 'invalid-url' | 'unreachable' | 'timeout' | 'not-polaris'; detail?: string };
 
 export interface Methods {
+  'host.python.status': { params: void; result: import('./python-environment').PythonEnvironmentStatus };
+  'host.python.detect': { params: { pathDirectories: string[] }; result: import('./python-environment').PythonCandidate[] };
+  'host.python.pick': { params: void; result: PickDirectoryResult };
+  'host.python.validate': { params: { executable: string }; result: import('./python-environment').PythonCandidate };
+  'host.python.prepare': { params: import('./python-environment').PythonSelection; result: JobHandle };
+  'host.python.cancel': { params: void; result: void };
   'host.info': { params: void; result: HostInfo };
   /** 保存服务器地址并重建窗口（刷新 preload 注入值与 CSP）。 */
   'host.setServerUrl': { params: { url: string }; result: void };

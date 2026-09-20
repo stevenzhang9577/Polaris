@@ -24,6 +24,8 @@ export function ObsidianVaultSettings() {
   const [mergedContent, setMergedContent] = useState('');
   const [pendingConnectionAction, setPendingConnectionAction] = useState<'change' | 'disconnect' | null>(null);
   const [pendingConnectionId, setPendingConnectionId] = useState<string | null>(null);
+  const [directoryDraft, setDirectoryDraft] = useState<string | null>(null);
+  const [confirmDirectory, setConfirmDirectory] = useState(false);
 
   useEffect(() => {
     if (available) return;
@@ -60,6 +62,12 @@ export function ObsidianVaultSettings() {
   });
 
   const latestConflict = conflicts.data?.find((item) => item.id === selectedConflict?.id);
+  const currentDirectory = status.data?.connection?.managed_directory ?? 'Polaris';
+  const managedDirectory = directoryDraft ?? currentDirectory;
+  const validDirectory = managedDirectory.length > 0 && managedDirectory.length <= 128
+    && managedDirectory === managedDirectory.trim() && !managedDirectory.startsWith('.')
+    && !managedDirectory.endsWith('.') && !/[/\\:<>"|?*\u0000-\u001f\u007f]/.test(managedDirectory);
+  const directoryChanged = managedDirectory !== currentDirectory;
   const conflictChanged = !!selectedConflict && !!latestConflict
     && latestConflict.version !== selectedConflict.version;
   const conflictGone = !!selectedConflict && !!conflicts.data && !latestConflict;
@@ -77,12 +85,13 @@ export function ObsidianVaultSettings() {
       if ((latest.connection?.id ?? null) !== expectedConnectionId) {
         throw new Error('VAULT_CONNECTION_CHANGED');
       }
-      return api.putObsidianVault(path);
+      return api.putObsidianVault(path, managedDirectory);
     },
     onSuccess: (result) => {
       if (!result) return;
       setPendingConnectionAction(null);
       setPendingConnectionId(null);
+      setDirectoryDraft(null);
       refresh();
       toast(tr('Obsidian Vault 已连接', 'Obsidian Vault connected'), 'ok');
     },
@@ -93,6 +102,27 @@ export function ObsidianVaultSettings() {
       toast(`${tr('连接失败', 'Connection failed')}：${detail}`, 'error');
       setPendingConnectionAction(null);
       setPendingConnectionId(null);
+      refresh();
+    },
+  });
+  const changeDirectory = useMutation({
+    mutationFn: async () => {
+      const connection = status.data?.connection;
+      if (!connection) throw new Error('VAULT_CONNECTION_CHANGED');
+      return api.putObsidianVault(connection.vault_path, managedDirectory);
+    },
+    onSuccess: () => {
+      setConfirmDirectory(false);
+      setDirectoryDraft(null);
+      refresh();
+      toast(tr('同步目录已更新，文件与冲突记录已保留', 'Sync folder updated; files and conflicts were preserved'), 'ok');
+    },
+    onError: (error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      toast(detail.includes('OBSIDIAN_DESTINATION_ALREADY_EXISTS')
+        ? tr('目标目录已存在，请使用尚未创建的目录名，避免覆盖已有文件。', 'The destination already exists. Choose a new folder name to avoid overwriting files.')
+        : `${tr('更换目录失败，原配置保留', 'Folder change failed; the previous configuration was kept')}：${detail}`, 'error');
+      setConfirmDirectory(false);
       refresh();
     },
   });
@@ -218,7 +248,7 @@ export function ObsidianVaultSettings() {
           <div>
             <div className="section-h">Obsidian Vault</div>
             <div className="muted" style={{ fontSize: 12, marginTop: 5, lineHeight: 1.55 }}>
-              {tr('Polaris 只管理 Vault/Polaris/；不会复制 PDF，也不会扫描 Vault 的其他目录。', 'Polaris manages only Vault/Polaris/. PDFs are not copied and other Vault folders are not scanned.')}
+              {tr('只管理你指定的 Vault 子目录；不会复制 PDF，也不会扫描 Vault 的其他目录。', 'Only your chosen Vault subfolder is managed. PDFs are not copied and other Vault folders are not scanned.')}
             </div>
           </div>
           {status.data?.connection ? (
@@ -231,7 +261,7 @@ export function ObsidianVaultSettings() {
         <div className="row gap8 wrap" style={{ marginTop: 16 }}>
           <button
             className="btn btn-primary sm"
-            disabled={connect.isPending}
+            disabled={connect.isPending || changeDirectory.isPending || !validDirectory}
             onClick={() => {
               const connection = status.data?.connection;
               if (!connection) {
@@ -272,6 +302,37 @@ export function ObsidianVaultSettings() {
             {status.data.connection.vault_path}
           </div>
         )}
+        <div style={{ marginTop: 18, borderTop: '1px solid var(--border)', paddingTop: 16 }}>
+          <label className="col gap6" htmlFor="obsidian-managed-directory" style={{ fontSize: 12.5, fontWeight: 600 }}>
+            {tr('Vault 内的同步目录', 'Sync folder inside the Vault')}
+          </label>
+          <div className="row gap8 wrap" style={{ marginTop: 8 }}>
+            <input
+              id="obsidian-managed-directory"
+              className="input"
+              style={{ flex: '1 1 220px', minWidth: 0, maxWidth: 420 }}
+              value={managedDirectory}
+              maxLength={128}
+              placeholder="008-Polaris"
+              disabled={connect.isPending || changeDirectory.isPending}
+              onChange={(event) => setDirectoryDraft(event.target.value)}
+              aria-invalid={!validDirectory}
+              aria-describedby="obsidian-directory-help"
+            />
+            {status.data?.connection && (
+              <button className="btn btn-primary sm" disabled={!validDirectory || !directoryChanged || changeDirectory.isPending || connect.isPending} onClick={() => setConfirmDirectory(true)}>
+                {changeDirectory.isPending ? tr('正在更换…', 'Changing…') : tr('保存目录', 'Save folder')}
+              </button>
+            )}
+          </div>
+          <div id="obsidian-directory-help" className="muted" style={{ marginTop: 8, fontSize: 11.5, lineHeight: 1.6 }}>
+            {tr('填写一个目录名，例如 008-Polaris，不是完整路径。更换时会重命名当前同步目录，保留未同步编辑、历史基线与冲突；目标目录须尚不存在。', 'Enter a folder name, such as 008-Polaris, not a full path. Changing it renames the current sync folder while preserving unsynced edits, baselines and conflicts. The destination must not already exist.')}
+          </div>
+          <div className="mono muted" style={{ marginTop: 6, fontSize: 11, overflowWrap: 'anywhere' }}>
+            {status.data?.connection?.vault_path ?? '<Vault>'}/{managedDirectory}/
+          </div>
+          {!validDirectory && <div role="alert" style={{ color: 'var(--danger-tx)', fontSize: 11.5, marginTop: 6 }}>{tr('请输入有效目录名：不能以点开头、包含斜杠或特殊路径字符。', 'Enter a valid folder name without a leading dot, slashes or special path characters.')}</div>}
+        </div>
         {status.data?.connection?.last_synced_at && (
           <div className="muted" style={{ marginTop: 10, fontSize: 11.5 }}>
             {tr('上次同步', 'Last sync')}：{new Date(status.data.connection.last_synced_at).toLocaleString()}
@@ -405,6 +466,18 @@ export function ObsidianVaultSettings() {
         )}
       </Modal>
       <ConfirmModal
+        open={confirmDirectory}
+        onClose={() => { if (!changeDirectory.isPending) setConfirmDirectory(false); }}
+        title={tr('更换同步目录', 'Change sync folder')}
+        message={tr(
+          `将 ${currentDirectory}/ 重命名为 ${managedDirectory}/。现有文件、未同步编辑与冲突记录会保留；PDF 不会复制。请暂时关闭正在编辑这些文件的窗口。`,
+          `Rename ${currentDirectory}/ to ${managedDirectory}/. Existing files, unsynced edits and conflicts will be preserved; PDFs are not copied. Close editors currently editing these files before continuing.`,
+        )}
+        confirmText={tr('确认更换', 'Change folder')}
+        busy={changeDirectory.isPending}
+        onConfirm={() => changeDirectory.mutate()}
+      />
+      <ConfirmModal
         open={pendingConnectionAction === 'change'}
         onClose={() => {
           setPendingConnectionAction(null);
@@ -412,8 +485,8 @@ export function ObsidianVaultSettings() {
         }}
         title={tr('更换 Obsidian Vault', 'Change Obsidian Vault')}
         message={tr(
-          '更换后会在新 Vault 重建同步基线；未解决冲突的数据库记录会清理，旧 Vault 中的文件保留不动。',
-          'The new Vault gets a fresh sync baseline. Unresolved conflict records are cleared, while files in the old Vault remain untouched.',
+          '现有同步文件会复制到新 Vault，未同步编辑、基线与冲突记录保留；旧 Vault 文件保留，但不再监听。新 Vault 的目标同步目录须尚不存在。',
+          'Managed files are copied to the new Vault, preserving unsynced edits, baselines and conflicts. Old Vault files remain but are no longer watched. The destination folder in the new Vault must not already exist.',
         )}
         confirmText={tr('选择新 Vault', 'Choose new Vault')}
         busy={connect.isPending}

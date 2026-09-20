@@ -105,6 +105,7 @@ async def create_or_reuse_asset(
     identity_key: str | None = None,
     identity_status: str = "verified",
     sharing_scope: str = "private",
+    external_path: Path | None = None,
 ) -> PaperAsset:
     """Persist one immutable PDF and grant the target library access.
 
@@ -117,6 +118,8 @@ async def create_or_reuse_asset(
         raise AssetError("invalid sharing scope")
     if source not in {"oa", "upload", "extension", "arxiv", "manual", "unknown", "zotero"}:
         raise AssetError("invalid asset source")
+    if external_path is not None and (source != "zotero" or not get_settings().is_desktop):
+        raise AssetError("external PDF references require local Zotero")
     normalized_identity = identity_key.strip().lower() if identity_key else None
     if (
         identity_status == "verified"
@@ -137,9 +140,10 @@ async def create_or_reuse_asset(
         )
         session.add(blob)
         await session.flush()
-    path = blob_storage_path(blob.sha256)
-    if not path.exists() or path.stat().st_size != len(content):
-        await asyncio.to_thread(_write_blob, path, content)
+    if external_path is None:
+        path = blob_storage_path(blob.sha256)
+        if not path.exists() or path.stat().st_size != len(content):
+            await asyncio.to_thread(_write_blob, path, content)
 
     asset = await session.scalar(
         select(PaperAsset).where(
@@ -166,6 +170,16 @@ async def create_or_reuse_asset(
     else:
         if asset.sharing_scope == "private" and asset.sharing_scope != sharing_scope:
             raise AssetAlreadyExistsError("asset sharing scope cannot be widened in place")
+
+    if external_path is not None:
+        # This metadata is local-only and is deliberately omitted from API schemas.
+        asset.metadata_snapshot = {
+            "sha256": digest,
+            "byte_size": len(content),
+            "storage_mode": "zotero_original",
+            "local_path": str(external_path),
+        }
+        asset.source_locator = source_locator
 
     existing_grant = await session.scalar(
         select(AssetGrant).where(
@@ -314,3 +328,41 @@ def storage_path_for_blob(blob: PdfBlob) -> Path:
     if blob.storage_key != f"pdf-blobs/{blob.sha256[:2]}/{blob.sha256}.pdf":
         raise AssetError("blob storage key mismatch")
     return expected
+
+
+async def resolve_asset_path(asset: PaperAsset, blob: PdfBlob) -> Path:
+    """Resolve original references without silently substituting a different PDF revision."""
+    metadata = asset.metadata_snapshot or {}
+    if metadata.get("storage_mode") != "zotero_original":
+        return storage_path_for_blob(blob)
+    if not get_settings().is_desktop or asset.source != "zotero":
+        raise AssetError("ZOTERO_LOCAL_DESKTOP_ONLY")
+    from app.services.zotero_local import (
+        ZoteroLocalClient,
+        ZoteroLocalError,
+        _check_pdf_path,
+        _path_from_file_url,
+        _read_pdf_bytes,
+    )
+
+    locator = asset.source_locator or ""
+    if not locator.startswith("zotero://0/") or not metadata.get("local_path"):
+        raise AssetError("ZOTERO_REFERENCE_INVALID")
+    key = locator.removeprefix("zotero://0/")
+    if not key.isalnum():
+        raise AssetError("ZOTERO_REFERENCE_INVALID")
+    path = Path(metadata["local_path"])
+    try:
+        async with ZoteroLocalClient() as local:
+            try:
+                path = _path_from_file_url(await local.attachment_file_url(key))
+            except ZoteroLocalError as exc:
+                if exc.code not in {"ZOTERO_LOCAL_UNAVAILABLE", "ZOTERO_LOCAL_TIMEOUT"}:
+                    raise
+        path = await asyncio.to_thread(_check_pdf_path, path)
+        content = await asyncio.to_thread(_read_pdf_bytes, path)
+        if hashlib.sha256(content).hexdigest() != blob.sha256:
+            raise AssetError("ZOTERO_PDF_SOURCE_CHANGED")
+        return path
+    except ZoteroLocalError as exc:
+        raise AssetError(exc.code) from None

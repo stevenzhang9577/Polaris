@@ -8,6 +8,8 @@ drift between entry points.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 import unicodedata
 import uuid
@@ -30,7 +32,12 @@ from app.models.paper import Paper, new_paper
 from app.models.paper_assets import PaperAsset
 from app.models.paper_content import PaperContentVersion
 from app.models.user import User
-from app.models.zotero_local import ZoteroItemLink, ZoteroLocalBinding, ZoteroSyncRun
+from app.models.zotero_local import (
+    ZoteroItemLink,
+    ZoteroLibraryImport,
+    ZoteroLocalBinding,
+    ZoteroSyncRun,
+)
 from app.services.dedup import pool_dedup_key
 from app.services.libraries import ensure_membership, get_membership
 from app.services.paper_assets import MAX_PDF_BYTES, AssetError, create_or_reuse_asset
@@ -302,34 +309,56 @@ class ZoteroLocalClient:
     async def items_by_keys(self, item_keys: Sequence[str]) -> dict[str, dict[str, Any]]:
         found: dict[str, dict[str, Any]] = {}
         for batch in _chunks(list(dict.fromkeys(item_keys)), _ITEM_BATCH_SIZE):
+            # Local Zotero can expand a requested parent into additional records. A
+            # 50-key request is not necessarily a 50-result response.
+            for item in await self._item_pages(
+                "users/0/items", {"itemKey": ",".join(batch), "itemType": "-attachment"}
+            ):
+                data = item.get("data") if isinstance(item.get("data"), dict) else {}
+                key = _text(item.get("key") or data.get("key"))
+                if key in batch:
+                    found[key] = item
+            for key in batch:
+                if key in found:
+                    continue
+                try:
+                    response = await self._request(f"users/0/items/{key}")
+                except ZoteroLocalError:
+                    continue  # snapshot races remain explicit per-item failures
+                item = self._json(response)
+                if isinstance(item, dict) and item.get("key") == key:
+                    found[key] = item
+        return found
+
+    async def _item_pages(
+        self, path: str, params: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        start = 0
+        previous: list[Any] | None = None
+        while True:
             response = await self._request(
-                "users/0/items",
-                params={
-                    "itemKey": ",".join(batch),
-                    "itemType": "-attachment",
-                    "limit": _ITEM_BATCH_SIZE,
-                },
+                path, params={**(params or {}), "start": start, "limit": 100}
             )
             payload = self._json(response)
             if not isinstance(payload, list):
                 raise ZoteroLocalError("ZOTERO_LOCAL_INVALID_RESPONSE")
-            for item in payload:
-                if not isinstance(item, dict):
-                    continue
-                data = item.get("data") if isinstance(item.get("data"), dict) else {}
-                key = _text(item.get("key") or data.get("key"))
-                if key:
-                    found[key] = item
-        return found
+            if not payload:
+                break
+            if payload == previous:
+                raise ZoteroLocalError("ZOTERO_LOCAL_PAGINATION_STALLED")
+            previous = payload
+            rows.extend(item for item in payload if isinstance(item, dict))
+            start += len(payload)
+            total = self._header_int(response, "Total-Results")
+            if (total is not None and start >= int(total)) or (
+                total is None and len(payload) < 100
+            ):
+                break
+        return rows
 
     async def children(self, item_key: str) -> list[dict[str, Any]]:
-        response = await self._request(
-            f"users/0/items/{item_key}/children", params={"limit": 100}
-        )
-        payload = self._json(response)
-        if not isinstance(payload, list):
-            raise ZoteroLocalError("ZOTERO_LOCAL_INVALID_RESPONSE")
-        return [item for item in payload if isinstance(item, dict)]
+        return await self._item_pages(f"users/0/items/{item_key}/children")
 
     async def attachment_file_url(self, attachment_key: str) -> str:
         response = await self._request(
@@ -369,9 +398,7 @@ def collection_keys_for_binding(
     return result
 
 
-async def get_binding(
-    session: AsyncSession, *, library_id: uuid.UUID
-) -> ZoteroLocalBinding | None:
+async def get_binding(session: AsyncSession, *, library_id: uuid.UUID) -> ZoteroLocalBinding | None:
     return await session.scalar(
         select(ZoteroLocalBinding).where(ZoteroLocalBinding.library_id == library_id)
     )
@@ -384,6 +411,8 @@ async def bind_library(
     collection_key: str,
     user_id: uuid.UUID,
     client: ZoteroLocalClient | None = None,
+    commit: bool = True,
+    verified: tuple[ZoteroProbe, Sequence[ZoteroCollection]] | None = None,
 ) -> ZoteroLocalBinding:
     require_desktop_profile()
     binding = await get_binding(session, library_id=library.id)
@@ -398,13 +427,16 @@ async def bind_library(
         )
         if active:
             raise ZoteroLocalError("ZOTERO_SYNC_IN_PROGRESS")
-    own_client = client is None
-    local = client or ZoteroLocalClient()
-    try:
-        probe, collections = await asyncio.gather(local.probe(), local.collections())
-    finally:
-        if own_client:
-            await local.aclose()
+    if verified is None:
+        own_client = client is None
+        local = client or ZoteroLocalClient()
+        try:
+            probe, collections = await asyncio.gather(local.probe(), local.collections())
+        finally:
+            if own_client:
+                await local.aclose()
+    else:
+        probe, collections = verified
     collection = next((item for item in collections if item.key == collection_key), None)
     if collection is None:
         raise ZoteroLocalError("ZOTERO_COLLECTION_NOT_FOUND")
@@ -426,9 +458,106 @@ async def bind_library(
     else:
         binding.collection_name = collection.name
     binding.zotero_instance_id = probe.instance_id
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     await session.refresh(binding)
     return binding
+
+
+async def import_collection_library(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    request_id: uuid.UUID,
+    collection_key: str,
+    name: str,
+    statement: str | None,
+    discipline: str | None,
+    client: ZoteroLocalClient | None = None,
+) -> tuple[ZoteroLocalBinding, ZoteroSyncRun]:
+    """Create the library, binding, run and receipt in one transaction."""
+    from app.services.libraries import create_library
+
+    require_desktop_profile()
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            [collection_key, name.strip(), statement, discipline], ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+    lookup = select(ZoteroLibraryImport).where(
+        ZoteroLibraryImport.user_id == user_id,
+        ZoteroLibraryImport.request_id == request_id,
+    )
+
+    async def replay(receipt: ZoteroLibraryImport):
+        if receipt.fingerprint != fingerprint:
+            raise ZoteroLocalError("ZOTERO_IMPORT_REQUEST_CONFLICT")
+        return (
+            await session.get(ZoteroLocalBinding, receipt.binding_id),
+            await session.get(ZoteroSyncRun, receipt.run_id),
+        )
+
+    receipt = await session.scalar(lookup)
+    if receipt is not None:
+        return await replay(receipt)
+    if not name.strip():
+        raise ZoteroLocalError("ZOTERO_LIBRARY_NAME_REQUIRED")
+    local = client or ZoteroLocalClient()
+    try:
+        probe, collections = await asyncio.gather(local.probe(), local.collections())
+    finally:
+        if client is None:
+            await local.aclose()
+    if not any(item.key == collection_key for item in collections):
+        raise ZoteroLocalError("ZOTERO_COLLECTION_NOT_FOUND")
+    try:
+        library = await create_library(
+            session,
+            name=name.strip(),
+            statement=statement,
+            discipline=discipline,
+            created_by=user_id,
+        )
+        binding = await bind_library(
+            session,
+            library=library,
+            collection_key=collection_key,
+            user_id=user_id,
+            client=client,
+            commit=False,
+            verified=(probe, collections),
+        )
+        run = ZoteroSyncRun(
+            binding_id=binding.id,
+            requested_by=user_id,
+            full=True,
+            status="queued",
+            error_samples=[],
+        )
+        session.add(run)
+        await session.flush()
+        session.add(
+            ZoteroLibraryImport(
+                user_id=user_id,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                binding_id=binding.id,
+                run_id=run.id,
+            )
+        )
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        receipt = await session.scalar(lookup)
+        if receipt is None:
+            raise
+        return await replay(receipt)
+    except Exception:
+        await session.rollback()
+        raise
+    return binding, run
 
 
 async def delete_binding(session: AsyncSession, *, binding: ZoteroLocalBinding) -> None:
@@ -448,9 +577,7 @@ async def prepare_sync_run(
     # Serialize the active-run check per binding on PostgreSQL.  The queue job id prevents
     # duplicate delivery; this lock also prevents two API replicas from persisting two runs.
     await session.execute(
-        select(ZoteroLocalBinding.id)
-        .where(ZoteroLocalBinding.id == binding.id)
-        .with_for_update()
+        select(ZoteroLocalBinding.id).where(ZoteroLocalBinding.id == binding.id).with_for_update()
     )
     active = await session.scalar(
         select(ZoteroSyncRun)
@@ -492,9 +619,7 @@ async def prepare_sync_run(
     return run
 
 
-async def latest_sync_run(
-    session: AsyncSession, *, binding_id: uuid.UUID
-) -> ZoteroSyncRun | None:
+async def latest_sync_run(session: AsyncSession, *, binding_id: uuid.UUID) -> ZoteroSyncRun | None:
     return await session.scalar(
         select(ZoteroSyncRun)
         .where(ZoteroSyncRun.binding_id == binding_id)
@@ -680,7 +805,7 @@ async def execute_sync_run(
                 failed_link.last_seen_run_id = run.id
             run.processed += 1
             if run.processed % 50 == 0:
-                run.error_samples = errors
+                run.error_samples = list(errors)
                 await session.commit()
 
         # Items no longer in the recursively-bound collection are archived only when
@@ -700,6 +825,14 @@ async def execute_sync_run(
             link.status = "missing"
             link.last_error = None
             run.missing += 1
+
+        # Resolve references even for unchanged parent records: moving/replacing an
+        # attachment does not reliably bump its parent's version in Local Zotero.
+        # Bound concurrency/memory; do not read/hash/parse thousands of PDFs here.
+        active_links = [link for link in links if link.status == "active"]
+        for batch in _chunks(active_links, 8):
+            await asyncio.gather(*(refresh_pdf_reference(local, link) for link in batch))
+            await session.commit()
 
         # Archive at Paper granularity, after every disappeared link has been marked. Two Zotero
         # records may deduplicate onto one global Paper: only the first link records that this
@@ -724,7 +857,7 @@ async def execute_sync_run(
                 membership.trash_reason = "zotero_removed"
 
         now = utcnow()
-        run.error_samples = errors
+        run.error_samples = list(errors)
         run.status = "completed_with_errors" if run.failed else "completed"
         run.finished_at = now
         binding.status = "idle"
@@ -766,9 +899,7 @@ async def sync_binding(
     client: ZoteroLocalClient | None = None,
 ) -> ZoteroSyncRun:
     """Convenience entry point used by the CLI and direct service callers."""
-    run = await prepare_sync_run(
-        session, binding=binding, requested_by=requested_by, full=full
-    )
+    run = await prepare_sync_run(session, binding=binding, requested_by=requested_by, full=full)
     return await execute_sync_run(session, run_id=run.id, client=client)
 
 
@@ -776,9 +907,7 @@ async def recover_interrupted_sync_runs(session: AsyncSession) -> int:
     """Reset runs owned by a previous Desktop process before the local scheduler starts."""
     runs = list(
         (
-            await session.execute(
-                select(ZoteroSyncRun).where(ZoteroSyncRun.status == "running")
-            )
+            await session.execute(select(ZoteroSyncRun).where(ZoteroSyncRun.status == "running"))
         ).scalars()
     )
     binding_ids: set[uuid.UUID] = set()
@@ -790,9 +919,7 @@ async def recover_interrupted_sync_runs(session: AsyncSession) -> int:
         bindings = list(
             (
                 await session.execute(
-                    select(ZoteroLocalBinding).where(
-                        ZoteroLocalBinding.id.in_(binding_ids)
-                    )
+                    select(ZoteroLocalBinding).where(ZoteroLocalBinding.id.in_(binding_ids))
                 )
             ).scalars()
         )
@@ -906,8 +1033,10 @@ def _first_author_identity(authors: list[Any] | None) -> str:
 
 
 async def _find_paper_for_zotero(
-    session: AsyncSession, fields: dict[str, Any],
-    *, title_index: dict[str, set[uuid.UUID]] | None = None,
+    session: AsyncSession,
+    fields: dict[str, Any],
+    *,
+    title_index: dict[str, set[uuid.UUID]] | None = None,
 ) -> Paper | None:
     # Product contract is DOI -> arXiv -> normalized title, even though the global pool's
     # creation key remains its historical arXiv -> DOI -> title convention.
@@ -919,9 +1048,7 @@ async def _find_paper_for_zotero(
             return paper
     if fields["arxiv_id"]:
         paper = await session.scalar(
-            select(Paper)
-            .where(func.lower(Paper.arxiv_id) == fields["arxiv_id"].lower())
-            .limit(1)
+            select(Paper).where(func.lower(Paper.arxiv_id) == fields["arxiv_id"].lower()).limit(1)
         )
         if paper is not None:
             return paper
@@ -933,7 +1060,8 @@ async def _find_paper_for_zotero(
         if paper is None:
             continue
         if any(
-            fields[field] and getattr(paper, field)
+            fields[field]
+            and getattr(paper, field)
             and str(fields[field]).casefold() != str(getattr(paper, field)).casefold()
             for field in ("doi", "arxiv_id", "year")
         ):
@@ -947,9 +1075,7 @@ async def _find_paper_for_zotero(
     return matches[0] if len(matches) == 1 else None
 
 
-def _merge_paper_fields(
-    paper: Paper, incoming: dict[str, Any], *, replace: bool
-) -> list[str]:
+def _merge_paper_fields(paper: Paper, incoming: dict[str, Any], *, replace: bool) -> list[str]:
     conflicts: list[str] = []
     for field in ("doi", "arxiv_id"):
         old = _text(getattr(paper, field))
@@ -1040,7 +1166,7 @@ async def materialize_pdf(
     client: ZoteroLocalClient | None = None,
     attachment_ref: ZoteroAttachmentRef | None = None,
 ) -> MaterializedZoteroAsset:
-    """Copy a linked Zotero PDF into Polaris content-addressed storage on demand."""
+    """Register the original Zotero file and its digest without copying PDF bytes."""
     require_desktop_profile()
     binding = await get_binding(session, library_id=library.id)
     if binding is None:
@@ -1075,6 +1201,7 @@ async def materialize_pdf(
                 identity_key=paper.dedup_key,
                 identity_status="verified" if paper.dedup_key else "unverified",
                 sharing_scope="private",
+                external_path=path,
             )
         except AssetError:
             raise ZoteroLocalError("ZOTERO_ATTACHMENT_INVALID") from None
@@ -1089,6 +1216,9 @@ async def materialize_pdf(
         )
         link.attachment_key = resolved.key
         link.attachment_version = resolved.version
+        link.local_pdf_path = str(path)
+        link.pdf_status = "linked"
+        link.pdf_error = None
         await session.commit()
         await session.refresh(asset)
         return MaterializedZoteroAsset(
@@ -1143,9 +1273,7 @@ async def materialize_paper_pdf(
     membership = await get_membership(session, library_id=library.id, paper_id=paper.id)
     if membership is None:
         return None
-    current_asset = (
-        await session.get(PaperAsset, current.asset_id) if current is not None else None
-    )
+    current_asset = await session.get(PaperAsset, current.asset_id) if current is not None else None
     if (
         current is not None
         and current.status in {"ready", "ready_fallback", "vector_ready"}
@@ -1170,15 +1298,8 @@ async def materialize_paper_pdf(
     local = client or ZoteroLocalClient()
     try:
         attachment_ref = await _pdf_attachment_ref(local, link.item_key)
-        if (
-            current is not None
-            and current.status in {"ready", "ready_fallback", "vector_ready"}
-            and current_asset is not None
-            and current_asset.source == "zotero"
-            and link.attachment_key == attachment_ref.key
-            and link.attachment_version == attachment_ref.version
-        ):
-            return current
+        # Hash on demand, not just key/version: in-place PDF edits may leave the
+        # Zotero version unchanged. Identical bytes still reuse the existing version.
         materialized = await materialize_pdf(
             session,
             library=library,
@@ -1234,9 +1355,7 @@ def _select_pdf_attachment(items: Sequence[dict[str, Any]]) -> dict[str, Any] | 
     )
 
 
-async def _pdf_attachment_ref(
-    client: ZoteroLocalClient, item_key: str
-) -> ZoteroAttachmentRef:
+async def _pdf_attachment_ref(client: ZoteroLocalClient, item_key: str) -> ZoteroAttachmentRef:
     attachment = _select_pdf_attachment(await client.children(item_key))
     if attachment is None:
         raise ZoteroLocalError("ZOTERO_PDF_ATTACHMENT_NOT_FOUND")
@@ -1258,6 +1377,71 @@ def _path_from_file_url(value: str) -> Path:
     if not path.is_absolute():
         raise ZoteroLocalError("ZOTERO_ATTACHMENT_URL_INVALID")
     return path
+
+
+def _check_pdf_path(path: Path, *, check_header: bool = True) -> Path:
+    """Cheap import-time check; never copy or parse the PDF."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ZoteroLocalError("ZOTERO_ATTACHMENT_FILE_MISSING")
+        if not 0 < path.stat().st_size <= MAX_PDF_BYTES:
+            raise ZoteroLocalError("ZOTERO_ATTACHMENT_SIZE_INVALID")
+        if check_header:
+            with path.open("rb") as handle:
+                if handle.read(5) != b"%PDF-":
+                    raise ZoteroLocalError("ZOTERO_ATTACHMENT_NOT_PDF")
+        return path.resolve(strict=True)
+    except OSError:
+        raise ZoteroLocalError("ZOTERO_ATTACHMENT_FILE_UNREADABLE") from None
+
+
+async def refresh_pdf_reference(local: ZoteroLocalClient, link: ZoteroItemLink) -> None:
+    try:
+        ref = await _pdf_attachment_ref(local, link.item_key)
+        link.attachment_key, link.attachment_version = ref.key, ref.version
+        path = _path_from_file_url(await local.attachment_file_url(ref.key))
+        # Retain the trusted API path even when an offline/cloud file is unavailable.
+        link.local_pdf_path = str(path)
+        await asyncio.to_thread(_check_pdf_path, path, check_header=False)
+        link.pdf_status, link.pdf_error = "linked", None
+    except ZoteroLocalError as exc:
+        link.pdf_status = (
+            "missing" if exc.code == "ZOTERO_PDF_ATTACHMENT_NOT_FOUND" else "unavailable"
+        )
+        link.pdf_error = exc.code
+        if link.pdf_status == "missing":
+            link.attachment_key = None
+            link.attachment_version = None
+            link.local_pdf_path = None
+
+
+async def original_pdf_path(
+    session: AsyncSession, *, library_id: uuid.UUID, paper_id: uuid.UUID
+) -> Path:
+    """Return an original file after caller authorization; never expose its path on the wire."""
+    require_desktop_profile()
+    link = await session.scalar(
+        select(ZoteroItemLink)
+        .join(ZoteroLocalBinding, ZoteroLocalBinding.id == ZoteroItemLink.binding_id)
+        .where(
+            ZoteroLocalBinding.library_id == library_id,
+            ZoteroItemLink.paper_id == paper_id,
+            ZoteroItemLink.status == "active",
+        )
+    )
+    if (
+        link is None
+        or await get_membership(session, library_id=library_id, paper_id=paper_id) is None
+    ):
+        raise ZoteroLocalError("ZOTERO_ITEM_LINK_NOT_FOUND")
+    async with ZoteroLocalClient() as local:
+        await refresh_pdf_reference(local, link)
+    await session.commit()
+    if link.pdf_error not in {None, "ZOTERO_LOCAL_UNAVAILABLE", "ZOTERO_LOCAL_TIMEOUT"}:
+        raise ZoteroLocalError(link.pdf_error)
+    if not link.local_pdf_path:
+        raise ZoteroLocalError("ZOTERO_PDF_ATTACHMENT_NOT_FOUND")
+    return await asyncio.to_thread(_check_pdf_path, Path(link.local_pdf_path))
 
 
 def _read_pdf_bytes(path: Path) -> bytes:

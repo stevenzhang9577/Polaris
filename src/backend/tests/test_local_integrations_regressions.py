@@ -428,8 +428,8 @@ async def test_title_fallback_handles_unicode_and_rejects_ambiguous_matches(app)
 
 
 @pytest.mark.asyncio
-async def test_6000_metadata_items_deduplicate_and_incremental_sync_fetches_no_bodies(
-    app, monkeypatch
+async def test_7000_items_import_paths_without_copying_and_incremental_skips_metadata(
+    app, monkeypatch, tmp_path
 ):
     import uuid
 
@@ -442,7 +442,10 @@ async def test_6000_metadata_items_deduplicate_and_incremental_sync_fetches_no_b
     from app.services.zotero_local import ZoteroLocalClient, sync_binding
 
     monkeypatch.setattr(get_settings(), "profile", "desktop")
-    count = 6000
+    count = 7000
+    pdf = tmp_path / "original.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(get_settings(), "data_dir", str(tmp_path / "polaris"))
     keys = [f"K{index:07d}" for index in range(count)]
     versions = {key: 1 for key in keys}
     fetched = 0
@@ -488,7 +491,13 @@ async def test_6000_metadata_items_deduplicate_and_incremental_sync_fetches_no_b
                 ],
                 request=request,
             )
-        raise AssertionError(f"Metadata sync must not request PDF data: {path}")
+        if path.endswith("/children"):
+            return httpx.Response(200, json=[{"key": "PDF", "data": {
+                "itemType": "attachment", "contentType": "application/pdf",
+            }}])
+        if path.endswith("/file/view/url"):
+            return httpx.Response(200, text=pdf.as_uri())
+        raise AssertionError(f"Import must not request PDF bytes: {path}")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         local = ZoteroLocalClient(client=http)
@@ -522,3 +531,8 @@ async def test_6000_metadata_items_deduplicate_and_incremental_sync_fetches_no_b
             second = await sync_binding(session, binding=binding, requested_by=None, client=local)
             assert second.processed == count and second.failed == 0
             assert fetched == count
+            assert await session.scalar(select(func.count()).select_from(ZoteroItemLink).where(
+                ZoteroItemLink.pdf_status == "linked",
+                ZoteroItemLink.local_pdf_path == str(pdf),
+            )) == count
+            assert not list((tmp_path / "polaris").rglob("*.pdf"))
