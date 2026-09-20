@@ -5,6 +5,8 @@ the authoritative store for papers while ``VaultFileState.base_content`` is the 
 merge base shared by the database and the managed Markdown file.
 """
 
+import hashlib
+import json
 import uuid
 from datetime import datetime
 
@@ -136,3 +138,10 @@ class VaultConflict(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     resolution: Mapped[str | None] = mapped_column(String(16))
     resolved_content: Mapped[str | None] = mapped_column(Text)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    @property
+    def version(self) -> str:
+        """Opaque compare-and-swap token for the exact conflict shown in the client."""
+        payload = [self.base_content, self.polaris_content, self.vault_content,
+                   self.status, self.relative_path]
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()

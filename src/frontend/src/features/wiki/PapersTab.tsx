@@ -1062,6 +1062,7 @@ function PaperDetailPane({
 
         <PaperSummaryPanel
           paperId={paper.id}
+          libraryId={libraryId}
           canManage={paper.can_manage_summary ?? canManage}
         />
 

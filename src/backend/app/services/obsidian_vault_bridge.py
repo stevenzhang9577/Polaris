@@ -22,7 +22,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
@@ -222,6 +222,14 @@ class DefaultVaultDomainAdapter:
     async def restore_summary(
         self, session: AsyncSession, *, paper: Paper, user: User, content: str
     ) -> None:
+        from app.services.paper_summaries import SummaryRestoreExpiredError, restore_summary
+
+        wiki = await session.scalar(select(PaperWiki).where(PaperWiki.paper_id == paper.id))
+        if wiki is not None and wiki.deleted_at is not None:
+            try:
+                await restore_summary(session, paper=paper)
+            except SummaryRestoreExpiredError as exc:
+                raise VaultBridgeError("OBSIDIAN_RESTORE_EXPIRED") from exc
         await self.apply_summary(session, paper=paper, user=user, content=content)
 
     async def apply_notes(
@@ -244,6 +252,10 @@ class DefaultVaultDomainAdapter:
             ).scalars()
         )
         existing = {note.id: note for note in rows}
+        if parsed.keys() - existing.keys():
+            # An expired/foreign marker cannot be silently discarded by canonical rendering.
+            # Keep the file intact so its author can recover the text explicitly as a new note.
+            raise VaultBridgeError("OBSIDIAN_NOTE_ID_UNKNOWN_OR_EXPIRED")
         for note_id, note_content in parsed.items():
             note = existing.get(note_id)
             if note is None:
@@ -919,15 +931,25 @@ async def _apply_entity_content(
     user: User,
     content: str,
     restore: bool = False,
-) -> None:
+) -> str:
     if entity.paper is None:
-        return
+        return content
     if entity.entity_type == "summary":
         method = adapter.restore_summary if restore else adapter.apply_summary
         await method(session, paper=entity.paper, user=user, content=content)
     elif entity.entity_type == "notes":
         method = adapter.restore_notes if restore else adapter.apply_notes
         await method(session, paper=entity.paper, user=user, content=content)
+        notes = list((await session.scalars(
+            select(PaperNote).where(
+                PaperNote.paper_id == entity.paper.id,
+                PaperNote.author_id == user.id,
+                PaperNote.deleted_at.is_(None),
+            )
+        )).all())
+        # The merge base must contain the newly assigned identities, not the consumed new slot.
+        return render_notes_body(entity.paper, notes)
+    return content
 
 
 async def _soft_delete_entity(
@@ -1028,7 +1050,10 @@ async def _record_conflict(
         "## Obsidian\n\n"
         f"{vault.rstrip()}\n"
     )
-    atomic_write_text(root, companion, render_markdown_document(metadata, body))
+    rendered = render_markdown_document(metadata, body)
+    target = safe_managed_path(root, companion)
+    if not target.is_file() or target.read_text(encoding="utf-8") != rendered:
+        atomic_write_text(root, companion, rendered)
     return conflict
 
 
@@ -1193,8 +1218,14 @@ async def _sync_entity(
     vault = document.body
 
     if state.deleted_at is not None or state.status in {"deleted", "delete_pending"}:
+        if state.deleted_at is not None:
+            deleted_at = state.deleted_at
+            if deleted_at.tzinfo is None:
+                deleted_at = deleted_at.replace(tzinfo=UTC)
+            if utcnow() > deleted_at + timedelta(days=DELETION_RETENTION_DAYS):
+                raise VaultBridgeError("OBSIDIAN_RESTORE_EXPIRED")
         if entity.editable:
-            await _apply_entity_content(
+            vault = await _apply_entity_content(
                 adapter,
                 session,
                 entity=entity,
@@ -1236,7 +1267,7 @@ async def _sync_entity(
 
     selected = outcome.content
     if outcome.status in {"vault", "merged"}:
-        await _apply_entity_content(
+        selected = await _apply_entity_content(
             adapter, session, entity=entity, user=user, content=selected
         )
         await _refresh_entity_metadata(session, entity)
@@ -1335,7 +1366,7 @@ async def sync_connection(
     """Serialize watcher, manual, and projection reconciliation for one local connection."""
     lock = _SYNC_LOCKS.setdefault(connection.id, asyncio.Lock())
     async with lock:
-        return await _sync_connection_unlocked(
+        stats = await _sync_connection_unlocked(
             session,
             connection=connection,
             user=user,
@@ -1344,6 +1375,9 @@ async def sync_connection(
             entity_types=entity_types,
             adapter=adapter,
         )
+        # The next reconciler must observe the committed merge base before it reads our files.
+        await session.commit()
+        return stats
 
 
 async def sync_paper_to_vaults(
@@ -1521,6 +1555,30 @@ async def resolve_conflict(
     user: User,
     content: str | None = None,
     adapter: VaultDomainAdapter = DEFAULT_DOMAIN_ADAPTER,
+    expected_version: str | None = None,
+) -> VaultConflict:
+    expected = expected_version or conflict.version
+    lock = _SYNC_LOCKS.setdefault(conflict.connection_id, asyncio.Lock())
+    async with lock:
+        await session.refresh(conflict)
+        if conflict.version != expected:
+            raise VaultBridgeError("OBSIDIAN_CONFLICT_CHANGED")
+        result = await _resolve_conflict_unlocked(
+            session, conflict=conflict, strategy=strategy, user=user,
+            content=content, adapter=adapter,
+        )
+        await session.commit()
+        return result
+
+
+async def _resolve_conflict_unlocked(
+    session: AsyncSession,
+    *,
+    conflict: VaultConflict,
+    strategy: Literal["polaris", "vault", "merged"],
+    user: User,
+    content: str | None,
+    adapter: VaultDomainAdapter,
 ) -> VaultConflict:
     if conflict.status != "open":
         raise VaultBridgeError("OBSIDIAN_CONFLICT_ALREADY_RESOLVED")
@@ -1558,10 +1616,45 @@ async def resolve_conflict(
         editable=conflict.entity_type != "library_index",
     )
     root = managed_root(validate_vault_root(connection.vault_path), create=True)
+    target = safe_managed_path(root, state.relative_path)
+    live_vault = ""
+    original_raw: str | None = None
+    if target.exists():
+        original_raw = target.read_text(encoding="utf-8")
+        document = parse_markdown_document(original_raw)
+        if not _document_matches_entity(document, entity):
+            raise VaultBridgeError("OBSIDIAN_FILE_IDENTITY_MISMATCH")
+        live_vault = document.body
+    live_polaris = conflict.polaris_content
+    if entity.entity_type == "summary":
+        wiki = await session.scalar(
+            select(PaperWiki).where(PaperWiki.paper_id == entity.entity_id)
+            .execution_options(populate_existing=True)
+        )
+        live_polaris = wiki.content if wiki is not None and wiki.deleted_at is None else ""
+    elif entity.entity_type == "notes" and paper is not None:
+        notes = list((await session.scalars(
+            select(PaperNote).where(
+                PaperNote.paper_id == paper.id, PaperNote.author_id == user.id,
+                PaperNote.deleted_at.is_(None),
+            ).execution_options(populate_existing=True)
+        )).all())
+        live_polaris = render_notes_body(paper, notes)
+    if (normalize_markdown(live_vault) != normalize_markdown(conflict.vault_content)
+            or normalize_markdown(live_polaris) != normalize_markdown(conflict.polaris_content)):
+        await _record_conflict(
+            session, root=root, connection=connection, state=state, entity=entity,
+            base=state.base_content, polaris=live_polaris, vault=live_vault,
+        )
+        await session.commit()
+        raise VaultBridgeError("OBSIDIAN_CONFLICT_CHANGED")
     accepts_deletion = entity.editable and not selected.strip()
     if accepts_deletion:
         await _soft_delete_entity(adapter, session, entity=entity, user=user)
         target = safe_managed_path(root, state.relative_path)
+        if (target.read_text(encoding="utf-8") if target.exists() else None) != original_raw:
+            await session.rollback()
+            raise VaultBridgeError("OBSIDIAN_CONFLICT_CHANGED")
         if target.is_file() and not target.is_symlink():
             target.unlink()
         state.status = "deleted"
@@ -1570,10 +1663,14 @@ async def resolve_conflict(
         state.vault_hash = content_hash("")
     else:
         if strategy in {"vault", "merged"} and entity.editable:
-            await _apply_entity_content(
+            selected = await _apply_entity_content(
                 adapter, session, entity=entity, user=user, content=selected
             )
         await _refresh_entity_metadata(session, entity)
+        target = safe_managed_path(root, state.relative_path)
+        if (target.read_text(encoding="utf-8") if target.exists() else None) != original_raw:
+            await session.rollback()
+            raise VaultBridgeError("OBSIDIAN_CONFLICT_CHANGED")
         _set_state_content(state, selected)
         _write_entity(root, entity, state, selected)
     companion = safe_managed_path(
@@ -1639,6 +1736,8 @@ class VaultWatcher:
             return ()
         for path in self.root.rglob("*.md"):
             try:
+                if "conflicts" in path.relative_to(self.root).parts:
+                    continue  # generated conflict companions are not editable inputs
                 if path.is_symlink() or not path.is_file():
                     continue
                 stat = path.stat()
@@ -1661,7 +1760,7 @@ class VaultWatcher:
         self._task = None
 
     async def _run(self) -> None:
-        previous = self._snapshot()
+        previous = await asyncio.to_thread(self._snapshot)
         changed_at: float | None = None
         loop = asyncio.get_running_loop()
         while not self._stop.is_set():
@@ -1670,7 +1769,7 @@ class VaultWatcher:
                 continue
             except TimeoutError:
                 pass
-            current = self._snapshot()
+            current = await asyncio.to_thread(self._snapshot)
             if current != previous:
                 previous = current
                 changed_at = loop.time()

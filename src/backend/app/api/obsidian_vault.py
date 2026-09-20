@@ -41,6 +41,8 @@ def _require_desktop() -> None:
 
 
 def _bridge_error(exc: bridge.VaultBridgeError) -> HTTPException:
+    if exc.code in {"OBSIDIAN_CONFLICT_CHANGED", "OBSIDIAN_CONFLICT_ALREADY_RESOLVED"}:
+        return HTTPException(status.HTTP_409_CONFLICT, detail=exc.code)
     if exc.code == "OBSIDIAN_CONFLICT_NOT_FOUND":
         return HTTPException(status.HTTP_404_NOT_FOUND, detail=exc.code)
     return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.code)
@@ -300,6 +302,7 @@ async def resolve_conflict(
             conflict=conflict,
             strategy=data.strategy,
             content=data.content,
+            expected_version=data.expected_version,
             user=user,
         )
     except bridge.VaultBridgeError as exc:

@@ -326,7 +326,8 @@ async def _get_member_paper(
 
 
 async def _get_summary_writable_paper(
-    session: AsyncSession, paper_id: uuid.UUID, user: User
+    session: AsyncSession, paper_id: uuid.UUID, user: User,
+    *, library_id: uuid.UUID | None = None,
 ) -> papers_service.PaperView:
     """Return a user-scoped library view for a global-summary mutation, or a uniform 404.
 
@@ -354,7 +355,12 @@ async def _get_summary_writable_paper(
                     LibraryPaper.paper_id == paper_id,
                     LibraryPaper.trash_reason.is_(None),
                 )
-                .order_by(LibraryPaper.created_at, DirectionLibrary.id)
+                .where(DirectionLibrary.id == library_id if library_id is not None else True)
+                .outerjoin(ZoteroLocalBinding, ZoteroLocalBinding.library_id == DirectionLibrary.id)
+                .order_by(
+                    ZoteroLocalBinding.id.is_not(None).desc(),
+                    LibraryPaper.created_at, DirectionLibrary.id,
+                )
             )
         ).scalars()
     )
@@ -1151,12 +1157,13 @@ async def extract_paper_figures(
 )
 async def create_paper_summary(
     paper_id: uuid.UUID,
+    library_id: uuid.UUID | None = Query(default=None),
     session: AsyncSession = Depends(get_session),
     user: User = Depends(current_active_user),
     queue: TaskQueue = Depends(get_task_queue),
 ) -> PaperSummaryQueued:
     """Queue a summary revision; the last ready revision stays current until this one succeeds."""
-    paper = await _get_summary_writable_paper(session, paper_id, user)
+    paper = await _get_summary_writable_paper(session, paper_id, user, library_id=library_id)
     revision = await paper_summaries_service.queue_summary_revision(
         session,
         paper=paper.paper,

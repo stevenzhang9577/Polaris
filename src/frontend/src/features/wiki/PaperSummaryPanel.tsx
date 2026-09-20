@@ -50,7 +50,7 @@ function sourceLabel(revision: PaperSummaryRevision): string {
   return tr('旧版', 'Legacy');
 }
 
-export function PaperSummaryPanel({ paperId, canManage }: { paperId: string; canManage: boolean }) {
+export function PaperSummaryPanel({ paperId, libraryId, canManage }: { paperId: string; libraryId?: string | null; canManage: boolean }) {
   const queryClient = useQueryClient();
   const [historyOpen, setHistoryOpen] = useState(false);
   const [compareRevisionId, setCompareRevisionId] = useState<string | null>(null);
@@ -62,6 +62,7 @@ export function PaperSummaryPanel({ paperId, canManage }: { paperId: string; can
     queryKey: ['paper-summary', paperId],
     queryFn: () => api.getPaperSummary(paperId),
     retry: false,
+    refetchInterval: desktopLocal ? 5_000 : false,
   });
   const history = useQuery({
     queryKey: ['paper-summary-history', paperId],
@@ -79,17 +80,23 @@ export function PaperSummaryPanel({ paperId, canManage }: { paperId: string; can
     () => history.data?.find(isSummaryRevisionInFlight),
     [history.data],
   );
-  const currentRevision = current.data?.current_revision;
+  const currentMissing = current.error instanceof ApiError && current.error.status === 404;
+  const currentRevision = currentMissing ? undefined : current.data?.current_revision;
   const activeRevision = currentRevision ?? history.data?.find((revision) => revision.is_current);
   const compareRevision = history.data?.find((revision) => revision.id === compareRevisionId);
   const readyHistory = history.data?.filter((revision) => revision.status === 'ready' || revision.status === 'stale') ?? [];
   const softDeleted = current.error instanceof ApiError && current.error.status === 404 && readyHistory.some((revision) => revision.is_current);
   const latestFailure = history.data?.find((revision) => revision.status === 'failed');
-  const currentMissing = current.error instanceof ApiError && current.error.status === 404;
   const initialLoading = current.isLoading || history.isLoading;
   const loadFailed = history.isError || (current.isError && !currentMissing);
 
   const completedRevisionId = history.data?.find((revision) => revision.status === 'ready' && revision.stage === 'complete')?.id;
+  const currentState = `${current.data?.current_revision.id ?? ''}:${current.data?.stale ?? ''}:${current.error instanceof ApiError ? current.error.status : ''}`;
+  useEffect(() => {
+    void queryClient.invalidateQueries({ queryKey: ['paper'] });
+    void queryClient.invalidateQueries({ queryKey: ['papers'] });
+    void queryClient.invalidateQueries({ queryKey: ['paper-summary-history', paperId] });
+  }, [currentState, paperId, queryClient]);
   useEffect(() => {
     if (!completedRevisionId) return;
     void queryClient.invalidateQueries({ queryKey: ['paper-summary', paperId] });
@@ -105,7 +112,7 @@ export function PaperSummaryPanel({ paperId, canManage }: { paperId: string; can
   };
 
   const generate = useMutation({
-    mutationFn: () => api.generatePaperSummary(paperId),
+    mutationFn: () => api.generatePaperSummary(paperId, libraryId),
     onSuccess: () => {
       setActivateRevisionId(null);
       refresh();
@@ -180,7 +187,7 @@ export function PaperSummaryPanel({ paperId, canManage }: { paperId: string; can
               {sourceLabel(currentRevision)}
             </span>
           )}
-          {current.data?.stale && <span className="pill sm" style={{ background: 'var(--warn-bg)', color: 'var(--warn-tx)' }}>{tr('需更新', 'Stale')}</span>}
+          {!softDeleted && current.data?.stale && <span className="pill sm" style={{ background: 'var(--warn-bg)', color: 'var(--warn-tx)' }}>{tr('需更新', 'Stale')}</span>}
           {softDeleted && <span className="pill sm">{tr('回收站', 'Trash')}</span>}
           {!canManage && <span className="pill sm">{tr('只读', 'Read only')}</span>}
         </div>

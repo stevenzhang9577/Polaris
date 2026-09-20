@@ -1689,6 +1689,7 @@ export interface VaultSyncResult {
 
 export interface VaultConflict {
   id: string;
+  version: string;
   entity_type: string;
   entity_id: string;
   relative_path: string;
@@ -4058,8 +4059,9 @@ export const api = {
     return request<PaperDetail>(`/papers/${id}/recompile`, { method: 'POST' });
   },
   /** 异步生成新解读修订；全文不可用时后端明确降级为摘要级。 */
-  generatePaperSummary(id: string): Promise<PaperSummaryQueued> {
-    return request<PaperSummaryQueued>(`/papers/${id}/summaries`, { method: 'POST' });
+  generatePaperSummary(id: string, libraryId?: string | null): Promise<PaperSummaryQueued> {
+    const scope = libraryId ? `?library_id=${encodeURIComponent(libraryId)}` : '';
+    return request<PaperSummaryQueued>(`/papers/${id}/summaries${scope}`, { method: 'POST' });
   },
   getPaperSummary(id: string): Promise<PaperSummaryCurrent> {
     return request<PaperSummaryCurrent>(`/papers/${id}/summary`);
@@ -4822,7 +4824,7 @@ export const api = {
   },
   resolveObsidianConflict(
     conflictId: string,
-    input: { strategy: 'polaris' | 'vault' | 'merged'; content?: string },
+    input: { strategy: 'polaris' | 'vault' | 'merged'; content?: string; expected_version: string },
   ): Promise<VaultConflict> {
     return requestJson<VaultConflict>(`/obsidian-vault/conflicts/${conflictId}/resolve`, 'POST', input);
   },

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -30,7 +31,7 @@ from app.models.paper_assets import PaperAsset
 from app.models.paper_content import PaperContentVersion
 from app.models.user import User
 from app.models.zotero_local import ZoteroItemLink, ZoteroLocalBinding, ZoteroSyncRun
-from app.services.dedup import dedup_key_for, pool_dedup_key
+from app.services.dedup import pool_dedup_key
 from app.services.libraries import ensure_membership, get_membership
 from app.services.paper_assets import MAX_PDF_BYTES, AssetError, create_or_reuse_asset
 
@@ -614,10 +615,12 @@ async def execute_sync_run(
             or existing_links[key].status in {"missing", "error"}
         ]
         fetched = await local.items_by_keys(changed_keys)
+        changed_key_set = set(changed_keys)
+        title_index = await _title_index(session) if changed_keys else {}
 
         for item_key, item_version in versions.items():
             link = existing_links.get(item_key)
-            if item_key not in changed_keys:
+            if item_key not in changed_key_set:
                 assert link is not None
                 link.last_seen_run_id = run.id
                 run.processed += 1
@@ -651,6 +654,7 @@ async def execute_sync_run(
                         item=item,
                         item_key=item_key,
                         item_version=item_version,
+                        title_index=title_index,
                     )
                 setattr(run, outcome, getattr(run, outcome) + 1)
                 for conflict in conflicts:
@@ -706,12 +710,11 @@ async def execute_sync_run(
             for link in links
             if link.paper_id is not None and link.membership_created_by_sync
         }
+        present_paper_ids = {link.paper_id for link in links if link.item_key in versions}
         for paper_id in sync_created_paper_ids:
             # Presence in the current version snapshot is authoritative even when fetching that
             # item failed and its link is temporarily in ``error`` state.
-            if any(
-                link.paper_id == paper_id and link.item_key in versions for link in links
-            ):
+            if paper_id in present_paper_ids:
                 continue
             membership = await get_membership(
                 session, library_id=binding.library_id, paper_id=paper_id
@@ -809,6 +812,7 @@ async def _sync_item(
     item: dict[str, Any],
     item_key: str,
     item_version: int,
+    title_index: dict[str, set[uuid.UUID]] | None = None,
 ) -> tuple[str, list[str]]:
     had_link = link is not None
     data = item.get("data") if isinstance(item.get("data"), dict) else {}
@@ -833,7 +837,7 @@ async def _sync_item(
     paper = await session.get(Paper, link.paper_id) if link and link.paper_id else None
     created = False
     if paper is None:
-        paper = await _find_paper_for_zotero(session, fields)
+        paper = await _find_paper_for_zotero(session, fields, title_index=title_index)
         if paper is None:
             paper = new_paper(
                 source="zotero",
@@ -850,6 +854,7 @@ async def _sync_item(
             await session.flush()
             created = True
 
+    old_title = _normalized_identity_text(paper.title)
     conflicts = _merge_paper_fields(paper, fields, replace=paper.source == "zotero")
     membership, membership_created = await ensure_membership(
         session, library_id=binding.library_id, paper_id=paper.id, status="included"
@@ -873,13 +878,36 @@ async def _sync_item(
     link.last_error = None
     await session.flush()
 
+    if title_index is not None:
+        title_index.get(old_title, set()).discard(paper.id)
+        title_index.setdefault(_normalized_identity_text(paper.title), set()).add(paper.id)
+
     if created:
         return "created", conflicts
     return ("updated" if had_link else "existing"), conflicts
 
 
+def _normalized_identity_text(value: str) -> str:
+    return re.sub(r"[\W_]+", " ", unicodedata.normalize("NFKC", value).casefold()).strip()
+
+
+async def _title_index(session: AsyncSession) -> dict[str, set[uuid.UUID]]:
+    """One lightweight, Unicode-safe index per run, independent of the primary DOI key."""
+    index: dict[str, set[uuid.UUID]] = {}
+    for paper_id, title in await session.execute(select(Paper.id, Paper.title)):
+        index.setdefault(_normalized_identity_text(title), set()).add(paper_id)
+    return index
+
+
+def _first_author_identity(authors: list[Any] | None) -> str:
+    first = (authors or [""])[0]
+    name = first.get("name", "") if isinstance(first, dict) else str(first)
+    return _normalized_identity_text(name if isinstance(name, str) else "")
+
+
 async def _find_paper_for_zotero(
-    session: AsyncSession, fields: dict[str, Any]
+    session: AsyncSession, fields: dict[str, Any],
+    *, title_index: dict[str, set[uuid.UUID]] | None = None,
 ) -> Paper | None:
     # Product contract is DOI -> arXiv -> normalized title, even though the global pool's
     # creation key remains its historical arXiv -> DOI -> title convention.
@@ -897,12 +925,26 @@ async def _find_paper_for_zotero(
         )
         if paper is not None:
             return paper
-    title_key = dedup_key_for(
-        title=fields["title"], year=fields["year"], authors=fields["authors"]
-    )
-    if title_key:
-        return await session.scalar(select(Paper).where(Paper.dedup_key == title_key).limit(1))
-    return None
+    index = title_index if title_index is not None else await _title_index(session)
+    key = _normalized_identity_text(fields["title"])
+    matches: list[Paper] = []
+    for paper_id in index.get(key, ()) if key else ():
+        paper = await session.get(Paper, paper_id)
+        if paper is None:
+            continue
+        if any(
+            fields[field] and getattr(paper, field)
+            and str(fields[field]).casefold() != str(getattr(paper, field)).casefold()
+            for field in ("doi", "arxiv_id", "year")
+        ):
+            continue
+        author = _first_author_identity(paper.authors)
+        incoming = _first_author_identity(fields["authors"])
+        if author and incoming and author != incoming:
+            continue
+        matches.append(paper)
+    # A title collision is not enough evidence to merge two different papers.
+    return matches[0] if len(matches) == 1 else None
 
 
 def _merge_paper_fields(

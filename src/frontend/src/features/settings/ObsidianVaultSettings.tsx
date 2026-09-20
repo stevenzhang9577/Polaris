@@ -5,7 +5,7 @@ import { ConfirmModal } from '../../components/ui/ConfirmModal';
 import { Modal } from '../../components/ui/Modal';
 import { Switch } from '../../components/ui/Switch';
 import { toast } from '../../components/ui/Toast';
-import { api, type VaultConflict } from '../../lib/api';
+import { ApiError, api, type VaultConflict } from '../../lib/api';
 import {
   CAPABILITY_OBSIDIAN_VAULT_SYNC,
   isCapabilityAvailable,
@@ -59,23 +59,10 @@ export function ObsidianVaultSettings() {
     refetchInterval: 3_000,
   });
 
-  useEffect(() => {
-    if (!selectedConflict || !conflicts.data) return;
-    const latest = conflicts.data.find((conflict) => conflict.id === selectedConflict.id);
-    if (!latest) {
-      setSelectedConflict(null);
-      setMergedContent('');
-      return;
-    }
-    if (
-      latest.updated_at === selectedConflict.updated_at
-      && latest.polaris_content === selectedConflict.polaris_content
-      && latest.vault_content === selectedConflict.vault_content
-    ) return;
-    const previousVaultContent = selectedConflict.vault_content;
-    setSelectedConflict(latest);
-    setMergedContent((current) => current === previousVaultContent ? latest.vault_content : current);
-  }, [conflicts.data, selectedConflict]);
+  const latestConflict = conflicts.data?.find((item) => item.id === selectedConflict?.id);
+  const conflictChanged = !!selectedConflict && !!latestConflict
+    && latestConflict.version !== selectedConflict.version;
+  const conflictGone = !!selectedConflict && !!conflicts.data && !latestConflict;
 
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ['obsidian-vault'] });
@@ -162,14 +149,25 @@ export function ObsidianVaultSettings() {
   });
   const resolve = useMutation({
     mutationFn: ({ conflict, strategy, content }: { conflict: VaultConflict; strategy: 'polaris' | 'vault' | 'merged'; content?: string }) =>
-      api.resolveObsidianConflict(conflict.id, { strategy, content }),
+      api.resolveObsidianConflict(conflict.id, { strategy, content, expected_version: conflict.version }),
     onSuccess: () => {
       setSelectedConflict(null);
       setMergedContent('');
       refresh();
       toast(tr('冲突已解决', 'Conflict resolved'), 'ok');
     },
-    onError: (error) => toast(`${tr('解决失败', 'Resolution failed')}：${error instanceof Error ? error.message : String(error)}`, 'error'),
+    onError: async (error, variables) => {
+      if (error instanceof ApiError && error.status === 409) {
+        const latest = await conflicts.refetch();
+        const updated = latest.data?.find((item) => item.id === variables.conflict.id);
+        if (updated) setSelectedConflict(updated);
+        // Keep mergedContent: a stale snapshot must never erase the user's merge draft.
+        toast(tr('双方内容已变化，请核对刷新后的版本再提交；合并草稿已保留。', 'Content changed. Review the refreshed versions before submitting; your merge draft was kept.'), 'info');
+        refresh();
+        return;
+      }
+      toast(`${tr('解决失败', 'Resolution failed')}：${error instanceof Error ? error.message : String(error)}`, 'error');
+    },
   });
 
   const enabledLibraries = useMemo(
@@ -374,14 +372,27 @@ export function ObsidianVaultSettings() {
         width={760}
         footer={selectedConflict ? (
           <>
-            <button className="btn btn-soft sm" disabled={resolve.isPending} onClick={() => resolve.mutate({ conflict: selectedConflict, strategy: 'polaris' })}>{tr('采用 Polaris', 'Use Polaris')}</button>
-            <button className="btn btn-soft sm" disabled={resolve.isPending} onClick={() => resolve.mutate({ conflict: selectedConflict, strategy: 'vault' })}>{tr('采用 Vault', 'Use Vault')}</button>
-            <button className="btn btn-primary sm" disabled={resolve.isPending || !mergedContent.trim()} onClick={() => resolve.mutate({ conflict: selectedConflict, strategy: 'merged', content: mergedContent })}>{tr('保存合并结果', 'Save merged result')}</button>
+            <button className="btn btn-soft sm" disabled={resolve.isPending || conflictChanged || conflictGone} onClick={() => resolve.mutate({ conflict: selectedConflict, strategy: 'polaris' })}>{tr('采用 Polaris', 'Use Polaris')}</button>
+            <button className="btn btn-soft sm" disabled={resolve.isPending || conflictChanged || conflictGone} onClick={() => resolve.mutate({ conflict: selectedConflict, strategy: 'vault' })}>{tr('采用 Vault', 'Use Vault')}</button>
+            <button className="btn btn-primary sm" disabled={resolve.isPending || conflictChanged || conflictGone || !mergedContent.trim()} onClick={() => resolve.mutate({ conflict: selectedConflict, strategy: 'merged', content: mergedContent })}>{tr('保存合并结果', 'Save merged result')}</button>
           </>
         ) : undefined}
       >
         {selectedConflict && (
           <>
+            {conflictChanged && latestConflict && (
+              <div style={{ marginBottom: 12, color: 'var(--warn-tx)', fontSize: 12 }} role="status">
+                {tr('检测到新编辑，请刷新双方版本后重新核对。合并草稿会保留。', 'New edits detected. Refresh both versions and review them; your merge draft is kept.')}
+                <button className="btn btn-soft sm" style={{ marginTop: 8 }} onClick={() => setSelectedConflict(latestConflict)}>
+                  {tr('刷新版本，保留草稿', 'Refresh versions, keep draft')}
+                </button>
+              </div>
+            )}
+            {conflictGone && (
+              <div style={{ marginBottom: 12, color: 'var(--warn-tx)', fontSize: 12 }} role="status">
+                {tr('此冲突已在其他窗口解决。你的草稿仍保留在下方，可复制后关闭。', 'This conflict was resolved elsewhere. Your draft remains below for copying before you close.')}
+              </div>
+            )}
             <div className="settings-2col" style={{ marginBottom: 12 }}>
               <div><div className="mono muted" style={{ fontSize: 10.5, marginBottom: 5 }}>Polaris</div><pre style={{ whiteSpace: 'pre-wrap', maxHeight: 180, overflow: 'auto', fontSize: 11 }}>{selectedConflict.polaris_content}</pre></div>
               <div><div className="mono muted" style={{ fontSize: 10.5, marginBottom: 5 }}>Vault</div><pre style={{ whiteSpace: 'pre-wrap', maxHeight: 180, overflow: 'auto', fontSize: 11 }}>{selectedConflict.vault_content}</pre></div>

@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.llm.base import EFFORT_LEVELS, EffortLevel
 from app.core.llm.router import get_llm_router, is_plugin_stage, known_stages
-from app.core.security import encrypt_secret
+from app.core.security import decrypt_secret, encrypt_secret
 from app.models.base import utcnow
 from app.models.llm_config import LLMProviderConfig, ModelRoute
 from app.schemas.llm_admin import LocalConfigPreview, RouteItem
@@ -628,6 +628,28 @@ async def import_local_config(
             LLMProviderConfig.import_source_key == config.source_key,
         )
     )
+    if provider is not None:
+        old_secret = (
+            decrypt_secret(provider.api_key_encrypted) if provider.api_key_encrypted else None
+        )
+        connection_changed = (
+            provider.kind != config.kind
+            or provider.transport != config.transport
+            or provider.auth_scheme != config.auth_scheme
+            or provider.base_url != config.base_url
+            or old_secret != config.api_key
+            or provider.models != config.models
+        )
+        referenced = await session.scalar(
+            select(ModelRoute.id).where(ModelRoute.provider_id == provider.id).limit(1)
+        )
+        if connection_changed and referenced is not None:
+            # Freeze the old connection for every existing consumer. Only explicitly selected
+            # routes can move to the new connection below. NULL detaches this snapshot from
+            # future source refreshes while retaining source/fingerprint/time provenance.
+            provider.import_source_key = None
+            await session.flush()
+            provider = None
     created = provider is None
     if provider is None:
         provider = LLMProviderConfig(

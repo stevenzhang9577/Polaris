@@ -63,6 +63,7 @@ class VaultConflictRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    version: str
     library_id: uuid.UUID
     entity_type: str
     entity_id: uuid.UUID
@@ -80,6 +81,7 @@ class VaultConflictRead(BaseModel):
 
 class VaultConflictResolve(BaseModel):
     strategy: Literal["polaris", "vault", "merged"]
+    expected_version: str = Field(min_length=64, max_length=64)
     content: str | None = Field(default=None, max_length=2_000_000)
 
     @model_validator(mode="after")

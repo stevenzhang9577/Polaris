@@ -440,11 +440,11 @@ export function LocalLlmImport() {
 
             {routeImpact.length === 0 ? (
               <div style={{ color: 'var(--text-3)' }}>
-                {tr('不会改动模型路由；导入后可在下方路由表中手动选择。', 'No model routes will change. You can assign this provider in the routing table below.')}
+                {tr('现有任务继续使用原连接。若源连接已变化且正在被使用，会另建连接；你可以随后在路由表中选择。', 'Existing tasks keep their connection. If an in-use source connection changed, a new connection is created for you to assign later.')}
               </div>
             ) : (
               <div>
-                <div style={{ color: 'var(--text-3)', marginBottom: 6 }}>{tr('路由变化', 'Route changes')}</div>
+                <div style={{ color: 'var(--text-3)', marginBottom: 6 }}>{tr('只迁移下列选择替换的路由；其余任务保留原连接。', 'Only routes selected for replacement move; other tasks keep their connection.')}</div>
                 {routeImpact.map((impact) => (
                   <div key={impact.stage} className="row" style={{ justifyContent: 'space-between', padding: '5px 0', borderTop: '0.5px solid var(--border)' }}>
                     <span className="mono">{impact.stage}</span>

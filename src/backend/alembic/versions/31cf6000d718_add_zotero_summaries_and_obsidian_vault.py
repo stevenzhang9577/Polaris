@@ -105,12 +105,19 @@ def upgrade() -> None:
 
     # Existing current wiki rows become immutable legacy revisions without changing content.
     connection = op.get_bind()
-    rows = connection.execute(
-        sa.text(
-            "SELECT id, paper_id, content, model, compiled_by, created_at, updated_at "
-            "FROM paper_wikis"
-        )
-    ).mappings()
+    wiki_table = sa.table(
+        "paper_wikis",
+        sa.column("id", sa.Uuid()),
+        sa.column("paper_id", sa.Uuid()),
+        sa.column("content", sa.Text()),
+        sa.column("model", sa.String()),
+        sa.column("compiled_by", sa.Uuid()),
+        sa.column("created_at", sa.DateTime(timezone=True)),
+        sa.column("updated_at", sa.DateTime(timezone=True)),
+        sa.column("current_revision_id", sa.Uuid()),
+    )
+    # Typed reads normalize SQLite UUID/timestamp strings as well as native PostgreSQL values.
+    rows = connection.execute(sa.select(wiki_table)).mappings().all()
     revision_table = sa.table(
         "paper_wiki_revisions",
         sa.column("id", sa.Uuid()),
@@ -146,8 +153,9 @@ def upgrade() -> None:
             )
         )
         connection.execute(
-            sa.text("UPDATE paper_wikis SET current_revision_id = :revision WHERE id = :wiki"),
-            {"revision": revision_id, "wiki": row["id"]},
+            wiki_table.update().where(wiki_table.c.id == row["id"]).values(
+                current_revision_id=revision_id
+            ),
         )
 
     op.create_table(
