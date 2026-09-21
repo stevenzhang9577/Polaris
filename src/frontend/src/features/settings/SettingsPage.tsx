@@ -938,6 +938,13 @@ function parseModels(raw: string): string[] {
   return [...new Set(raw.split(/[\n,，]/).map((s) => s.trim()).filter(Boolean))];
 }
 
+const OPENAI_ENDPOINT_SUFFIX_RE = /\/(?:chat\/completions|embeddings|responses|rerank)\/?$/i;
+
+/** OpenAI-compatible adapters append the capability endpoint themselves. */
+function hasOpenAiEndpointSuffix(draft: Pick<ProviderDraft, 'kind' | 'base_url'>): boolean {
+  return draft.kind === 'openai_compat' && OPENAI_ENDPOINT_SUFFIX_RE.test(draft.base_url.trim());
+}
+
 function emptyDraft(): ProviderDraft {
   return {
     name: '',
@@ -991,6 +998,7 @@ function ProviderForm({ draft, setDraft, isNew }: {
 }) {
   const noAuth = draft.auth_scheme === 'none';
   const credentialMissing = !noAuth && !draft.has_api_key && !draft.api_key.trim();
+  const endpointSuffix = hasOpenAiEndpointSuffix(draft);
   return (
     <>
       <FormField label={tr('名称', 'Name')}>
@@ -1017,15 +1025,32 @@ function ProviderForm({ draft, setDraft, isNew }: {
             }}
           />
         </FormField>
-        <FormField label="Base URL" style={{ flex: 1 }}>
+        <FormField
+          label="Base URL"
+          hint={draft.kind === 'openai_compat'
+            ? tr(
+              '填写 API 根地址；Polaris 会按测试能力追加 /chat/completions、/embeddings 或 /rerank。',
+              'Enter the API root; Polaris appends /chat/completions, /embeddings, or /rerank for the selected capability.',
+            )
+            : undefined}
+          style={{ flex: 1 }}
+        >
           <input className="input mono" value={draft.base_url} onChange={(e) => setDraft({ ...draft, base_url: e.target.value })}
             placeholder="https://api.example.com/v1" disabled={draft.kind === 'fake'} />
+          {endpointSuffix && (
+            <div className="field-hint" style={{ color: 'var(--danger-tx)', marginTop: 4 }}>
+              {tr('这里需要根地址，请去掉末尾的具体接口路径。', 'Use the API root here; remove the endpoint suffix.')}
+            </div>
+          )}
         </FormField>
       </div>
       <div className="row gap12" style={{ alignItems: 'flex-start' }}>
         <FormField
           label={tr('请求协议', 'Transport')}
-          hint={tr('必须与服务端实际提供的 API 一致。', 'Must match the API exposed by the server.')}
+          hint={tr(
+            '聊天调用使用此协议；向量嵌入和重排序会调用各自的专用端点。',
+            'Chat calls use this transport; embeddings and reranking use their dedicated endpoints.',
+          )}
           style={{ flex: 1 }}
         >
           <SelectMenu
@@ -1199,11 +1224,17 @@ function ModelStatusBadge({ state, onTest, idleHint }: {
 /** 「可用模型」列收起时最多展示的 chips 数。 */
 const MODELS_COLLAPSED = 3;
 
+const PROVIDER_TEST_CAPABILITIES: { value: LlmTestCapability; label: string }[] = [
+  { value: 'chat', label: tr('对话', 'Chat') },
+  { value: 'embedding', label: tr('向量嵌入', 'Embedding') },
+  { value: 'rerank', label: tr('重排序', 'Rerank') },
+];
+
 // 曾经有一层 LlmAdapter：同一套 Providers/Routes UI 在 /admin/llm（全局）和
 // /me/llm（用户自管）之间切换。自管轨并入平台配置后（#621）只剩一份配置，
 // 适配层随之拆掉，两个 Section 直接打 /admin/llm。
 
-function ProvidersSection() {
+export function ProvidersSection() {
   const queryClient = useQueryClient();
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['llm', 'providers'],
@@ -1215,6 +1246,7 @@ function ProvidersSection() {
   const [modal, setModal] = useState<'closed' | 'create' | string>('closed'); // string = 编辑中的 provider id
   const [draft, setDraft] = useState<ProviderDraft>(emptyDraft());
   const [expandedModels, setExpandedModels] = useState<Set<string>>(new Set());
+  const [testCapability, setTestCapability] = useState<LlmTestCapability>('chat');
   const tests = useModelTests(api.testLlmModel);
 
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ['llm'] });
@@ -1254,13 +1286,13 @@ function ProvidersSection() {
     onError: (err) => toast(`${tr('操作失败', 'Failed')}：${err instanceof Error ? err.message : String(err)}`, 'error'),
   });
 
-  /** 每个 provider 用其 models 的第一个模型测 chat 连通性。 */
+  /** 每个 provider 用其 models 的第一个模型按用户选择的能力探测。 */
   const firstModelOf = (p: LlmProviderRead): string | null => (p.models ?? [])[0]?.trim() || null;
   const runProviderTests = async (list: LlmProviderRead[]) => {
     const inputs: LlmTestModelInput[] = [];
     for (const p of list) {
       const model = firstModelOf(p);
-      if (model) inputs.push({ provider_id: p.id, model, capability: 'chat' });
+      if (model) inputs.push({ provider_id: p.id, model, capability: testCapability });
     }
     if (!(await tests.run(inputs))) {
       toast(tr('没有可测试的 provider — 先在编辑里填写可用模型', 'Nothing to test — add models to a provider first'), 'error');
@@ -1285,10 +1317,18 @@ function ProvidersSection() {
           <Icon name="server" size={15} style={{ color: 'var(--accent)' }} />
           {tr('LLM 供应商', 'Providers')}{' '}
           <span className="en-label" style={{ fontSize: 11 }}>
-            {tr('测试用各 provider 的第一个可用模型', "tests use each provider's first model")}
+            {tr('选择能力后，测试各 provider 的第一个可用模型', "select a capability, then test each provider's first model")}
           </span>
         </span>
         <div className="row gap8">
+          <span className="muted" style={{ fontSize: 11.5 }}>{tr('测试能力', 'Capability')}</span>
+          <SelectMenu
+            value={testCapability}
+            options={PROVIDER_TEST_CAPABILITIES}
+            onChange={(value) => setTestCapability(value as LlmTestCapability)}
+            wrapStyle={{ width: 116 }}
+            style={{ height: 30, fontSize: 11.5, padding: '0 9px' }}
+          />
           <button className="btn btn-soft sm" disabled={tests.testing || providers.length === 0}
             onClick={() => void runProviderTests(providers)}>
             <Icon name="play" size={12} />
@@ -1333,7 +1373,7 @@ function ProvidersSection() {
                 const shownModels = expanded ? models : models.slice(0, MODELS_COLLAPSED);
                 const hiddenCount = models.length - shownModels.length;
                 const state: TestState = firstModel
-                  ? tests.results[testKeyOf(p.id, firstModel, 'chat')] ?? { status: 'idle' }
+                  ? tests.results[testKeyOf(p.id, firstModel, testCapability)] ?? { status: 'idle' }
                   : { status: 'idle' };
                 return (
                   <tr key={p.id}>
@@ -1407,7 +1447,9 @@ function ProvidersSection() {
                       <ModelStatusBadge
                         state={state}
                         onTest={firstModel ? () => void runProviderTests([p]) : undefined}
-                        idleHint={firstModel ? undefined : tr('先填写可用模型才能测试', 'Add models first to enable testing')}
+                        idleHint={firstModel
+                          ? tr(`点击按所选能力测试 ${firstModel}`, `Test ${firstModel} with the selected capability`)
+                          : tr('先填写可用模型才能测试', 'Add models first to enable testing')}
                       />
                     </td>
                     <td>
@@ -1448,6 +1490,7 @@ function ProvidersSection() {
               disabled={
                 !draft.name.trim()
                 || (draft.auth_scheme !== 'none' && !draft.has_api_key && !draft.api_key.trim())
+                || hasOpenAiEndpointSuffix(draft)
                 || busy
               }
               onClick={() => (isNew ? createMutation.mutate() : patchMutation.mutate(modal))}>

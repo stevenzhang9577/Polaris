@@ -31,7 +31,11 @@ function PaperRecoveryFixture() {
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={client}>
-      <main style={{ padding: 24, maxWidth: 920, margin: 'auto' }}>
+      <main style={{
+        padding: 24,
+        maxWidth: new URLSearchParams(location.search).get('view') === 'libraries' ? 1200 : 920,
+        margin: 'auto',
+      }}>
         {new URLSearchParams(location.search).get('view') === 'reader'
           ? <div style={{ height: 700, display: 'flex', flexDirection: 'column' }}><PdfReader
               paper={{ id: 'paper-test', title: 'Original PDF', pdf_available: false,

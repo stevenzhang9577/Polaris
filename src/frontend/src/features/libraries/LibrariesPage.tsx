@@ -109,6 +109,7 @@ function LibraryCard({
       tabIndex={0}
       onClick={activate}
       onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           activate();
@@ -118,25 +119,13 @@ function LibraryCard({
         padding: '18px 20px',
         display: 'flex',
         flexDirection: 'column',
+        flex: 1,
         gap: 10,
         cursor: 'pointer',
         borderColor: selectMode && selected ? 'var(--accent)' : undefined,
       }}
     >
       <div className="row gap8" style={{ alignItems: 'flex-start' }}>
-        {/* 占位常驻（仅 admin）：切换多选时卡片尺寸/位置不变 */}
-        {admin && (
-          <div
-            style={{ paddingTop: 3, visibility: selectMode ? 'visible' : 'hidden' }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <CheckBox
-              checked={selected}
-              onToggle={onToggleSelect}
-              title={selected ? tr('取消选择', 'Deselect') : tr('选择', 'Select')}
-            />
-          </div>
-        )}
         <span
           style={{
             width: 34,
@@ -150,12 +139,27 @@ function LibraryCard({
             flexShrink: 0,
           }}
         >
-          <Icon name="book" size={17} />
+          {admin && selectMode ? (
+            <CheckBox
+              checked={selected}
+              onToggle={onToggleSelect}
+              title={selected ? tr('取消选择', 'Deselect') : tr('选择', 'Select')}
+            />
+          ) : (
+            <Icon name="book" size={17} />
+          )}
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div className="row gap8" style={{ flexWrap: 'wrap' }}>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(0, 1fr) auto',
+              alignItems: 'start',
+              gap: 8,
+              minHeight: 38,
+            }}
+          >
             <span
-              // 长库名限两行：撑高的是整行卡片（grid 行高取最高者），不只是它自己
               style={{
                 fontSize: 14.5,
                 fontWeight: 680,
@@ -170,12 +174,14 @@ function LibraryCard({
             >
               {lib.name}
             </span>
-            <TypeBadge isPublic={lib.is_public} />
-            {lib.is_mine && (
-              <span className="pill sm" style={{ background: 'var(--accent-soft)', color: 'var(--accent-text)', flexShrink: 0 }}>
-                {tr('我在用', 'In use')}
-              </span>
-            )}
+            <span className="row gap6" style={{ flexShrink: 0 }}>
+              <TypeBadge isPublic={lib.is_public} />
+              {lib.is_mine && (
+                <span className="pill sm" style={{ background: 'var(--accent-soft)', color: 'var(--accent-text)', flexShrink: 0 }}>
+                  {tr('我在用', 'In use')}
+                </span>
+              )}
+            </span>
           </div>
           {!lib.is_public && lib.owner_name && (
             <div style={{ fontSize: 11.5, color: 'var(--text-4)', marginTop: 3 }}>
@@ -610,30 +616,55 @@ export function LibrariesPage() {
             gap: 14,
           }}
         >
-          {sorted.map((lib) => (
-            <div key={lib.id}>
-            {zoteroBindings.data?.filter((b) => b.library_id === lib.id).map((b) => <div key={b.id} className="muted" style={{ fontSize: 12, marginBottom: 6 }}>Zotero · {b.collection_name} · {b.status === 'syncing' ? tr('同步中', 'Syncing') : b.last_error ? tr('同步异常', 'Sync error') : b.last_synced_at ? tr('已同步', 'Synced') : tr('等待同步', 'Waiting to sync')}</div>)}
-            <LibraryCard
-              key={lib.id}
-              lib={lib}
-              admin={admin}
-              selectMode={selectMode}
-              selected={selectedIds.has(lib.id)}
-              onOpen={() => navigate(libraryPath(lib.id))}
-              onToggleSelect={() => toggleSelect(lib.id)}
-              onDelete={() => {
-                const ok = window.confirm(
-                  tr(
-                    `确定删除文献库${lib.name}吗？此操作不可撤销。`,
-                    `Delete library "${lib.name}"? This cannot be undone.`,
-                  ),
-                );
-                if (!ok) return;
-                deleteMutation.mutate([lib]);
-              }}
-            />
-            </div>
-          ))}
+          {sorted.map((lib) => {
+            const bindings = zoteroBindings.data?.filter((b) => b.library_id === lib.id) ?? [];
+            const bindingText = bindings.map((b) => (
+              `Zotero · ${b.collection_name} · ${b.status === 'syncing'
+                ? tr('同步中', 'Syncing')
+                : b.last_error
+                  ? tr('同步异常', 'Sync error')
+                  : b.last_synced_at
+                    ? tr('已同步', 'Synced')
+                    : tr('等待同步', 'Waiting to sync')}`
+            )).join(' · ');
+            return (
+              <div key={lib.id} style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                <div
+                  className="muted"
+                  title={bindingText || undefined}
+                  aria-hidden={!bindingText}
+                  style={{
+                    height: 18,
+                    marginBottom: 6,
+                    fontSize: 12,
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {bindingText || '\u00a0'}
+                </div>
+                <LibraryCard
+                  lib={lib}
+                  admin={admin}
+                  selectMode={selectMode}
+                  selected={selectedIds.has(lib.id)}
+                  onOpen={() => navigate(libraryPath(lib.id))}
+                  onToggleSelect={() => toggleSelect(lib.id)}
+                  onDelete={() => {
+                    const ok = window.confirm(
+                      tr(
+                        `确定删除文献库${lib.name}吗？此操作不可撤销。`,
+                        `Delete library "${lib.name}"? This cannot be undone.`,
+                      ),
+                    );
+                    if (!ok) return;
+                    deleteMutation.mutate([lib]);
+                  }}
+                />
+              </div>
+            );
+          })}
         </div>
       )}
 

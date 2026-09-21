@@ -1,7 +1,7 @@
 {
   "name": "polaris-desktop",
   "private": true,
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Polaris desktop shell (Electron)",
   "homepage": "https://github.com/ZJU-REAL/Polaris",
   "author": "Polaris contributors <polaris@users.noreply.github.com>",
@@ -29,6 +29,7 @@
     "e2e:local-integrations": "esbuild e2e/local-integrations.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/local-integrations-e2e.cjs --packages=external && node dist/local-integrations-e2e.cjs",
     "e2e:llm-usage": "esbuild e2e/llm-usage.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/llm-usage-e2e.cjs --packages=external && node dist/llm-usage-e2e.cjs",
     "e2e:summary-batches": "esbuild e2e/summary-batches.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/summary-batches-e2e.cjs --packages=external && node dist/summary-batches-e2e.cjs",
+    "e2e:provider-library-ui": "esbuild e2e/provider-library-ui.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/provider-library-ui.cjs --packages=external && node dist/provider-library-ui.cjs",
     "e2e:routing-live": "esbuild e2e/routing-live.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/routing-live.cjs --packages=external && node dist/routing-live.cjs",
     "e2e:paper-recovery": "esbuild e2e/paper-recovery.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/paper-recovery.cjs --packages=external && node dist/paper-recovery.cjs",
     "e2e:summary-provenance": "esbuild e2e/summary-provenance.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/summary-provenance.cjs --packages=external && node dist/summary-provenance.cjs"
