@@ -4,7 +4,7 @@ import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { UsageDashboard } from '../src/features/settings/UsageDashboard';
 import { LlmPricingSettings } from '../src/features/settings/LlmPricingSettings';
-import { RoutesSection } from '../src/features/settings/SettingsPage';
+import { ProvidersSection, RoutesSection } from '../src/features/settings/SettingsPage';
 import { ToastHost } from '../src/components/ui/Toast';
 import '../src/styles/global.css';
 
@@ -15,7 +15,13 @@ createRoot(document.getElementById('root')!).render(
   <React.StrictMode><QueryClientProvider client={client}>
     <main style={{ padding: 32, maxWidth: 1440, margin: 'auto' }}>
       <p style={{ color: 'var(--muted)', marginBottom: 24 }}>Polaris · 用量统计预览（示例数据）</p>
-      {view === 'routing' ? <RoutesSection /> : view === 'pricing' ? <LlmPricingSettings /> : <UsageDashboard scope={view === 'platform' ? 'platform' : 'personal'} />}
+      {view === 'routing'
+        ? <RoutesSection />
+        : view === 'providers'
+          ? <ProvidersSection />
+          : view === 'pricing'
+            ? <LlmPricingSettings />
+            : <UsageDashboard scope={view === 'platform' ? 'platform' : 'personal'} />}
     </main><ToastHost />
   </QueryClientProvider></React.StrictMode>,
 );
