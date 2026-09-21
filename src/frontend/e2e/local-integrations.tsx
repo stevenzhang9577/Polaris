@@ -19,6 +19,15 @@ import '../src/styles/global.css';
 await probeLocalBackend();
 await loadCapabilities();
 const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function PaperRecoveryFixture() {
+  const [selected, setSelected] = React.useState<string | null>(null);
+  return <MemoryRouter>
+    <button onClick={() => { void client.invalidateQueries(); }}>Refresh fixture</button>
+    <div className="card split-card" style={{ height: 780 }}>
+      <PapersTab libraryId="library-summary" selectedId={selected} onSelect={setSelected} onOpenConcept={() => undefined} onWikiLink={() => undefined} />
+    </div>
+  </MemoryRouter>;
+}
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={client}>
@@ -31,6 +40,8 @@ createRoot(document.getElementById('root')!).render(
               libraryId="library-zotero" highlights={[]} activeHighlightId={null} creating={false}
               onCreateHighlight={() => undefined} onHighlightClick={() => undefined} jumpTarget={null}
             /></div>
+          : new URLSearchParams(location.search).get('view') === 'paper-recovery'
+          ? <PaperRecoveryFixture />
           : new URLSearchParams(location.search).get('view') === 'summary-batches'
           ? <MemoryRouter><div className="card split-card" style={{ height: 780 }}><PapersTab libraryId="library-summary" canManage selectedId={null} onSelect={() => undefined} onOpenConcept={() => undefined} onWikiLink={() => undefined} /></div></MemoryRouter>
           : new URLSearchParams(location.search).get('view') === 'summary-settings'

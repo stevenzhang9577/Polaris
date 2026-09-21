@@ -739,11 +739,19 @@ async def execute_sync_run(
             or existing_links[key].item_version != version
             or existing_links[key].status in {"missing", "error"}
         ]
+        # The query above autoflushes run/binding updates. Release SQLite's
+        # writer lock before waiting on Zotero's paginated network responses.
+        await session.commit()
         fetched = await local.items_by_keys(changed_keys)
         changed_key_set = set(changed_keys)
         title_index = await _title_index(session) if changed_keys else {}
 
         for item_key, item_version in versions.items():
+            # Include unchanged and missing items, whose early continues used
+            # to bypass the commit boundary for arbitrarily large collections.
+            if run.processed and run.processed % 50 == 0:
+                run.error_samples = list(errors)
+                await session.commit()
             link = existing_links.get(item_key)
             if item_key not in changed_key_set:
                 assert link is not None
@@ -804,9 +812,6 @@ async def execute_sync_run(
                 failed_link.last_error = str(exc)[:4000]
                 failed_link.last_seen_run_id = run.id
             run.processed += 1
-            if run.processed % 50 == 0:
-                run.error_samples = list(errors)
-                await session.commit()
 
         # Items no longer in the recursively-bound collection are archived only when
         # this binding originally created the membership.
@@ -830,6 +835,8 @@ async def execute_sync_run(
         # attachment does not reliably bump its parent's version in Local Zotero.
         # Bound concurrency/memory; do not read/hash/parse thousands of PDFs here.
         active_links = [link for link in links if link.status == "active"]
+        run.error_samples = list(errors)
+        await session.commit()
         for batch in _chunks(active_links, 8):
             await asyncio.gather(*(refresh_pdf_reference(local, link) for link in batch))
             await session.commit()

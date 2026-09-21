@@ -4,10 +4,10 @@ import uuid
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.core.config import get_settings
-from app.core.db import get_sessionmaker
+from app.core.db import get_engine, get_sessionmaker
 from app.models.library_direction import DirectionLibrary, LibraryPaper
 from app.models.paper import new_paper
 from app.models.paper_assets import PaperAsset
@@ -171,7 +171,14 @@ async def test_sync_deduplicates_archives_only_owned_membership_and_restores(
         },
     }
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(("/items", "/children")):
+            # Heartbeats and batch progress must be able to write while Zotero
+            # waits for metadata or attachments. Fail quickly if sync holds a lock.
+            async with get_engine().connect() as concurrent:
+                await concurrent.execute(text("PRAGMA busy_timeout=100"))
+                await concurrent.execute(text("BEGIN IMMEDIATE"))
+                await concurrent.rollback()
         if request.url.path == "/api/":
             return _response(
                 request,

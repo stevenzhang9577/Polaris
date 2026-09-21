@@ -59,6 +59,11 @@ async function main() {
     assert(!existsSync(join(data, 'engine/python')), 'local selection downloaded managed Python');
     const sentinel = join(config.current.directory, 'bootstrap.json');
     const modified = statSync(sentinel).mtimeMs;
+    const journal = execFileSync(python, ['-c',
+      'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute("PRAGMA journal_mode").fetchone()[0]); print(c.execute("PRAGMA quick_check").fetchone()[0])',
+      join(data, 'engine/polaris.db')], { encoding: 'utf8' }).trim();
+    assert.equal(journal, 'wal\nok', 'packaged backend must enable WAL on a healthy database');
+    console.log('PASS: packaged backend enabled WAL; database quick_check is ok');
     console.log('PASS: packaged first choice, local installation, session and two Zotero buttons');
     await close();
     app = await _electron.launch({ executablePath, env, timeout: 60000 });
