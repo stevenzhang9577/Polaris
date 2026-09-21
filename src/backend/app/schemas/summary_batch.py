@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class SummarySettings(BaseModel):
-    concurrency: int = Field(default=3, ge=1, le=10)
+    concurrency: int = Field(default=3, ge=1, le=20)
 
 
 class SummarySelectionFilters(BaseModel):

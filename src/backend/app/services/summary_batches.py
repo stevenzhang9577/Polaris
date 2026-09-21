@@ -32,7 +32,7 @@ class SummaryBatchError(ValueError):
 
 def concurrency_for(user: User | None) -> int:
     value = (user.settings or {}).get("summary.concurrency", 3) if user else 3
-    return max(1, min(10, value)) if isinstance(value, int) else 3
+    return max(1, min(20, value)) if isinstance(value, int) else 3
 
 
 async def managed_library(session, library_id, user):

@@ -197,7 +197,7 @@ async def test_summary_settings_http_range_user_isolation_and_preserves_preferen
         await session.commit()
     response = await client.get("/api/summary-settings", headers=headers)
     assert response.status_code == 200 and response.json() == {"concurrency": 3}
-    for concurrency in range(1, 11):
+    for concurrency in range(1, 21):
         response = await client.put(
             "/api/summary-settings", headers=headers, json={"concurrency": concurrency}
         )
@@ -207,18 +207,18 @@ async def test_summary_settings_http_range_user_isolation_and_preserves_preferen
         assert (await client.get("/api/summary-settings", headers=other_headers)).json() == {
             "concurrency": 3
         }
-    for invalid in (0, -1, 11, 10000, 2.5, None, "invalid"):
+    for invalid in (0, -1, 21, 10000, 2.5, None, "invalid"):
         response = await client.put(
             "/api/summary-settings", headers=headers, json={"concurrency": invalid}
         )
         assert response.status_code == 422, (invalid, response.text)
     assert (await client.get("/api/summary-settings", headers=headers)).json() == {
-        "concurrency": 10
+        "concurrency": 20
     }
     async with get_sessionmaker()() as session:
         user = await session.get(User, user_id)
         assert user.settings == {
-            "ui.theme": "dark", "tts": {"enabled": True}, "summary.concurrency": 10
+            "ui.theme": "dark", "tts": {"enabled": True}, "summary.concurrency": 20
         }
 
 
@@ -241,14 +241,14 @@ def test_batch_read_serializes_sqlite_naive_timestamps_as_utc():
     assert payload["updated_at"] == "2026-09-20T22:30:07Z"
 
 
-async def test_ten_capacity_slots_are_available_and_eleventh_waits(app):
-    user_id, _library_id, papers = await _seed_library(count=11, concurrency=10)
+async def test_twenty_capacity_slots_are_available_and_twenty_first_waits(app):
+    user_id, _library_id, papers = await _seed_library(count=21, concurrency=20)
     leases = []
-    for paper_id in papers[:10]:
+    for paper_id in papers[:20]:
         lease_id = await summary_batches.try_acquire_capacity(user_id, paper_id)
         assert lease_id is not None
         leases.append(lease_id)
-    assert await summary_batches.try_acquire_capacity(user_id, papers[10]) is None
+    assert await summary_batches.try_acquire_capacity(user_id, papers[20]) is None
 
     async with get_sessionmaker()() as session:
         await session.execute(

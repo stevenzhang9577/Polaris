@@ -7,7 +7,7 @@ import { toast } from '../../components/ui/Toast';
 
 export function validSummaryConcurrency(value: string): boolean {
   const number = Number(value);
-  return value.trim() !== '' && Number.isInteger(number) && number >= 1 && number <= 10;
+  return value.trim() !== '' && Number.isInteger(number) && number >= 1 && number <= 20;
 }
 
 export function SummarySettingsPanel() {
@@ -47,7 +47,7 @@ export function SummarySettingsPanel() {
         <>
           <div className="row gap12 wrap" style={{ alignItems: 'center' }}>
             <label htmlFor="summary-concurrency" style={{ fontSize: 13, fontWeight: 600 }}>{tr('同时生成的论文数', 'Concurrent papers')}</label>
-            <input id="summary-concurrency" className="input" type="number" min={1} max={10} step={1}
+            <input id="summary-concurrency" className="input" type="number" min={1} max={20} step={1}
               value={shown} onChange={(event) => setDraft(event.target.value)} disabled={save.isPending}
               aria-describedby="summary-concurrency-help" aria-invalid={!valid} style={{ width: 90 }} />
             <button className="btn btn-primary sm" disabled={!valid || save.isPending || Number(shown) === settings.data?.concurrency} onClick={() => save.mutate()}>
@@ -55,9 +55,9 @@ export function SummarySettingsPanel() {
             </button>
           </div>
           <p id="summary-concurrency-help" className="muted" style={{ fontSize: 12, lineHeight: 1.7 }}>
-            {tr('范围 1–10，默认 3。建议从较低并发开始，避免触发模型服务限流。降低并发不会中断正在生成的论文；新的任务会按新额度启动。', 'Range 1–10; default 3. Start low to avoid provider rate limits. Lowering the limit does not interrupt running papers; new tasks use the updated limit.')}
+            {tr('范围 1–20，默认 3。建议从较低并发开始，避免触发模型服务限流。降低并发不会中断正在生成的论文；新的任务会按新额度启动。', 'Range 1–20; default 3. Start low to avoid provider rate limits. Lowering the limit does not interrupt running papers; new tasks use the updated limit.')}
           </p>
-          {!valid && <p role="alert" style={{ fontSize: 12, color: 'var(--danger-tx)' }}>{tr('请输入 1 到 10 之间的整数。', 'Enter an integer from 1 to 10.')}</p>}
+          {!valid && <p role="alert" style={{ fontSize: 12, color: 'var(--danger-tx)' }}>{tr('请输入 1 到 20 之间的整数。', 'Enter an integer from 1 to 20.')}</p>}
           <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16, fontSize: 13, lineHeight: 1.7 }}>
             {tr('到文献库 → 论文库，点击「全选筛选结果」或逐篇勾选，再点「生成总结」。默认跳过已有总结，任务支持暂停、继续和失败重试。', 'In Library → Papers, select all filtered results or individual papers, then choose Generate summaries. Existing summaries are skipped by default. Batches support pause, resume, and retry.')}
           </div>
