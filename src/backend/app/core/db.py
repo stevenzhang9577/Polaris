@@ -49,10 +49,25 @@ def get_engine() -> AsyncEngine:
             }
         _engine = create_async_engine(settings.database_url, **kwargs)
         if _engine.url.get_backend_name() == "sqlite":
+            if _engine.url.database not in (None, "", ":memory:"):
+                # Set the persistent journal mode once, before serving requests.
+                # Doing this on every NullPool connection can contend with writers.
+                @event.listens_for(_engine.sync_engine, "first_connect")
+                def _sqlite_wal(dbapi_connection, _record):
+                    cursor = dbapi_connection.cursor()
+                    try:
+                        cursor.execute("PRAGMA busy_timeout=10000")
+                        cursor.execute("PRAGMA journal_mode=WAL")
+                        if cursor.fetchone()[0].lower() != "wal":
+                            raise RuntimeError("SQLite WAL mode could not be enabled")
+                    finally:
+                        cursor.close()
+
             # sqlite 默认不强制外键：打开 pragma，让 ON DELETE CASCADE 生效（对齐 postgres）
             @event.listens_for(_engine.sync_engine, "connect")
             def _sqlite_fk_on(dbapi_connection, _record):
                 cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA busy_timeout=10000")
                 cursor.execute("PRAGMA foreign_keys=ON")
                 cursor.close()
 

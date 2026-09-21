@@ -1,3 +1,5 @@
+import { isTransientReadError, readQueryOptions } from '../../lib/read-query';
+import { ReadFailure } from '../shared/ReadFailure';
 import { Suspense, lazy, memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery } from '@tanstack/react-query';
@@ -248,10 +250,10 @@ function PaperDetailPane({
 
   // 库作用域取详情：锁定本库那份成员行，相关度/状态/wiki 不会串到该论文在别的库的副本
   const detailKey = useMemo(() => ['paper', libraryId, paperId], [libraryId, paperId]);
-  const { data: paper, isLoading, isError } = useQuery({
+  const { data: paper, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: detailKey,
     queryFn: () => api.getLibraryPaper(libraryId, paperId),
-    retry: false,
+    ...readQueryOptions,
   });
 
   // 星标 / 阅读状态、笔记改动后要刷新的列表（库列表 + 库内搜索 + 库笔记本）
@@ -281,13 +283,13 @@ function PaperDetailPane({
   );
 
   if (isLoading) return <div className="empty">{tr('加载论文详情…', 'Loading paper…')}</div>;
-  if (isError || !paper) {
+  if (!paper || (isError && !isTransientReadError(error))) {
     return (
       <EmptyState
         compact
         icon="x"
         title={tr('无法加载论文详情', 'Failed to load paper')}
-        desc={tr('后端不可用或该论文不存在。', 'Backend unavailable or the paper does not exist.')}
+        action={<ReadFailure error={error} retry={refetch} fetching={isFetching} />}
       />
     );
   }
@@ -299,6 +301,7 @@ function PaperDetailPane({
 
   return (
     <div className="scroll fadeup" key={paper.id} style={{ overflowY: 'auto', flex: 1, padding: '26px 32px 60px' }}>
+      {isError && <ReadFailure error={error} retry={refetch} fetching={isFetching} retained />}
       {/* —— 元数据头 —— */}
       <div className="row" style={{ alignItems: 'flex-start', gap: 20 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -624,13 +627,13 @@ function PapersPane({
       });
     },
     enabled: !semantic,
-    retry: false,
+    ...readQueryOptions,
   });
   const semQuery = useQuery({
     queryKey: ['lib-search', libraryId, q],
     queryFn: () => api.searchLibrary(libraryId, { q, mode: 'semantic' }),
     enabled: semantic,
-    retry: false,
+    ...readQueryOptions,
   });
 
   const items: PaperRead[] = semantic ? semQuery.data?.papers ?? [] : listQuery.data?.items ?? [];
@@ -638,6 +641,8 @@ function PapersPane({
   const pages = semantic ? 1 : Math.max(1, Math.ceil(total / PAGE_SIZE));
   const isLoading = semantic ? semQuery.isLoading : listQuery.isLoading;
   const isError = semantic ? semQuery.isError : listQuery.isError;
+  const activeRead = semantic ? semQuery : listQuery;
+  const hasData = activeRead.data !== undefined && (!isError || isTransientReadError(activeRead.error));
 
   // 首条自动选中
   const firstId = items[0]?.id ?? null;
@@ -748,14 +753,15 @@ function PapersPane({
         </div>
 
         <div className="scroll" style={{ overflowY: 'auto', flex: 1 }}>
+          {isError && hasData && <ReadFailure error={activeRead.error} retry={activeRead.refetch} fetching={activeRead.isFetching} retained />}
           {isLoading ? (
             <div className="empty">{tr('加载论文…', 'Loading papers…')}</div>
-          ) : isError ? (
+          ) : isError && !hasData ? (
             <EmptyState
               compact
               icon="x"
               title={tr('无法加载论文列表', 'Failed to load papers')}
-              desc={tr('后端不可用或接口尚未就绪，稍后重试。', 'Backend unavailable — try again later.')}
+              action={<ReadFailure error={activeRead.error} retry={activeRead.refetch} fetching={activeRead.isFetching} />}
             />
           ) : items.length === 0 ? (
             <EmptyState

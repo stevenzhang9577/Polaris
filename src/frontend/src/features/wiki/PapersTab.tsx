@@ -1,3 +1,5 @@
+import { isTransientReadError, readQueryOptions } from '../../lib/read-query';
+import { ReadFailure } from '../shared/ReadFailure';
 import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -831,7 +833,7 @@ function PaperDetailPane({
 
   // 作用域读：锁定当前库/课题那份成员行，避免同一论文属多个库时读到跨库归并的错行
   // （相关度/状态/wiki）。queryKey 带 scope 隔离不同库的缓存。
-  const { data: paper, isLoading, isError } = useQuery({
+  const { data: paper, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ['paper', scopeId, paperId],
     queryFn: () =>
       libraryId
@@ -839,7 +841,7 @@ function PaperDetailPane({
         : pid
           ? api.getProjectPaper(pid, paperId)
           : api.getPaper(paperId),
-    retry: false,
+    ...readQueryOptions,
   });
 
   const deleteMutation = useMutation({
@@ -905,13 +907,13 @@ function PaperDetailPane({
   );
 
   if (isLoading) return <div className="empty">{tr('加载论文详情…', 'Loading paper…')}</div>;
-  if (isError || !paper) {
+  if (!paper || (isError && !isTransientReadError(error))) {
     return (
       <EmptyState
         compact
         icon="x"
         title={tr('无法加载论文详情', 'Failed to load paper')}
-        desc={tr('后端不可用或该论文不存在。', 'Backend unavailable or the paper does not exist.')}
+        action={<ReadFailure error={error} retry={refetch} fetching={isFetching} />}
       />
     );
   }
@@ -923,6 +925,7 @@ function PaperDetailPane({
 
   return (
     <div className="scroll fadeup" key={paper.id} style={{ overflowY: 'auto', flex: 1, padding: '26px 32px 60px' }}>
+      {isError && <ReadFailure error={error} retry={refetch} fetching={isFetching} retained />}
       {/* —— 元数据头 —— */}
       <div className="row" style={{ alignItems: 'flex-start', gap: 20 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -1463,7 +1466,7 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
     },
     initialPageParam: 1,
     getNextPageParam: (last) => (last.page * last.size < last.total ? last.page + 1 : undefined),
-    retry: false,
+    ...readQueryOptions,
     enabled: !semanticActive,
   });
 
@@ -1474,7 +1477,7 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
       libraryId
         ? api.searchLibrary(libraryId, { q, mode: 'semantic', limit: 30 })
         : api.searchProject(scopeId, { q, mode: 'semantic', limit: 30 }),
-    retry: (count, e) => !(e instanceof ApiError) && count < 1,
+    ...readQueryOptions,
     enabled: semanticActive,
   });
 
@@ -1527,6 +1530,8 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
 
   const isLoading = semanticActive ? semQuery.isLoading : listQuery.isLoading;
   const isError = semanticActive ? semQuery.isError : listQuery.isError;
+  const activeRead = semanticActive ? semQuery : listQuery;
+  const hasData = activeRead.data !== undefined && (!isError || isTransientReadError(activeRead.error));
   const fallbackNotice = semanticActive && semQuery.data && semQuery.data.mode_used === 'keyword';
 
   const hasFilter = !!q || view !== 'all' || !!myTagFilter || !!readingFilter || advActive;
@@ -1791,14 +1796,15 @@ export function PapersTab({ pid, libraryId, canManage = false, selectedId, onSel
         </div>
 
         <div className="scroll" style={{ overflowY: 'auto', flex: 1 }}>
+          {isError && hasData && <ReadFailure error={activeRead.error} retry={activeRead.refetch} fetching={activeRead.isFetching} retained />}
           {isLoading ? (
             <div className="empty">{tr('加载论文…', 'Loading papers…')}</div>
-          ) : isError ? (
+          ) : isError && !hasData ? (
             <EmptyState
               compact
               icon="x"
               title={tr('无法加载论文列表', 'Failed to load papers')}
-              desc={tr('后端不可用或接口尚未就绪，稍后重试。', 'Backend unavailable or API not ready — try again later.')}
+              action={<ReadFailure error={activeRead.error} retry={activeRead.refetch} fetching={activeRead.isFetching} />}
             />
           ) : papers.length === 0 ? (
             <EmptyState
