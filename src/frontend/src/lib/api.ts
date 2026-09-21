@@ -718,6 +718,13 @@ export function isPluginStage(stage: string): boolean {
   return PLUGIN_STAGE_RE.test(stage);
 }
 
+export interface ModelPricing {
+  input_per_million: string;
+  output_per_million: string;
+  cache_read_per_million: string | null;
+  cache_creation_per_million: string | null;
+}
+
 export interface LlmProviderRead {
   id: string;
   name: string;
@@ -730,6 +737,7 @@ export interface LlmProviderRead {
   enabled: boolean;
   /** 可用模型 id 列表（null = 未配置） */
   models: string[] | null;
+  model_pricing: Record<string, ModelPricing> | null;
   import_source: 'codex' | 'claude_code' | null;
   import_source_key: string | null;
   import_fingerprint: string | null;
@@ -749,6 +757,7 @@ export interface LlmProviderInput {
   enabled: boolean;
   /** 可用模型 id 列表；整体替换（清空传 []） */
   models?: string[];
+  model_pricing?: Record<string, ModelPricing> | null;
 }
 
 /** 推理档位；与后端 app/core/llm/base.py 的 EFFORT_LEVELS 对齐 */
@@ -834,8 +843,17 @@ export interface LlmUsageRow {
   date: string;
   stage: string;
   model: string;
+  provider_name: string | null;
+  /** Total input, including cache reads and creation. */
   prompt_tokens: number;
   completion_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cache_reported_calls: number;
+  estimated_calls: number;
+  priced_calls: number;
+  /** Sum for priced calls only; null when no call has a known cost. */
+  cost_usd: string | null;
   calls: number;
 }
 

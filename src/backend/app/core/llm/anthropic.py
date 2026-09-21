@@ -32,6 +32,7 @@ from app.core.llm.base import (
     ToolUseStop,
     normalize_finish_reason,
 )
+from app.core.llm.usage import normalize_anthropic_usage
 
 logger = logging.getLogger("polaris.llm")
 
@@ -60,22 +61,8 @@ def _rejects_effort(body: str) -> bool:
 
 
 def _normalize_usage(raw: dict[str, Any] | None) -> dict[str, int]:
-    """Anthropic 的 usage 键名归一成平台口径。
-
-    它给的是 ``input_tokens`` / ``output_tokens``，而记账读的是 ``prompt_tokens`` /
-    ``completion_tokens``，读不到就按 len/4 估——**所以此前走 Anthropic 的用量统计全是
-    估算值**。归一化放在 provider 里做，不污染 router。
-    """
-    if not raw:
-        return {}
-    usage = dict(raw)
-    if "input_tokens" in usage:
-        usage["prompt_tokens"] = int(usage["input_tokens"])
-    if "output_tokens" in usage:
-        usage["completion_tokens"] = int(usage["output_tokens"])
-    if "prompt_tokens" in usage and "completion_tokens" in usage:
-        usage.setdefault("total_tokens", usage["prompt_tokens"] + usage["completion_tokens"])
-    return {k: v for k, v in usage.items() if isinstance(v, int)}
+    """Backward-compatible local name for the shared usage normalizer."""
+    return normalize_anthropic_usage(raw)
 
 
 def _content_payload(block: ContentBlock) -> dict[str, Any] | None:

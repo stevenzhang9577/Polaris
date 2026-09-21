@@ -10,7 +10,8 @@ from alembic import command
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
-HEAD_REVISION = "bad1bb4329c1"  # Durable summary batches and concurrency leases
+HEAD_REVISION = "4758f07e3148"  # LLM cache usage and model pricing snapshots
+SUMMARY_BATCHES_REVISION = "bad1bb4329c1"  # Durable summary batches and concurrency leases
 VAULT_DIRECTORY_REVISION = "0a93d8114114"  # Configurable Obsidian managed folder
 ZOTERO_ORIGINAL_PDF_REVISION = "57022e4415e1"
 PRE_LLM_IMPORT_REVISION = "31cf6000d718"  # Zotero Local, summaries, and Obsidian Vault
@@ -211,7 +212,8 @@ def _inspect_db(db_path: Path) -> tuple[str, dict[str, set[str]]]:
 def test_single_migration_head(tmp_path):
     script = ScriptDirectory.from_config(_make_config(tmp_path / "unused.db"))
     assert script.get_heads() == [HEAD_REVISION]
-    assert script.get_revision(HEAD_REVISION).down_revision == VAULT_DIRECTORY_REVISION
+    assert script.get_revision(HEAD_REVISION).down_revision == SUMMARY_BATCHES_REVISION
+    assert script.get_revision(SUMMARY_BATCHES_REVISION).down_revision == VAULT_DIRECTORY_REVISION
     assert script.get_revision(VAULT_DIRECTORY_REVISION).down_revision == (
         ZOTERO_ORIGINAL_PDF_REVISION
     )
@@ -279,6 +281,103 @@ def test_vault_directory_and_summary_batches_preserve_existing_vault_roundtrip(t
             assert conn.execute(text(
                 "SELECT managed_directory FROM obsidian_vault_connections WHERE id=:id"
             ), {"id": connection_id}).scalar_one() == "Polaris"
+    finally:
+        engine.dispose()
+
+
+def test_llm_usage_cost_columns_preserve_populated_rows_roundtrip(tmp_path):
+    """The new nullable fields and default preserve old rows across upgrade/downgrade."""
+    db_path = tmp_path / "llm-usage-costs.db"
+    cfg = _make_config(db_path)
+    command.upgrade(cfg, SUMMARY_BATCHES_REVISION)
+    engine = create_engine(f"sqlite:///{db_path}")
+    provider_id = "00000000-0000-0000-0000-000000000101"
+    usage_id = "00000000-0000-0000-0000-000000000102"
+    now = "2026-09-21 00:00:00"
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO llm_providers "
+                    "(id, name, kind, transport, auth_scheme, enabled, created_at, updated_at) "
+                    "VALUES (:id, 'gateway', 'openai_compat', 'responses', 'bearer', 1, :now, :now)"
+                ),
+                {"id": provider_id, "now": now},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO llm_usage "
+                    "(id, stage, model, prompt_tokens, completion_tokens, created_at, updated_at) "
+                    "VALUES (:id, 'default', 'model-x', 1200, 300, :now, :now)"
+                ),
+                {"id": usage_id, "now": now},
+            )
+
+        command.upgrade(cfg, HEAD_REVISION)
+        version, columns = _inspect_db(db_path)
+        assert version == HEAD_REVISION
+        assert "model_pricing" in columns["llm_providers"]
+        new_usage_columns = {
+            "provider_name",
+            "cache_read_tokens",
+            "cache_creation_tokens",
+            "usage_estimated",
+            "cost_usd",
+            "pricing_snapshot",
+        }
+        assert new_usage_columns <= columns["llm_usage"]
+        with engine.connect() as conn:
+            usage_columns = {
+                column["name"]: column for column in inspect(conn).get_columns("llm_usage")
+            }
+            assert usage_columns["provider_name"]["type"].length == 255
+            assert usage_columns["usage_estimated"]["nullable"] is False
+            assert usage_columns["cost_usd"]["type"].precision == 24
+            assert usage_columns["cost_usd"]["type"].scale == 14
+            row = conn.execute(
+                text(
+                    "SELECT prompt_tokens, completion_tokens, provider_name, cache_read_tokens, "
+                    "cache_creation_tokens, usage_estimated, cost_usd, pricing_snapshot "
+                    "FROM llm_usage WHERE id = :id"
+                ),
+                {"id": usage_id},
+            ).one()
+            assert tuple(row[:5]) == (1200, 300, None, None, None)
+            assert row.usage_estimated in (True, 1)
+            assert row.cost_usd is None and row.pricing_snapshot is None
+
+        command.downgrade(cfg, SUMMARY_BATCHES_REVISION)
+        version, columns = _inspect_db(db_path)
+        assert version == SUMMARY_BATCHES_REVISION
+        assert "model_pricing" not in columns["llm_providers"]
+        assert not new_usage_columns & columns["llm_usage"]
+        with engine.connect() as conn:
+            assert tuple(
+                conn.execute(
+                    text(
+                        "SELECT stage, model, prompt_tokens, completion_tokens "
+                        "FROM llm_usage WHERE id = :id"
+                    ),
+                    {"id": usage_id},
+                ).one()
+            ) == ("default", "model-x", 1200, 300)
+            assert conn.execute(
+                text("SELECT name FROM llm_providers WHERE id = :id"), {"id": provider_id}
+            ).scalar_one() == "gateway"
+
+        command.upgrade(cfg, HEAD_REVISION)
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT provider_name, cache_read_tokens, cache_creation_tokens, "
+                    "usage_estimated, cost_usd, pricing_snapshot "
+                    "FROM llm_usage WHERE id = :id"
+                ),
+                {"id": usage_id},
+            ).one()
+            assert tuple(row[:3]) == (None, None, None)
+            assert row.usage_estimated in (True, 1)
+            assert row.cost_usd is None and row.pricing_snapshot is None
     finally:
         engine.dispose()
 

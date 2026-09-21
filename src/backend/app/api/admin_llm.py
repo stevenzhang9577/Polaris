@@ -63,6 +63,7 @@ def _provider_read(provider: LLMProviderConfig) -> ProviderRead:
         api_key_masked=llm_admin_service.masked_key_of(provider),
         enabled=provider.enabled,
         models=provider.models,
+        model_pricing=provider.model_pricing,
         import_source=provider.import_source,
         import_source_key=provider.import_source_key,
         import_fingerprint=provider.import_fingerprint,

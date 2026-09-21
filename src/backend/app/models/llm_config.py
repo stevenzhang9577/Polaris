@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -12,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     text,
@@ -100,6 +102,8 @@ class LLMProviderConfig(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # 该 provider 可用的模型 id 列表（字符串数组；None = 未配置，前端不给候选）
     models: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    # Exact model IDs, USD per million tokens. Decimal values are stored as strings.
+    model_pricing: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     # Provenance for Desktop local-config imports.  These fields contain no
     # path or credential values; source_key is the provider/profile identifier
     # inside the source config and fingerprint hashes only non-secret metadata.
@@ -184,6 +188,15 @@ class LLMUsage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     model: Mapped[str] = mapped_column(String(255), nullable=False)
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    provider_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # prompt_tokens includes both cache buckets; NULL means not reported, never zero.
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_creation_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_estimated: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(24, 14), nullable=True)
+    pricing_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class LLMCallLog(UUIDPrimaryKeyMixin, TimestampMixin, Base):

@@ -8,7 +8,7 @@ import httpx
 import pytest
 import respx
 
-from app.core.llm.base import Message
+from app.core.llm.base import Message, StreamDone
 from app.core.llm.openai_compat import OpenAICompatProvider
 
 BASE_URL = "http://relay.test/api/v1"
@@ -38,11 +38,21 @@ STREAM_CHUNKS = [
         "id": "c1",
         "model": "gpt-5.6-sol",
         "choices": [],
-        "usage": {"prompt_tokens": 12, "completion_tokens": 5},
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 5,
+            "total_tokens": 17,
+            "prompt_cache_hit_tokens": 8,
+            "prompt_cache_miss_tokens": 4,
+        },
     },
 ]
 
 FORCE_STREAM_400 = httpx.Response(400, json={"detail": "Stream must be set to true"})
+STREAM_USAGE_REJECTED = httpx.Response(
+    400,
+    json={"error": {"message": "Unrecognized request argument: stream_options.include_usage"}},
+)
 
 # 非流式成功响应（effort 透传用例不关心内容，只查 payload）
 NON_STREAM_OK = {
@@ -70,14 +80,51 @@ async def test_complete_force_stream_fallback_aggregates():
     assert result.content == "Hello world"
     assert result.model == "gpt-5.6-sol"
     assert result.finish_reason == "stop"
-    assert result.usage == {"prompt_tokens": 12, "completion_tokens": 5}
+    assert result.usage == {
+        "prompt_tokens": 12,
+        "completion_tokens": 5,
+        "total_tokens": 17,
+        "cache_read_tokens": 8,
+        "cache_creation_tokens": 0,
+    }
 
     assert route.call_count == 2
     first = json.loads(route.calls[0].request.content)
     second = json.loads(route.calls[1].request.content)
     assert first["stream"] is False
     assert second["stream"] is True
+    assert second["stream_options"] == {"include_usage": True}
     assert second["messages"] == first["messages"]  # 除 stream 外 payload 不变
+    await provider.aclose()
+
+
+@respx.mock
+async def test_complete_normalizes_openai_cached_tokens():
+    route = respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                **NON_STREAM_OK,
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 2,
+                    "total_tokens": 13,
+                    "prompt_tokens_details": {"cached_tokens": 7},
+                },
+            },
+        )
+    )
+    provider = OpenAICompatProvider(base_url=BASE_URL, api_key="sk-test")
+    result = await provider.complete([Message(role="user", content="hi")], model="gpt-5.6-sol")
+
+    assert result.usage == {
+        "prompt_tokens": 11,
+        "completion_tokens": 2,
+        "total_tokens": 13,
+        "cache_read_tokens": 7,
+        "cache_creation_tokens": 0,
+    }
+    assert json.loads(route.calls.last.request.content)["stream"] is False
     await provider.aclose()
 
 
@@ -99,6 +146,28 @@ async def test_complete_force_stream_fallback_no_usage_chunk():
     assert result.content == "Hello world"
     assert result.usage == {}
     assert result.usage.get("prompt_tokens", 0) == 0
+    await provider.aclose()
+
+
+@respx.mock
+async def test_force_stream_fallback_retries_without_unsupported_stream_options():
+    no_usage = httpx.Response(
+        200,
+        content=_sse([chunk for chunk in STREAM_CHUNKS if "usage" not in chunk]),
+        headers={"content-type": "text/event-stream"},
+    )
+    route = respx.post(CHAT_URL).mock(
+        side_effect=[FORCE_STREAM_400, STREAM_USAGE_REJECTED, no_usage]
+    )
+    provider = OpenAICompatProvider(base_url=BASE_URL, api_key="sk-test")
+    result = await provider.complete([Message(role="user", content="hi")], model="old-vllm")
+
+    assert result.content == "Hello world"
+    assert result.usage == {}
+    assert json.loads(route.calls[1].request.content)["stream_options"] == {
+        "include_usage": True
+    }
+    assert "stream_options" not in json.loads(route.calls[2].request.content)
     await provider.aclose()
 
 
@@ -144,6 +213,56 @@ async def test_stream_still_yields_deltas():
         c async for c in provider.stream([Message(role="user", content="hi")], model="gpt-5.6-sol")
     ]
     assert "".join(got) == "Hello world"
+    await provider.aclose()
+
+
+@respx.mock
+async def test_stream_events_requests_and_returns_exact_deepseek_usage():
+    route = respx.post(CHAT_URL).mock(return_value=_stream_response())
+    provider = OpenAICompatProvider(base_url=BASE_URL, api_key="sk-test")
+    events = [
+        event
+        async for event in provider.stream_events(
+            [Message(role="user", content="hi")], model="deepseek-chat"
+        )
+    ]
+
+    done = events[-1]
+    assert isinstance(done, StreamDone)
+    assert done.usage == {
+        "prompt_tokens": 12,
+        "completion_tokens": 5,
+        "total_tokens": 17,
+        "cache_read_tokens": 8,
+        "cache_creation_tokens": 0,
+    }
+    assert json.loads(route.calls.last.request.content)["stream_options"] == {
+        "include_usage": True
+    }
+    await provider.aclose()
+
+
+@respx.mock
+async def test_stream_events_retries_without_unsupported_stream_options():
+    no_usage = httpx.Response(
+        200,
+        content=_sse([chunk for chunk in STREAM_CHUNKS if "usage" not in chunk]),
+        headers={"content-type": "text/event-stream"},
+    )
+    route = respx.post(CHAT_URL).mock(side_effect=[STREAM_USAGE_REJECTED, no_usage])
+    provider = OpenAICompatProvider(base_url=BASE_URL, api_key="sk-test")
+    events = [
+        event
+        async for event in provider.stream_events(
+            [Message(role="user", content="hi")], model="old-vllm"
+        )
+    ]
+
+    done = events[-1]
+    assert isinstance(done, StreamDone)
+    assert done.usage == {}
+    assert route.call_count == 2
+    assert "stream_options" not in json.loads(route.calls[1].request.content)
     await provider.aclose()
 
 

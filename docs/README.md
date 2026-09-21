@@ -33,6 +33,7 @@ For a high-level tour of the product and its feature set, start with the
 | [MCP](mcp.md) | Connecting Claude Code, Codex, or Cursor to your research workspace: the two transports, topic scoping and permissions, the read-only tool catalog, recipes, limits, and how to check a connection. |
 | [Architecture](architecture.md) | The public-facing system design: layered backend, ARQ worker, LLM abstraction with DB model routing, the deterministic-vs-judgemental split, data stores, and real-time channels. |
 | [Configuration](configuration.md) | Reference table of every environment variable and setting from `.env.example` (database, cache, secrets, LLM providers, literature APIs, data directory, model routing). |
+| [LLM usage and costs](llm-usage.md) | Token accounting by provider and model, cache hit semantics, per-call price snapshots, unknown values, and estimated usage. |
 | [Development](development.md) | Local development workflow: repo layout, running the stack, migrations, tests, linting, the layering convention, and the branch-per-feature Git workflow. |
 | [Deployment](deployment.md) | Production deployment with Docker Compose: the prod overlay, bind-mount data directories, restricted-network build args, migrations, ports, and backups. |
 | [Desktop](desktop.md) | The Electron desktop client: process model, the `app://` protocol, the IPC contract, packaging, and unsigned-distribution notes. |

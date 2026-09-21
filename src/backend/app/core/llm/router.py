@@ -34,6 +34,7 @@ from app.core.llm.base import (
 from app.core.llm.fake import FakeProvider, estimate_tokens
 from app.core.llm.openai_compat import OpenAICompatProvider
 from app.core.llm.openai_responses import OpenAIResponsesProvider
+from app.core.llm.pricing import estimate_cost
 from app.core.security import decrypt_secret
 
 logger = logging.getLogger(__name__)
@@ -225,6 +226,7 @@ class ResolvedRoute:
     #: 模型的上下文窗口（token）。None = 管理端没填，调用方按保守常量走。
     #: agent 的历史回放预算靠它——不知道窗口多大，裁剪阈值就只能拍脑袋。
     context_window: int | None = None
+    pricing: dict[str, Any] | None = None
 
 
 # 无 DB 路由时的兜底：确定性 fake provider
@@ -440,6 +442,7 @@ class LLMRouter:
                     user_agent=provider.user_agent,
                     effort=route.effort,
                     context_window=route.context_window,
+                    pricing=(provider.model_pricing or {}).get(route.model),
                 )
         return routes
 
@@ -606,6 +609,7 @@ class LLMRouter:
         project_id: uuid.UUID | None,
         voyage_id: uuid.UUID | None,
         library_id: uuid.UUID | None = None,
+        route: ResolvedRoute | None = None,
     ) -> None:
         from app.models.llm_config import LLMUsage
 
@@ -621,6 +625,16 @@ class LLMRouter:
                         model=model,
                         prompt_tokens=int(usage.get("prompt_tokens", 0)),
                         completion_tokens=int(usage.get("completion_tokens", 0)),
+                        provider_name=route.provider_name if route else None,
+                        cache_read_tokens=usage.get("cache_read_tokens"),
+                        cache_creation_tokens=usage.get("cache_creation_tokens"),
+                        usage_estimated=bool(usage.get("usage_estimated", 1)),
+                        cost_usd=estimate_cost(usage, route.pricing if route else None),
+                        pricing_snapshot={
+                            "model": route.model,
+                            "currency": "USD",
+                            "rates": route.pricing,
+                        } if route and route.pricing is not None else None,
                     )
                 )
                 await session.commit()
@@ -672,11 +686,50 @@ class LLMRouter:
     ) -> dict[str, int]:
         """provider 未返回 usage 时按 len/4 估算。"""
         usage = dict(usage or {})
-        if not usage.get("prompt_tokens"):
+        estimated = bool(usage.get("usage_estimated", 0))
+        if usage.get("prompt_tokens") is None:
             usage["prompt_tokens"] = sum(estimate_tokens(m.text) for m in messages)
-        if not usage.get("completion_tokens"):
+            estimated = True
+        if usage.get("completion_tokens") is None:
             usage["completion_tokens"] = estimate_tokens(content)
+            estimated = True
+        usage["usage_estimated"] = int(estimated)
         return usage
+
+    @staticmethod
+    def _has_native_stream_events(provider: LLMProvider) -> bool:
+        """Whether a provider has a usage-capable structured stream implementation.
+
+        The base implementation only wraps ``stream()`` and FakeProvider adds tool
+        scripting on top.  Existing FakeProvider subclasses commonly override only
+        ``complete()`` or ``stream()`` (and some deliberately skip ``super().__init__``),
+        so routing their plain-text calls through FakeProvider.stream_events changes
+        behavior without adding usage data.  Real adapters, and custom providers that
+        override stream_events themselves, keep the structured path and its final
+        usage event.
+        """
+        instance_fields = getattr(provider, "__dict__", {})
+        if "stream_events" in instance_fields:
+            return True
+        if "stream" in instance_fields:
+            return False
+
+        provider_type = type(provider)
+        implementation = provider_type.stream_events
+        if implementation in {LLMProvider.stream_events, FakeProvider.stream_events}:
+            return False
+
+        def owner_index(method: str) -> int:
+            return next(
+                index
+                for index, cls in enumerate(provider_type.__mro__)
+                if method in cls.__dict__
+            )
+
+        # A compatibility subclass may inherit an adapter's structured stream
+        # while replacing only its older plain stream method. Respect the more
+        # specific override instead of silently bypassing it.
+        return owner_index("stream_events") <= owner_index("stream")
 
     async def complete(
         self,
@@ -738,11 +791,12 @@ class LLMRouter:
                     library_id=library_id,
                 )
             raise
-        result.usage = self._ensure_usage(messages, result.content, result.usage)
+        accounting_usage = self._ensure_usage(messages, result.content, result.usage)
         await self._record_usage(
+            route=route,
             stage=stage,
             model=result.model,
-            usage=result.usage,
+            usage=accounting_usage,
             user_id=user_id,
             project_id=project_id,
             voyage_id=voyage_id,
@@ -758,12 +812,17 @@ class LLMRouter:
                 error=None,
                 request=call_log.sanitize_request(messages, images),
                 response=result.content,
-                usage=result.usage,
+                usage=accounting_usage,
                 user_id=user_id,
                 project_id=project_id,
                 voyage_id=voyage_id,
                 library_id=library_id,
             )
+        # ``usage_estimated`` is accounting metadata, not part of the provider wire
+        # contract.  Keep it out of business payloads and golden protocol snapshots.
+        result.usage = {
+            key: value for key, value in accounting_usage.items() if key != "usage_estimated"
+        }
         return result
 
     async def _stream_and_broadcast(
@@ -781,8 +840,7 @@ class LLMRouter:
         """流式补全并把 token 增量节流广播成 llm_delta 事件，返回拼好的完整结果。
 
         节流见 _STREAM_FLUSH_CHARS：攒够长度再发一段，避免每 token 刷爆 pub/sub；始终
-        返回完整 content，对调用方与 complete() 等价（流式 provider 拿不到精确 usage，
-        由 _ensure_usage 估算）。
+        返回完整 content 与供应商的最终 usage；只有缺少 usage 时才估算。
 
         网络瞬断重试：非流式路径的 _post_with_retry 会自动重试 TransportError，流式
         路径以前没有——LLM 网关一次 ReadTimeout 就把整个任务步骤打失败（线上实测，
@@ -796,6 +854,7 @@ class LLMRouter:
         last_exc: Exception | None = None
         for attempt in range(_STREAM_RETRY_ATTEMPTS):
             collected = []
+            reported: dict[str, int] = {}
             buf: list[str] = []
             buf_len = 0
             seq = 0
@@ -812,19 +871,40 @@ class LLMRouter:
 
             await self.event_bus.publish_voyage_event(voyage_id, "llm_start", {"stage": stage})
             try:
-                async for chunk in provider.stream(
-                    messages,
-                    model=route.model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    images=images,
-                    **stream_extra,
-                ):
-                    collected.append(chunk)
-                    buf.append(chunk)
-                    buf_len += len(chunk)
-                    if buf_len >= _STREAM_FLUSH_CHARS:
-                        await flush()
+                if self._has_native_stream_events(provider):
+                    async for event in provider.stream_events(
+                        messages,
+                        model=route.model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        images=images,
+                        **stream_extra,
+                    ):
+                        if isinstance(event, StreamDone):
+                            reported.update(event.usage)
+                            continue
+                        if not isinstance(event, TextDelta):
+                            continue
+                        chunk = event.text
+                        collected.append(chunk)
+                        buf.append(chunk)
+                        buf_len += len(chunk)
+                        if buf_len >= _STREAM_FLUSH_CHARS:
+                            await flush()
+                else:
+                    async for chunk in provider.stream(
+                        messages,
+                        model=route.model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        images=images,
+                        **stream_extra,
+                    ):
+                        collected.append(chunk)
+                        buf.append(chunk)
+                        buf_len += len(chunk)
+                        if buf_len >= _STREAM_FLUSH_CHARS:
+                            await flush()
                 await flush()
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 await self.event_bus.publish_voyage_event(voyage_id, "llm_end", {"stage": stage})
@@ -865,7 +945,7 @@ class LLMRouter:
             from app.services.voyage_logs import record_terminal_log
 
             await record_terminal_log(voyage_id, "llm", message=full_text, stage=stage)
-        return CompletionResult(content=full_text, model=route.model)
+        return CompletionResult(content=full_text, model=route.model, usage=reported)
 
     async def embed(
         self,
@@ -908,8 +988,15 @@ class LLMRouter:
                     library_id=library_id,
                 )
             raise
-        usage = {"prompt_tokens": sum(estimate_tokens(t) for t in texts)}
+        usage = {
+            "prompt_tokens": sum(estimate_tokens(t) for t in texts),
+            "completion_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "usage_estimated": 1,
+        }
         await self._record_usage(
+            route=route,
             stage=stage,
             model=route.model,
             usage=usage,
@@ -985,13 +1072,24 @@ class LLMRouter:
                     library_id=library_id,
                 )
             raise
-        total_tokens = int(result.usage.get("total_tokens", 0)) or (
+        reported_tokens = result.usage.get("total_tokens")
+        total_tokens = int(reported_tokens) if reported_tokens is not None else (
             estimate_tokens(query) + sum(estimate_tokens(d) for d in documents)
         )
+        usage = {
+            "prompt_tokens": total_tokens,
+            "completion_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "usage_estimated": int(
+                reported_tokens is None or result.usage.get("usage_estimated", 0)
+            ),
+        }
         await self._record_usage(
+            route=route,
             stage=stage,
             model=route.model,
-            usage={"prompt_tokens": total_tokens},
+            usage=usage,
             user_id=user_id,
             project_id=project_id,
             voyage_id=voyage_id,
@@ -1007,7 +1105,7 @@ class LLMRouter:
                 error=None,
                 request=request_summary,
                 response=f"[{len(result.results)} rerank results]",
-                usage={"prompt_tokens": total_tokens},
+                usage=usage,
                 user_id=user_id,
                 project_id=project_id,
                 voyage_id=voyage_id,
@@ -1032,18 +1130,35 @@ class LLMRouter:
         log_enabled = await call_log.logging_enabled()
         started_at = time.monotonic()
         collected: list[str] = []
+        reported: dict[str, int] = {}
         eff = route.effort if effort is None else effort
         extra: dict[str, Any] = {"effort": eff} if eff is not None else {}
         try:
-            async for chunk in provider.stream(
-                messages,
-                model=route.model,
-                temperature=route.temperature if temperature is None else temperature,
-                max_tokens=max_tokens,
-                **extra,
-            ):
-                collected.append(chunk)
-                yield chunk
+            if self._has_native_stream_events(provider):
+                async for event in provider.stream_events(
+                    messages,
+                    model=route.model,
+                    temperature=route.temperature if temperature is None else temperature,
+                    max_tokens=max_tokens,
+                    **extra,
+                ):
+                    if isinstance(event, StreamDone):
+                        reported.update(event.usage)
+                        continue
+                    if not isinstance(event, TextDelta):
+                        continue
+                    collected.append(event.text)
+                    yield event.text
+            else:
+                async for chunk in provider.stream(
+                    messages,
+                    model=route.model,
+                    temperature=route.temperature if temperature is None else temperature,
+                    max_tokens=max_tokens,
+                    **extra,
+                ):
+                    collected.append(chunk)
+                    yield chunk
         except Exception as e:
             if log_enabled:
                 await self._log_call(
@@ -1054,7 +1169,7 @@ class LLMRouter:
                     status="error",
                     error=f"{type(e).__name__}: {e}",
                     request=call_log.sanitize_request(messages),
-                    response="".join(collected) or None,  # 已收到的部分输出
+                    response="".join(collected) or None,
                     usage={},
                     user_id=user_id,
                     project_id=project_id,
@@ -1063,8 +1178,9 @@ class LLMRouter:
                 )
             raise
         content = "".join(collected)
-        usage = self._ensure_usage(messages, content, None)
+        usage = self._ensure_usage(messages, content, reported)
         await self._record_usage(
+            route=route,
             stage=stage,
             model=route.model,
             usage=usage,
@@ -1073,7 +1189,6 @@ class LLMRouter:
             voyage_id=voyage_id,
             library_id=library_id,
         )
-        # 时延 = 到流结束的完整耗时；response 聚合完整输出
         if log_enabled:
             await self._log_call(
                 stage=stage,
@@ -1090,7 +1205,6 @@ class LLMRouter:
                 voyage_id=voyage_id,
                 library_id=library_id,
             )
-
 
     async def stream_events(
         self,
@@ -1139,7 +1253,7 @@ class LLMRouter:
                 if isinstance(ev, TextDelta):
                     collected.append(ev.text)
                 elif isinstance(ev, StreamDone) and ev.usage:
-                    reported = dict(ev.usage)
+                    reported.update(ev.usage)
                 yield ev
         except Exception as e:
             if log_enabled:
@@ -1160,8 +1274,9 @@ class LLMRouter:
                 )
             raise
         content = "".join(collected)
-        usage = reported or self._ensure_usage(messages, content, None)
+        usage = self._ensure_usage(messages, content, reported)
         await self._record_usage(
+            route=route,
             stage=stage,
             model=route.model,
             usage=usage,

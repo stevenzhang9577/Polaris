@@ -247,6 +247,7 @@ class FakeProvider(LLMProvider):
             usage={
                 "prompt_tokens": prompt_len,
                 "completion_tokens": estimate_tokens(content),
+                "usage_estimated": 1,
             },
         )
 
@@ -336,7 +337,7 @@ class FakeProvider(LLMProvider):
         if top_n is not None:
             scored = scored[:top_n]
         total = estimate_tokens(query) + sum(estimate_tokens(d) for d in documents)
-        return RerankResult(results=scored, usage={"total_tokens": total})
+        return RerankResult(results=scored, usage={"total_tokens": total, "usage_estimated": 1})
 
     @staticmethod
     def _respond(messages: Sequence[Message], model: str) -> str:

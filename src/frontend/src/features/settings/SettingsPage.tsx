@@ -51,6 +51,8 @@ import { SummarySettingsPanel } from './SummarySettingsPanel';
 import './settings-navigation.css';
 import { CAPABILITY_PYTHON_ENVIRONMENT_MANAGE } from '../../lib/host';
 import { LocalLlmImport } from './LocalLlmImport';
+import { UsageDashboard } from './UsageDashboard';
+import { LlmPricingSettings } from './LlmPricingSettings';
 import {
   CAPABILITY_OBSIDIAN_VAULT_SYNC,
   CAPABILITY_PLUGINS_MANAGE,
@@ -2255,6 +2257,7 @@ export function LlmTab() {
       <LocalLlmImport />
       <ProvidersSection />
       <RoutesSection />
+      <LlmPricingSettings />
       <EmbeddingSpaceSection />
       <AdminSpeechSettings />
       <AffiliationModeSection />
@@ -2266,202 +2269,11 @@ export function LlmTab() {
 // ---------------- 用量 ----------------
 
 export function UsageTab() {
-  const [days, setDays] = useState<'7' | '30' | '90'>('30');
-  const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: ['llm', 'usage', days],
-    queryFn: () => api.getLlmUsage({ days: Number(days) }),
-    retry: false,
-  });
-  const rows = useMemo(() => data ?? [], [data]);
-  const totals = useMemo(
-    () =>
-      rows.reduce(
-        (acc, r) => ({
-          prompt: acc.prompt + r.prompt_tokens,
-          completion: acc.completion + r.completion_tokens,
-          calls: acc.calls + r.calls,
-        }),
-        { prompt: 0, completion: 0, calls: 0 },
-      ),
-    [rows],
-  );
-
-  return (
-    <>
-    <div className="card card-pad">
-      <div className="row" style={{ justifyContent: 'space-between', marginBottom: 14 }}>
-        <span className="section-h">
-          <Icon name="chart" size={15} style={{ color: 'var(--accent)' }} />
-          {tr('LLM 用量', 'LLM usage')} <span className="en-label" style={{ fontSize: 11 }}>{tr('按天 × stage', 'per day × stage')}</span>
-        </span>
-        <Segmented options={[{ v: '7' as const, label: tr('7 天', '7 days') }, { v: '30' as const, label: tr('30 天', '30 days') }, { v: '90' as const, label: tr('90 天', '90 days') }]}
-          value={days} onChange={setDays} />
-      </div>
-      {isLoading ? (
-        <div className="empty" style={{ padding: 24 }}>{tr('加载中…', 'Loading…')}</div>
-      ) : isError ? (
-        <div className="empty" style={{ padding: 24 }}>
-          {tr('无法加载用量数据（后端不可用或无权限）', 'Failed to load usage data (backend unavailable or no permission)')}
-          <div style={{ marginTop: 10 }}>
-            <button className="btn btn-soft sm" onClick={() => void refetch()}>{tr('重试', 'Retry')}</button>
-          </div>
-        </div>
-      ) : rows.length === 0 ? (
-        <div className="empty" style={{ padding: 24 }}>{tr(`近 ${days} 天暂无用量记录`, `No usage records in the last ${days} days`)}</div>
-      ) : (
-        <div className="table-wrap">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>{tr('日期', 'Date')}</th>
-                <th>stage</th>
-                <th>model</th>
-                <th style={{ textAlign: 'right' }}>prompt tok</th>
-                <th style={{ textAlign: 'right' }}>completion tok</th>
-                <th style={{ textAlign: 'right' }}>calls</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r, i) => (
-                <tr key={i}>
-                  <td className="mono" style={{ fontSize: 11.5 }}>{r.date}</td>
-                  <td className="mono" style={{ fontSize: 11.5 }}>{r.stage}</td>
-                  <td className="mono" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{r.model}</td>
-                  <td className="mono" style={{ fontSize: 11.5, textAlign: 'right' }}>{r.prompt_tokens.toLocaleString()}</td>
-                  <td className="mono" style={{ fontSize: 11.5, textAlign: 'right' }}>{r.completion_tokens.toLocaleString()}</td>
-                  <td className="mono" style={{ fontSize: 11.5, textAlign: 'right' }}>{r.calls.toLocaleString()}</td>
-                </tr>
-              ))}
-              <tr>
-                <td colSpan={3} style={{ fontWeight: 650 }}>{tr('合计', 'Total')}</td>
-                <td className="mono" style={{ fontSize: 11.5, textAlign: 'right', fontWeight: 650 }}>{totals.prompt.toLocaleString()}</td>
-                <td className="mono" style={{ fontSize: 11.5, textAlign: 'right', fontWeight: 650 }}>{totals.completion.toLocaleString()}</td>
-                <td className="mono" style={{ fontSize: 11.5, textAlign: 'right', fontWeight: 650 }}>{totals.calls.toLocaleString()}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-    </>
-  );
+  return <UsageDashboard scope="platform" />;
 }
 
-// ---------------- 我的用量（个人） ----------------
-
 function MyUsageTab() {
-  const [days, setDays] = useState<'7' | '30' | '90'>('30');
-  const { data: summary } = useQuery({ queryKey: ['my-usage'], queryFn: () => api.myUsage(), retry: false });
-  const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: ['my-usage-history', days],
-    queryFn: () => api.myUsageHistory({ days: Number(days) }),
-    retry: false,
-  });
-  const rows = useMemo(() => data ?? [], [data]);
-  const totals = useMemo(
-    () =>
-      rows.reduce(
-        (acc, r) => ({
-          prompt: acc.prompt + r.prompt_tokens,
-          completion: acc.completion + r.completion_tokens,
-          calls: acc.calls + r.calls,
-        }),
-        { prompt: 0, completion: 0, calls: 0 },
-      ),
-    [rows],
-  );
-
-  const used = summary?.tokens_used ?? 0;
-
-  return (
-    <>
-      {/* —— 指标墙：一眼看完「一共用了多少 / 这段时间用了多少」——
-             左边第一张是累计与配额，后面三张跟着上面的天数选择走。 */}
-      <div className="settings-stats" style={{ marginBottom: 20 }}>
-        <div className="card card-pad">
-          <div className="row gap8" style={{ alignItems: 'center' }}>
-            <Icon name="chart" size={14} style={{ color: 'var(--accent)' }} />
-            <span style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{tr('累计消耗', 'Total consumed')}</span>
-          </div>
-          <div className="mono" style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>{used.toLocaleString()}</div>
-          <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2 }}>
-            tokens
-          </div>
-        </div>
-
-        {[
-          { zh: '这段时间 · 输入', en: 'Selected range · prompt', v: totals.prompt, unit: 'tokens' },
-          { zh: '这段时间 · 输出', en: 'Selected range · completion', v: totals.completion, unit: 'tokens' },
-          { zh: '这段时间 · 调用', en: 'Selected range · calls', v: totals.calls, unit: tr('次', 'calls') },
-        ].map((s) => (
-          <div key={s.en} className="card card-pad">
-            <div style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{tr(s.zh, s.en)}</div>
-            <div className="mono" style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>{s.v.toLocaleString()}</div>
-            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2 }}>
-              {s.unit}
-              <span style={{ color: 'var(--text-4)' }}>{tr(` · 近 ${days} 天`, ` · last ${days}d`)}</span>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div className="card card-pad">
-        <div className="row" style={{ justifyContent: 'space-between', marginBottom: 14 }}>
-          <span className="section-h">
-            <Icon name="chart" size={15} style={{ color: 'var(--accent)' }} />
-            {tr('用量明细', 'Usage details')} <span className="en-label" style={{ fontSize: 11 }}>{tr('按天 × stage', 'per day × stage')}</span>
-          </span>
-          <Segmented options={[{ v: '7' as const, label: tr('7 天', '7 days') }, { v: '30' as const, label: tr('30 天', '30 days') }, { v: '90' as const, label: tr('90 天', '90 days') }]}
-            value={days} onChange={setDays} />
-        </div>
-        {isLoading ? (
-          <div className="empty" style={{ padding: 24 }}>{tr('加载中…', 'Loading…')}</div>
-        ) : isError ? (
-          <div className="empty" style={{ padding: 24 }}>
-            {tr('无法加载用量数据（后端不可用）', 'Failed to load usage data (backend unavailable)')}
-            <div style={{ marginTop: 10 }}>
-              <button className="btn btn-soft sm" onClick={() => void refetch()}>{tr('重试', 'Retry')}</button>
-            </div>
-          </div>
-        ) : rows.length === 0 ? (
-          <div className="empty" style={{ padding: 24 }}>{tr(`近 ${days} 天暂无用量记录`, `No usage records in the last ${days} days`)}</div>
-        ) : (
-          <div className="table-wrap">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>{tr('日期', 'Date')}</th>
-                  <th>stage</th>
-                  <th>model</th>
-                  <th style={{ textAlign: 'right' }}>prompt tok</th>
-                  <th style={{ textAlign: 'right' }}>completion tok</th>
-                  <th style={{ textAlign: 'right' }}>calls</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r, i) => (
-                  <tr key={i}>
-                    <td className="mono" style={{ fontSize: 11.5 }}>{r.date}</td>
-                    <td className="mono" style={{ fontSize: 11.5 }}>{r.stage}</td>
-                    <td className="mono" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{r.model}</td>
-                    <td className="mono" style={{ fontSize: 11.5, textAlign: 'right' }}>{r.prompt_tokens.toLocaleString()}</td>
-                    <td className="mono" style={{ fontSize: 11.5, textAlign: 'right' }}>{r.completion_tokens.toLocaleString()}</td>
-                    <td className="mono" style={{ fontSize: 11.5, textAlign: 'right' }}>{r.calls.toLocaleString()}</td>
-                  </tr>
-                ))}
-                <tr>
-                  <td colSpan={3} style={{ fontWeight: 650 }}>{tr('合计', 'Total')}</td>
-                  <td className="mono" style={{ fontSize: 11.5, textAlign: 'right', fontWeight: 650 }}>{totals.prompt.toLocaleString()}</td>
-                  <td className="mono" style={{ fontSize: 11.5, textAlign: 'right', fontWeight: 650 }}>{totals.completion.toLocaleString()}</td>
-                  <td className="mono" style={{ fontSize: 11.5, textAlign: 'right', fontWeight: 650 }}>{totals.calls.toLocaleString()}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </>
-  );
+  return <UsageDashboard scope="personal" />;
 }
 
 // ---------------- 页面 ----------------
@@ -2907,14 +2719,18 @@ export function DailyCategoriesTab() {
   );
 }
 
-const PERSONAL_TABS: Tab[] = ['personal', 'prefs', 'buddy', 'speech', 'bots', 'ssh', 'myusage', 'extension', 'mcp', 'export', 'obsidian', 'plugins', 'python', 'summaries'];
+const SETTINGS_TABS: Tab[] = ['personal', 'prefs', 'buddy', 'speech', 'bots', 'ssh', 'myusage', 'extension', 'mcp', 'export', 'obsidian', 'plugins', 'python', 'summaries', 'llm', 'literature', 'processing', 'experiment', 'daily', 'usage'];
+
+export function settingsTabFromParam(param: string | null): Tab {
+  return param !== null && SETTINGS_TABS.includes(param as Tab) ? (param as Tab) : 'personal';
+}
 
 export function SettingsPage() {
   // 支持 /settings?tab=mcp 这类深链（如旧 /mcp-tools 路由的重定向）
   const [searchParams] = useSearchParams();
   const param = searchParams.get('tab');
   const [tab, setTab] = useState<Tab>(() =>
-    param !== null && PERSONAL_TABS.includes(param as Tab) ? (param as Tab) : 'personal',
+    settingsTabFromParam(param),
   );
 
   // 「插件」tab 在 plugins.manage 能力可用时出现——桌面端看主进程清单，服务器

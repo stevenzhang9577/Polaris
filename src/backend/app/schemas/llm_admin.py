@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -12,6 +13,18 @@ ProviderKind = Literal["openai_compat", "anthropic", "fake"]
 ProviderTransport = Literal["chat_completions", "responses", "anthropic_messages", "fake"]
 ProviderAuthScheme = Literal["bearer", "x_api_key", "none"]
 UserAgent = Annotated[str, Field(max_length=255, pattern=r"^[^\r\n]*$")]
+ModelPrice = Annotated[Decimal, Field(ge=0, le=1000000, max_digits=16, decimal_places=8)]
+ModelId = Annotated[str, Field(min_length=1, max_length=255, pattern=r".*\S.*")]
+
+
+class ModelPricing(BaseModel):
+    """USD per million tokens. Missing cache rates are unknown, not free."""
+
+    model_config = ConfigDict(extra="forbid")
+    input_per_million: ModelPrice
+    output_per_million: ModelPrice
+    cache_read_per_million: ModelPrice | None = None
+    cache_creation_per_million: ModelPrice | None = None
 
 
 class ProviderCreate(BaseModel):
@@ -24,6 +37,7 @@ class ProviderCreate(BaseModel):
     api_key: str | None = None  # 只写不读；入库前 Fernet 加密
     enabled: bool = True
     models: list[str] | None = None  # 可用模型 id 列表（None = 未配置）
+    model_pricing: dict[ModelId, ModelPricing] | None = None
 
 
 class ProviderUpdate(BaseModel):
@@ -36,6 +50,7 @@ class ProviderUpdate(BaseModel):
     api_key: str | None = None  # 空字符串 = 不变
     enabled: bool | None = None
     models: list[str] | None = None  # 整体替换；None = 不变（清空传 []）
+    model_pricing: dict[ModelId, ModelPricing] | None = None  # supplied null clears prices
 
 
 class ProviderRead(BaseModel):
@@ -51,6 +66,7 @@ class ProviderRead(BaseModel):
     api_key_masked: str
     enabled: bool
     models: list[str] | None = None
+    model_pricing: dict[str, ModelPricing] | None = None
     import_source: str | None = None
     import_source_key: str | None = None
     import_fingerprint: str | None = None
@@ -138,6 +154,13 @@ class UsageRow(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     calls: int
+    provider_name: str | None = None
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_reported_calls: int = 0
+    estimated_calls: int = 0
+    priced_calls: int = 0
+    cost_usd: Decimal | None = None
 
 
 # ---- 调用日志 ----

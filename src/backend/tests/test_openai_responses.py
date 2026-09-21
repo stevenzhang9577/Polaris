@@ -8,6 +8,7 @@ from app.core.llm.base import (
     Message,
     OpaqueProviderState,
     OpaqueProviderStateBlock,
+    StreamDone,
     TextBlock,
     TextDelta,
     ToolResultBlock,
@@ -58,7 +59,12 @@ async def test_responses_complete_preserves_function_call_chain():
                         "arguments": '{"q":"paper"}',
                     },
                 ],
-                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "usage": {
+                    "input_tokens": 3,
+                    "input_tokens_details": {"cached_tokens": 2},
+                    "output_tokens": 2,
+                    "total_tokens": 5,
+                },
             },
         )
     )
@@ -100,7 +106,13 @@ async def test_responses_complete_preserves_function_call_chain():
     assert result.finish_reason == "tool_use"
     assert result.tool_calls[0].id == "call_next"
     assert result.tool_calls[0].input == {"q": "paper"}
-    assert result.usage["prompt_tokens"] == 3
+    assert result.usage == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+        "cache_read_tokens": 2,
+        "cache_creation_tokens": 0,
+    }
     state = next(block for block in result.blocks if isinstance(block, OpaqueProviderStateBlock))
     assert state.payload["encrypted_content"] == "opaque-ciphertext"
     replay = provider._payload(  # type: ignore[attr-defined]
@@ -158,7 +170,8 @@ async def test_responses_stream_maps_text_and_tool_events():
             ),
             (
                 'data: {"type":"response.completed","response":'
-                '{"usage":{"input_tokens":2,"output_tokens":1}}}'
+                '{"usage":{"input_tokens":2,"input_tokens_details":'
+                '{"cached_tokens":1},"output_tokens":1,"total_tokens":3}}}'
             ),
             "data: [DONE]",
             "",
@@ -195,4 +208,51 @@ async def test_responses_stream_maps_text_and_tool_events():
     assert state_block.payload == state_event.payload
     assert any(isinstance(event, ToolUseArgsDelta) for event in events)
     assert events[-1].finish_reason == "tool_use"  # type: ignore[union-attr]
-    assert events[-1].usage["prompt_tokens"] == 2  # type: ignore[union-attr]
+    assert events[-1].usage == {  # type: ignore[union-attr]
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3,
+        "cache_read_tokens": 1,
+        "cache_creation_tokens": 0,
+    }
+
+
+@respx.mock
+async def test_responses_stream_incomplete_preserves_usage_and_reason():
+    body = "\n".join(
+        [
+            'data: {"type":"response.output_text.delta","delta":"partial"}',
+            (
+                'data: {"type":"response.incomplete","response":'
+                '{"incomplete_details":{"reason":"max_output_tokens"},'
+                '"usage":{"input_tokens":5,"input_tokens_details":'
+                '{"cached_tokens":3},"output_tokens":4,"total_tokens":9}}}'
+            ),
+            "data: [DONE]",
+            "",
+        ]
+    )
+    respx.post("http://relay.test/v1/responses").mock(
+        return_value=httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+    )
+    provider = OpenAIResponsesProvider("http://relay.test/v1", "", auth_scheme="none")
+    try:
+        events = [
+            event
+            async for event in provider.stream_events(
+                [Message(role="user", content="ping")], model="gpt-test"
+            )
+        ]
+    finally:
+        await provider.aclose()
+
+    done = events[-1]
+    assert isinstance(done, StreamDone)
+    assert done.finish_reason == "max_output_tokens"
+    assert done.usage == {
+        "prompt_tokens": 5,
+        "completion_tokens": 4,
+        "total_tokens": 9,
+        "cache_read_tokens": 3,
+        "cache_creation_tokens": 0,
+    }

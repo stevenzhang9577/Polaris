@@ -34,6 +34,7 @@ from app.core.llm.base import (
     ToolUseStop,
     normalize_finish_reason,
 )
+from app.core.llm.usage import normalize_openai_responses_usage
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _TOOLS_REJECT_MARKERS = (
@@ -60,14 +61,8 @@ def _responses_url(base_url: str) -> str:
 
 
 def _usage(raw: dict[str, Any] | None) -> dict[str, int]:
-    if not raw:
-        return {}
-    normalized = {key: value for key, value in raw.items() if isinstance(value, int)}
-    if "input_tokens" in normalized:
-        normalized["prompt_tokens"] = normalized["input_tokens"]
-    if "output_tokens" in normalized:
-        normalized["completion_tokens"] = normalized["output_tokens"]
-    return normalized
+    """Backward-compatible local name for the shared usage normalizer."""
+    return normalize_openai_responses_usage(raw)
 
 
 def _message_content(message: Message) -> list[dict[str, Any]]:
@@ -399,10 +394,10 @@ class OpenAIResponsesProvider(LLMProvider):
                     elif index in open_tools:
                         open_tools.remove(index)
                         yield ToolUseStop(index)
-                elif kind == "response.completed":
-                    completed = event.get("response") or {}
-                    usage = _usage(completed.get("usage"))
-                    finish_reason = (completed.get("incomplete_details") or {}).get("reason")
+                elif kind in {"response.completed", "response.incomplete"}:
+                    terminal = event.get("response") or {}
+                    usage = _usage(terminal.get("usage"))
+                    finish_reason = (terminal.get("incomplete_details") or {}).get("reason")
                 elif kind in {"response.failed", "error"}:
                     error = event.get("error") or (event.get("response") or {}).get("error") or {}
                     raise RuntimeError(f"openai responses stream failed: {str(error)[:500]}")

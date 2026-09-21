@@ -12,7 +12,7 @@ from datetime import timedelta
 from typing import Any
 
 from cryptography.fernet import InvalidToken
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, case, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.llm import call_log
@@ -166,6 +166,7 @@ async def create_provider(
         api_key_encrypted=encrypt_secret(data.api_key) if data.api_key else None,
         enabled=data.enabled,
         models=data.models,
+        model_pricing=data.model_dump(mode="json")["model_pricing"],
     )
     session.add(provider)
     await session.commit()
@@ -205,6 +206,8 @@ async def update_provider(
         provider.enabled = data.enabled
     if data.models is not None:  # 整体替换；清空传 []
         provider.models = data.models
+    if "model_pricing" in data.model_fields_set:
+        provider.model_pricing = data.model_dump(mode="json")["model_pricing"]
     await session.commit()
     await session.refresh(provider)
     get_llm_router().invalidate_cache()
@@ -381,7 +384,7 @@ async def usage_report(
     user_id: uuid.UUID | None = None,
     days: int = 30,
 ) -> list[dict[str, Any]]:
-    """按 日期 × stage × model 聚合最近 N 天的用量。"""
+    """Aggregate persisted usage and price snapshots; never reprice historical calls."""
     since = utcnow() - timedelta(days=days)
     date_col = func.date(LLMUsage.created_at).label("date")
     stmt = (
@@ -389,13 +392,24 @@ async def usage_report(
             date_col,
             LLMUsage.stage,
             LLMUsage.model,
+            LLMUsage.provider_name,
             func.sum(LLMUsage.prompt_tokens).label("prompt_tokens"),
             func.sum(LLMUsage.completion_tokens).label("completion_tokens"),
             func.count().label("calls"),
+            func.sum(LLMUsage.cache_read_tokens).label("cache_read_tokens"),
+            func.sum(LLMUsage.cache_creation_tokens).label("cache_creation_tokens"),
+            func.sum(case((and_(
+                LLMUsage.cache_read_tokens.is_not(None),
+                LLMUsage.cache_creation_tokens.is_not(None),
+            ), 1), else_=0)).label("cache_reported_calls"),
+            func.sum(case((LLMUsage.usage_estimated.is_(True), 1), else_=0))
+            .label("estimated_calls"),
+            func.count(LLMUsage.cost_usd).label("priced_calls"),
+            func.sum(LLMUsage.cost_usd).label("cost_usd"),
         )
         .where(LLMUsage.created_at >= since)
-        .group_by(date_col, LLMUsage.stage, LLMUsage.model)
-        .order_by(date_col.desc(), LLMUsage.stage, LLMUsage.model)
+        .group_by(date_col, LLMUsage.stage, LLMUsage.model, LLMUsage.provider_name)
+        .order_by(date_col.desc(), LLMUsage.stage, LLMUsage.model, LLMUsage.provider_name)
     )
     if project_id is not None:
         stmt = stmt.where(LLMUsage.project_id == project_id)
@@ -410,6 +424,13 @@ async def usage_report(
             "prompt_tokens": int(row.prompt_tokens or 0),
             "completion_tokens": int(row.completion_tokens or 0),
             "calls": int(row.calls),
+            "provider_name": row.provider_name,
+            "cache_read_tokens": int(row.cache_read_tokens or 0),
+            "cache_creation_tokens": int(row.cache_creation_tokens or 0),
+            "cache_reported_calls": int(row.cache_reported_calls or 0),
+            "estimated_calls": int(row.estimated_calls or 0),
+            "priced_calls": int(row.priced_calls),
+            "cost_usd": row.cost_usd,
         }
         for row in rows
     ]

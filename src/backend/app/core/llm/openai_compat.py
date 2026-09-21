@@ -34,6 +34,7 @@ from app.core.llm.base import (
     ToolUseStop,
     normalize_finish_reason,
 )
+from app.core.llm.usage import normalize_openai_chat_usage
 
 logger = logging.getLogger("polaris.llm")
 
@@ -47,10 +48,15 @@ _FORCE_STREAM_MARKER = "stream must be set to true"
 # LiteLLM 之类的中转会把 UnsupportedParamsError 包成 400 之外的状态码抛出来，
 # 所以这里只认错误内容、不认状态码；调用方已保证"本次确实发了该参数"。
 _EFFORT_REJECT_MARKERS = ("reasoning_effort", "reasoning.effort", "effort")
+_STREAM_USAGE_REJECT_MARKERS = ("stream_options", "stream options", "include_usage")
 
 
 class _EffortUnsupported(RuntimeError):
     """服务端明确因 reasoning_effort 拒绝了请求；调用方去掉该参数重试。"""
+
+
+class _StreamUsageUnsupported(RuntimeError):
+    """服务端明确不支持请求流式 usage；调用方去掉选项重试。"""
 
 
 #: 中转/本地推理服务不支持 tools 时的说法。命中就降级回无工具的一次性问答，
@@ -74,6 +80,12 @@ def _rejects_effort(body: str) -> bool:
     """错误信息提到 effort —— 仅在本次确实发了该参数时才做此判断。"""
     low = body.lower()
     return any(marker in low for marker in _EFFORT_REJECT_MARKERS)
+
+
+def _rejects_stream_usage(body: str) -> bool:
+    """只在错误正文明确点名 stream_options/include_usage 时降级。"""
+    low = body.lower()
+    return any(marker in low for marker in _STREAM_USAGE_REJECT_MARKERS)
 
 
 _MATRYOSHKA_UNSUPPORTED_MARKER = "does not support matryoshka representation"
@@ -318,6 +330,9 @@ class OpenAICompatProvider(LLMProvider):
             "messages": payload_messages,
             "stream": stream,
         }
+        if stream:
+            # OpenAI-compatible streams otherwise omit the final usage chunk.
+            payload["stream_options"] = {"include_usage": True}
         if temperature is not None:  # 新款 Claude 等模型已弃用该参数，None 则不发送
             payload["temperature"] = temperature
         if effort is not None and model not in self._effort_unsupported:
@@ -398,7 +413,13 @@ class OpenAICompatProvider(LLMProvider):
                 logger.info(
                     "openai_compat %s 仅支持流式，自动改用流式聚合：%s", self._base_url, model
                 )
-                return await self._complete_via_stream({**payload, "stream": True})
+                return await self._complete_via_stream(
+                    {
+                        **payload,
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                    }
+                )
             raise RuntimeError(f"openai_compat {resp.status_code} from {self._base_url}: {body}")
         data = resp.json()
         choice = data["choices"][0]
@@ -419,7 +440,7 @@ class OpenAICompatProvider(LLMProvider):
             content=text,
             model=data.get("model", model),
             finish_reason=normalize_finish_reason(choice.get("finish_reason")),
-            usage=data.get("usage") or {},
+            usage=normalize_openai_chat_usage(data.get("usage")),
             blocks=tuple(blocks),
         )
 
@@ -437,6 +458,8 @@ class OpenAICompatProvider(LLMProvider):
             if resp.status_code >= 400:
                 # 流式响应体要显式读出来才能看到错误内容
                 body = (await resp.aread()).decode(errors="replace")[:500]
+                if payload.get("stream_options") is not None and _rejects_stream_usage(body):
+                    raise _StreamUsageUnsupported(body)
                 if payload.get("reasoning_effort") is not None and _rejects_effort(body):
                     raise _EffortUnsupported(body)
                 if resp.status_code == 400 and _tools_unsupported(body):
@@ -458,27 +481,37 @@ class OpenAICompatProvider(LLMProvider):
 
     async def _complete_via_stream(self, payload: dict[str, Any]) -> CompletionResult:
         """流式聚合：拼接所有 delta.content；usage 取带 usage 的 chunk（通常最后一个）。"""
-        parts: list[str] = []
-        usage: dict[str, int] = {}
-        model_name: str = payload["model"]
-        finish_reason: str | None = None
-        async for data in self._stream_chunks(payload):
-            if data.get("model"):
-                model_name = data["model"]
-            choices = data.get("choices") or []
-            if choices:
-                if content := (choices[0].get("delta") or {}).get("content"):
-                    parts.append(content)
-                if reason := choices[0].get("finish_reason"):
-                    finish_reason = reason
-            if data.get("usage"):
-                usage = data["usage"]
-        return CompletionResult(
-            content="".join(parts),
-            model=model_name,
-            finish_reason=finish_reason,
-            usage=usage,
-        )
+        while True:
+            parts: list[str] = []
+            usage: dict[str, int] = {}
+            model_name: str = payload["model"]
+            finish_reason: str | None = None
+            try:
+                async for data in self._stream_chunks(payload):
+                    if data.get("model"):
+                        model_name = data["model"]
+                    choices = data.get("choices") or []
+                    if choices:
+                        if content := (choices[0].get("delta") or {}).get("content"):
+                            parts.append(content)
+                        if reason := choices[0].get("finish_reason"):
+                            finish_reason = reason
+                    if data.get("usage") is not None:
+                        usage = normalize_openai_chat_usage(data["usage"])
+            except _StreamUsageUnsupported as exc:
+                logger.warning(
+                    "模型 %s 的网关不支持流式 usage，已去掉 stream_options 重试：%s",
+                    payload["model"],
+                    exc,
+                )
+                payload = {key: value for key, value in payload.items() if key != "stream_options"}
+                continue
+            return CompletionResult(
+                content="".join(parts),
+                model=model_name,
+                finish_reason=finish_reason,
+                usage=usage,
+            )
 
     async def stream(
         self,
@@ -529,21 +562,32 @@ class OpenAICompatProvider(LLMProvider):
             tools=tools,
             tool_choice=tool_choice,
         )
-        emitted = False
-        try:
-            async for ev in self._events_from(payload):
-                emitted = emitted or isinstance(ev, TextDelta | ToolUseStart)
-                yield ev
-        except _EffortUnsupported as e:
-            # effort 是在首个 token 之前被拒的，重试不会重复输出。
-            # 判据里必须带上 ToolUseStart：已经发起过工具调用还重试，会重复调用 + 双倍计费。
-            if emitted:
-                raise
-            self._effort_unsupported.add(model)
-            logger.warning("模型 %s 不支持 effort=%s，已去掉该参数重试：%s", model, effort, e)
-            payload.pop("reasoning_effort", None)
-            async for ev in self._events_from(payload):
-                yield ev
+        while True:
+            emitted = False
+            try:
+                async for ev in self._events_from(payload):
+                    emitted = emitted or isinstance(ev, TextDelta | ToolUseStart)
+                    yield ev
+                return
+            except _EffortUnsupported as exc:
+                # effort 是在首个 token 之前被拒的，重试不会重复输出。
+                # 判据里必须带上 ToolUseStart：已经发起过工具调用还重试，会重复调用 + 双倍计费。
+                if emitted:
+                    raise
+                self._effort_unsupported.add(model)
+                logger.warning(
+                    "模型 %s 不支持 effort=%s，已去掉该参数重试：%s", model, effort, exc
+                )
+                payload.pop("reasoning_effort", None)
+            except _StreamUsageUnsupported as exc:
+                if emitted:
+                    raise
+                logger.warning(
+                    "模型 %s 的网关不支持流式 usage，已去掉 stream_options 重试：%s",
+                    model,
+                    exc,
+                )
+                payload.pop("stream_options", None)
 
     async def _events_from(self, payload: dict[str, Any]) -> AsyncIterator[StreamEvent]:
         """一个 chunk 一个 chunk 地翻成结构化事件。
@@ -555,8 +599,8 @@ class OpenAICompatProvider(LLMProvider):
         usage: dict[str, int] = {}
         open_indexes: set[int] = set()
         async for data in self._stream_chunks(payload):
-            if data.get("usage"):
-                usage = data["usage"]
+            if data.get("usage") is not None:
+                usage = normalize_openai_chat_usage(data["usage"])
             choices = data.get("choices") or []
             if not choices:
                 continue

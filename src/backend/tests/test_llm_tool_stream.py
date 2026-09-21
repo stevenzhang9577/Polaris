@@ -314,7 +314,12 @@ async def test_anthropic_custom_base_url(
                 "content": [{"type": "text", "text": "pong"}],
                 "model": "m",
                 "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "usage": {
+                    "input_tokens": 1,
+                    "cache_read_input_tokens": 4,
+                    "cache_creation_input_tokens": 2,
+                    "output_tokens": 1,
+                },
             },
         )
 
@@ -330,6 +335,13 @@ async def test_anthropic_custom_base_url(
 
     assert seen == {"url": expected_url, "api_key": "k"}
     assert result.content == "pong"
+    assert result.usage == {
+        "prompt_tokens": 7,
+        "completion_tokens": 1,
+        "total_tokens": 8,
+        "cache_read_tokens": 4,
+        "cache_creation_tokens": 2,
+    }
 
 
 @pytest.mark.asyncio
@@ -341,7 +353,16 @@ async def test_anthropic_tool_use_blocks_and_usage():
     """
     provider = _anthropic_provider(
         [
-            {"type": "message_start", "message": {"usage": {"input_tokens": 120}}},
+            {
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 120,
+                        "cache_read_input_tokens": 80,
+                        "cache_creation_input_tokens": 20,
+                    }
+                },
+            },
             {
                 "type": "content_block_start",
                 "index": 0,
@@ -377,7 +398,13 @@ async def test_anthropic_tool_use_blocks_and_usage():
     done = events[-1]
     assert isinstance(done, StreamDone)
     assert done.finish_reason == "tool_use"
-    assert done.usage["prompt_tokens"] == 120 and done.usage["completion_tokens"] == 45
+    assert done.usage == {
+        "prompt_tokens": 220,
+        "completion_tokens": 45,
+        "total_tokens": 265,
+        "cache_read_tokens": 80,
+        "cache_creation_tokens": 20,
+    }
 
 
 @pytest.mark.asyncio
