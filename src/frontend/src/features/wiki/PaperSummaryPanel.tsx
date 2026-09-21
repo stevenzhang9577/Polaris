@@ -5,6 +5,7 @@ import { ConfirmModal } from '../../components/ui/ConfirmModal';
 import { Modal } from '../../components/ui/Modal';
 import { toast } from '../../components/ui/Toast';
 import { ApiError, api, type PaperSummaryRevision } from '../../lib/api';
+import { latestSummaryFailure, summaryErrorLabel, summaryModelLabel, summaryUtcTime } from './summaryStatus';
 import { fmtTime } from '../../lib/format';
 import { tr } from '../../lib/i18n';
 import { localOrigin } from '../../lib/endpoint';
@@ -40,6 +41,7 @@ export function isSummaryRevisionInFlight(revision: PaperSummaryRevision): boole
 }
 
 function sourceLabel(revision: PaperSummaryRevision): string {
+  if (revision.status === 'queued' || (revision.status === 'generating' && ['materialize', 'parse'].includes(revision.stage ?? 'materialize'))) return tr('来源待确认', 'Source pending');
   if (revision.source_level === 'fulltext') return tr('全文级', 'Full text');
   if (revision.source_level === 'abstract') return tr('摘要级', 'Abstract only');
   if (revision.source_level === 'obsidian') {
@@ -86,7 +88,7 @@ export function PaperSummaryPanel({ paperId, libraryId, canManage }: { paperId: 
   const compareRevision = history.data?.find((revision) => revision.id === compareRevisionId);
   const readyHistory = history.data?.filter((revision) => revision.status === 'ready' || revision.status === 'stale') ?? [];
   const softDeleted = current.error instanceof ApiError && current.error.status === 404 && readyHistory.some((revision) => revision.is_current);
-  const latestFailure = history.data?.find((revision) => revision.status === 'failed');
+  const latestFailure = latestSummaryFailure(history.data ?? []);
   const initialLoading = current.isLoading || history.isLoading;
   const loadFailed = history.isError || (current.isError && !currentMissing);
 
@@ -243,7 +245,7 @@ export function PaperSummaryPanel({ paperId, libraryId, canManage }: { paperId: 
       {!running && latestFailure && (
         <div style={{ marginTop: 10, padding: '8px 10px', border: '1px solid var(--danger)', borderRadius: 8, color: 'var(--danger-tx)', fontSize: 11.5 }}>
           {tr('最近一次生成失败', 'The latest generation failed')}
-          {latestFailure.error_detail ? `：${latestFailure.error_detail}` : ''}
+          {latestFailure.error_code ? `：${summaryErrorLabel(latestFailure.error_code)}` : ''}
         </div>
       )}
 
@@ -253,16 +255,16 @@ export function PaperSummaryPanel({ paperId, libraryId, canManage }: { paperId: 
             <div key={revision.id} className="row gap8" style={{ padding: '8px 0', borderBottom: '0.5px solid var(--border)', alignItems: 'center' }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="row gap6 wrap" style={{ fontSize: 11.5 }}>
-                  <span className="mono">{fmtTime(revision.created_at)}</span>
+                  <span className="mono">{fmtTime(summaryUtcTime(revision.created_at))}</span>
                   <span className="pill sm">{sourceLabel(revision)}</span>
-                  <span className="pill sm">{revisionStatusLabel(revision.status)}</span>
+                  <span className="pill sm">{revision.error_code === 'SUMMARY_CANCELLED' ? tr('已取消', 'Cancelled') : revisionStatusLabel(revision.status)}</span>
                   {revision.is_current && <span style={{ color: 'var(--accent-text)' }}>{tr('当前', 'Current')}</span>}
                 </div>
                 <div className="muted" style={{ marginTop: 4, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {revision.model ?? tr('未知模型', 'Unknown model')}{revision.tldr ? ` · ${revision.tldr}` : ''}
+                  {summaryModelLabel(revision)}{revision.tldr ? ` · ${revision.tldr}` : ''}
                 </div>
                 {revision.status === 'failed' && revision.error_detail && (
-                  <div style={{ marginTop: 4, fontSize: 11, color: 'var(--danger-tx)' }}>{revision.error_detail}</div>
+                  <div style={{ marginTop: 4, fontSize: 11, color: 'var(--danger-tx)' }}>{summaryErrorLabel(revision.error_code ?? revision.error_detail ?? 'SUMMARY_GENERATION_FAILED')}</div>
                 )}
               </div>
               {!revision.is_current && revision.content && activeRevision?.content && (

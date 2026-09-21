@@ -9,6 +9,7 @@
 
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.llm.base import Message
+from app.core.llm.base import CompletionResult, Message
 from app.core.llm.router import LLMRouter, get_llm_router
 from app.models.paper import Paper
 from app.models.paper_assets import PaperAsset
@@ -187,6 +188,7 @@ async def compile_paper(
     source_text: str | None = None,
     source_level: str | None = None,
     include_figures: bool = True,
+    on_response: Callable[[CompletionResult], Awaitable[None]] | None = None,
 ) -> CompiledWiki:
     """图文编译一篇论文，返回校验过标记的 wiki markdown 与所用模型（调用方负责落库）。
 
@@ -243,6 +245,8 @@ async def compile_paper(
             library_id=library_id,
             voyage_id=voyage_id,
         )
+        if on_response is not None:
+            await on_response(result)
         if not result.content.strip():
             raise ValueError("librarian returned empty content")
         body = result.content

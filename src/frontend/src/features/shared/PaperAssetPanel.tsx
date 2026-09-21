@@ -57,6 +57,8 @@ export function parseStateMeta(status?: string | null): AssetStateMeta {
 
 export function vectorStateMeta(state?: string | null): AssetStateMeta {
   switch (state) {
+    case 'unconfigured':
+      return { label: tr('未配置模型', 'Model not configured'), tone: 'warning' };
     case 'ready':
       return { label: tr('已完成', 'Ready'), tone: 'success' };
     case 'building':
@@ -200,8 +202,10 @@ export function PaperAssetPanel({
   const version = versionQuery.data ?? null;
   const parseMeta = parseStateMeta(version?.status);
   const parsing = Boolean(version && ACTIVE_PARSE_STATES.has(version.status));
-  const documentVector = vectorStateMeta(version?.document_vector_state);
-  const chunkVector = vectorStateMeta(version?.chunk_vector_state);
+  const embeddingMissing = version?.error_code === 'EMBEDDING_NOT_CONFIGURED'
+    || (version?.error_code === 'VECTOR_BUILD_FAILED' && version.error_detail?.includes('no embedding model configured'));
+  const documentVector = vectorStateMeta(embeddingMissing ? 'unconfigured' : version?.document_vector_state);
+  const chunkVector = vectorStateMeta(embeddingMissing ? 'unconfigured' : version?.chunk_vector_state);
 
   return (
     <section
@@ -239,8 +243,8 @@ export function PaperAssetPanel({
       </div>
 
       {version?.error_code && (
-        <div style={{ marginTop: 10, color: 'var(--danger-tx)', fontSize: 11.5 }}>
-          {version.error_code}{version.error_detail ? ` · ${version.error_detail}` : ''}
+        <div style={{ marginTop: 10, color: embeddingMissing ? 'var(--warn-tx)' : 'var(--danger-tx)', fontSize: 11.5 }}>
+          {embeddingMissing ? <>{tr('尚未配置向量嵌入模型；语义检索暂不可用，已解析的全文仍可用于阅读和总结。', 'No embedding model is configured. Semantic search is unavailable; parsed full text remains usable for reading and summaries.')} <a href="/settings?tab=llm">{tr('配置向量模型', 'Configure embeddings')}</a></> : <>{version.error_code}{version.error_detail ? ` · ${version.error_detail}` : ''}</>}
         </div>
       )}
 

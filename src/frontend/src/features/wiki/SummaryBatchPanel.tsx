@@ -43,6 +43,8 @@ export function summaryBatchItemLabel(item: SummaryBatchItem): string {
 
 export function summaryBatchErrorLabel(code: string): string {
   const labels: Record<string, [string, string]> = {
+    LLM_PROVIDER_PROTOCOL_MISMATCH: ['网关返回格式与配置协议不符；任务已暂停，请检查供应商地址与协议', 'Gateway protocol mismatch. The batch was paused; check the provider URL and protocol.'],
+    LLM_EMPTY_RESPONSE: ['模型未返回正文；任务已暂停，请检查供应商响应', 'The model returned no text. The batch was paused; check the provider response.'],
     LLM_NOT_CONFIGURED: ['尚未配置可用的模型；任务已暂停，请完成模型配置后重试失败项', 'No model is configured. The batch was paused; configure a model and retry failed items.'],
     LLM_PROVIDER_TIMEOUT: ['模型服务响应超时；任务已暂停，请检查服务后重试失败项', 'The model service timed out. The batch was paused; check it and retry failed items.'],
     LLM_PROVIDER_UNAVAILABLE: ['模型服务无法连接；任务已暂停，请启动或检查模型服务后重试失败项', 'The model service could not be reached. The batch was paused; start or check it and retry failed items.'],

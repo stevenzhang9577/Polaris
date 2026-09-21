@@ -148,6 +148,9 @@ class TestModelResult(BaseModel):
 
 
 class UsageRow(BaseModel):
+    requested_model: str | None = None
+    pricing_model: str | None = None
+    response_error: str | None = None
     id: str | None = None
     occurred_at: datetime | None = None
     reference_cost_usd: Decimal | None = None

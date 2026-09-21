@@ -143,6 +143,8 @@ class CompletionResult:
     finish_reason: str | None = None
     usage: dict[str, int] = field(default_factory=dict)  # prompt_tokens/completion_tokens/...
     blocks: tuple[ContentBlock, ...] = ()
+    requested_model: str | None = None
+    provider_name: str | None = None
 
     @property
     def tool_calls(self) -> tuple[ToolUseBlock, ...]:
@@ -227,6 +229,18 @@ def normalize_finish_reason(raw: str | None) -> str | None:
     if raw in ("stop", "end_turn", "stop_sequence"):
         return "stop"
     return raw
+
+
+class ProviderProtocolError(RuntimeError):
+    """A successful HTTP response did not use the configured provider protocol."""
+
+    def __init__(self, requested_model: str, response_model: str | None = None,
+                 usage: dict[str, int] | None = None):
+        super().__init__("LLM_PROVIDER_PROTOCOL_MISMATCH: expected Anthropic Messages response")
+        self.provider_name: str | None = None
+        self.requested_model = requested_model
+        self.response_model = response_model
+        self.usage = usage or {}
 
 
 class ToolsUnsupportedError(RuntimeError):

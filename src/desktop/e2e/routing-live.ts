@@ -28,18 +28,19 @@ async function main() {
   const apiOrigin = `http://127.0.0.1:${apiPort}`;
   const webOrigin = `http://127.0.0.1:${webPort}`;
   const seen: string[] = [];
+  let wrongProtocol = false;
   const upstream = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     const request = JSON.parse(Buffer.concat(chunks).toString());
     seen.push(request.model);
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(req.url?.endsWith('/messages') ? {
+    res.end(JSON.stringify(req.url?.endsWith('/messages') && !wrongProtocol ? {
       id: 'msg-fixture', type: 'message', role: 'assistant', model: request.model,
       content: [{ type: 'text', text: 'routing verified' }], stop_reason: 'end_turn',
       usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
     } : {
-      id: 'chat-fixture', model: request.model,
+      id: 'chat-fixture', model: wrongProtocol ? 'glm-5.3-flash' : request.model,
       choices: [{ message: { role: 'assistant', content: 'routing verified' }, finish_reason: 'stop' }],
       usage: { prompt_tokens: 10, completion_tokens: 2, prompt_tokens_details: { cached_tokens: 0 } },
     }));
@@ -117,6 +118,23 @@ async function main() {
     assert.equal(usage.items[0].provider_name, 'Claude Code');
     assert.equal(usage.items[0].model, 'kimi-k3[1M]');
     await page.screenshot({ path: join(artifacts, 'saved-route.png'), fullPage: true });
+    wrongProtocol = true;
+    const failed = await fetch(`${apiOrigin}/api/test-routing/call`, { method: 'POST', headers });
+    assert.equal(failed.status, 502);
+    assert.deepEqual(await failed.json(), { code: 'LLM_PROVIDER_PROTOCOL_MISMATCH', requested: 'kimi-k3[1M]', returned: 'glm-5.3-flash' });
+    const failureUsage = (await api('/users/me/usage/calls')).items[0];
+    assert.equal(failureUsage.requested_model, 'kimi-k3[1M]');
+    assert.equal(failureUsage.model, 'glm-5.3-flash');
+    assert.equal(failureUsage.completion_tokens, 2);
+    assert.equal(failureUsage.cost_usd, null);
+    const probe = await api('/admin/llm/test-model', 'POST', { provider_id: newProvider.id, model: 'kimi-k3[1M]', capability: 'chat' });
+    assert.equal(probe.ok, false);
+    assert(probe.error.includes('LLM_PROVIDER_PROTOCOL_MISMATCH'));
+    await page.goto(`${webOrigin}/e2e/llm-usage.html`);
+    await page.getByText('返回：glm-5.3-flash', { exact: true }).waitFor();
+    await page.getByText('请求：kimi-k3[1M]', { exact: true }).first().waitFor();
+    await page.getByText('响应协议不匹配', { exact: true }).waitFor();
+    await page.screenshot({ path: join(artifacts, 'request-response-provenance.png'), fullPage: true });
     console.log(JSON.stringify({ ok: true, seen, persisted: routes[0].model, artifacts }));
   } finally {
     await browser?.close();

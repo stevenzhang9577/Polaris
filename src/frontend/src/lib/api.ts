@@ -840,6 +840,9 @@ export interface LlmTestResult {
 }
 
 export interface LlmUsageRow {
+  requested_model?: string | null;
+  pricing_model?: string | null;
+  response_error?: string | null;
   id?: string | null;
   occurred_at?: string | null;
   reference_cost_usd?: string | null;
@@ -1179,6 +1182,8 @@ export type PaperSummaryStatus = 'queued' | 'generating' | 'ready' | 'failed' | 
 
 /** 一次不可变的论文解读修订；PaperWiki 只保存当前指针与兼容缓存。 */
 export interface PaperSummaryRevision {
+  requested_model?: string | null;
+  provider_name?: string | null;
   id: string;
   paper_id: string;
   content_version_id: string | null;

@@ -350,7 +350,13 @@ async def probe_model(
                     raise RuntimeError("provider did not return the required tool call")
             else:
                 messages = [Message(role="user", content="ping")]
-                await llm.complete(messages, model=model, max_tokens=8)
+                result = await llm.complete(messages, model=model, max_tokens=8)
+                from app.services.cc_switch_pricing import canonical_model
+
+                if canonical_model(result.model) != canonical_model(model):
+                    raise RuntimeError(
+                        f"LLM_MODEL_MISMATCH: requested {model}; returned {result.model}"
+                    )
         ok = True
     except TimeoutError:
         error = f"timeout after {_TEST_TIMEOUT_S:.0f}s"
@@ -464,12 +470,16 @@ async def usage_calls(session, *, user_id=None, days=30, model=None, offset=0, l
     )
     rows = []
     for call in calls:
+        snapshot = call.pricing_snapshot or {}
         stamp = call.created_at
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=UTC)
         rows.append(dict(
             id=str(call.id), occurred_at=stamp.isoformat(), date=stamp.date().isoformat(),
             stage=call.stage, model=call.model, provider_name=call.provider_name,
+            requested_model=snapshot.get("model"),
+            pricing_model=snapshot.get("model") if snapshot.get("rates") else None,
+            response_error=snapshot.get("response_error"),
             prompt_tokens=call.prompt_tokens, completion_tokens=call.completion_tokens,
             cache_read_tokens=call.cache_read_tokens or 0,
             cache_creation_tokens=call.cache_creation_tokens or 0,
