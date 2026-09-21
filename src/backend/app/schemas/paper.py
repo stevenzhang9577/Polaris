@@ -141,6 +141,8 @@ class PaperSummaryRevisionRead(BaseModel):
     content: str | None
     tldr: str | None
     model: str | None
+    requested_model: str | None = None
+    provider_name: str | None = None
     prompt_version: str | None
     schema_version: str | None
     created_by: uuid.UUID | None

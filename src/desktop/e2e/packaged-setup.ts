@@ -63,6 +63,11 @@ async function main() {
       'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute("PRAGMA journal_mode").fetchone()[0]); print(c.execute("PRAGMA quick_check").fetchone()[0])',
       join(data, 'engine/polaris.db')], { encoding: 'utf8' }).trim();
     assert.equal(journal, 'wal\nok', 'packaged backend must enable WAL on a healthy database');
+    const provenanceColumns = JSON.parse(execFileSync(python, ['-c',
+      'import sqlite3,sys,json; c=sqlite3.connect(sys.argv[1]); print(json.dumps([r[1] for r in c.execute("PRAGMA table_info(paper_wiki_revisions)")]))',
+      join(data, 'engine/polaris.db')], { encoding: 'utf8' })) as string[];
+    assert(provenanceColumns.includes('requested_model') && provenanceColumns.includes('provider_name'));
+    console.log('PASS: packaged summary provenance migration applied');
     console.log('PASS: packaged backend enabled WAL; database quick_check is ok');
     console.log('PASS: packaged first choice, local installation, session and two Zotero buttons');
     await close();

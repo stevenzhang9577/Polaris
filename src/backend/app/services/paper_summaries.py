@@ -26,6 +26,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.config import get_settings
 from app.core.db import get_sessionmaker
+from app.core.llm.base import CompletionResult, ProviderProtocolError
 from app.models.base import utcnow
 from app.models.paper import (
     SUMMARY_SOURCE_LEVELS,
@@ -50,12 +51,18 @@ RETRYABLE_SUMMARY_ERROR_CODES = frozenset(
         "LLM_PROVIDER_TIMEOUT",
         "LLM_PROVIDER_UNAVAILABLE",
         "LLM_PROVIDER_REQUEST_FAILED",
+        "LLM_PROVIDER_PROTOCOL_MISMATCH",
+        "LLM_EMPTY_RESPONSE",
     }
 )
 
 
 def summary_failure_code(exc: Exception) -> str:
     """Return a stable, non-sensitive code that can guide batch recovery."""
+    if isinstance(exc, ProviderProtocolError):
+        return "LLM_PROVIDER_PROTOCOL_MISMATCH"
+    if "librarian returned empty content" in str(exc):
+        return "LLM_EMPTY_RESPONSE"
     name = type(exc).__name__
     detail = f"{name}: {exc}".lower()
     if name == "PendingRollbackError":
@@ -621,6 +628,11 @@ async def generate_queued_revision(
         raise SummaryNotFoundError(str(revision.paper_id))
 
     try:
+        from app.core.llm.router import get_llm_router
+
+        _, requested_route = await get_llm_router().resolve("librarian", user_id)
+        revision.requested_model = requested_route.model
+        revision.provider_name = requested_route.provider_name
         revision.status = "generating"
         revision.stage = "materialize"
         revision.error_code = None
@@ -657,10 +669,23 @@ async def generate_queued_revision(
         await session.commit()
 
         source = await current_summary_source(session, paper, library_id=library_id)
+        revision.source_level = source.source_level
+        revision.content_version_id = source.content_version_id
         revision.stage = "compile"
         await session.commit()
 
         from app.services.wiki_compile import compile_paper
+
+        async def record_response(result: CompletionResult) -> None:
+            # Persist provenance even when the response is empty or validation fails.
+            attempt = await session.get(PaperWikiRevision, revision_id, populate_existing=True)
+            assert attempt is not None
+            if attempt.error_code == "SUMMARY_CANCELLED":
+                raise asyncio.CancelledError
+            attempt.model = result.model or None
+            attempt.provider_name = result.provider_name or attempt.provider_name
+            attempt.requested_model = result.requested_model or attempt.requested_model
+            await session.commit()
 
         compiled = await compile_paper(
             paper,
@@ -671,6 +696,7 @@ async def generate_queued_revision(
             source_text=source.text,
             source_level=source.source_level,
             include_figures=False,
+            on_response=record_response,
         )
         revision = await session.get(PaperWikiRevision, revision_id, populate_existing=True)
         assert revision is not None
@@ -754,8 +780,16 @@ async def generate_queued_revision(
     except Exception as exc:
         logger.exception("paper summary generation failed for %s", revision_id)
         await session.rollback()
-        failed = await session.get(PaperWikiRevision, revision_id)
-        if failed is not None and failed.status not in _ACTIVATABLE_REVISION_STATUSES:
+        failed = await session.get(PaperWikiRevision, revision_id, populate_existing=True)
+        if (
+            failed is not None
+            and failed.status not in _ACTIVATABLE_REVISION_STATUSES
+            and failed.error_code != "SUMMARY_CANCELLED"
+        ):
+            if isinstance(exc, ProviderProtocolError):
+                failed.requested_model = exc.requested_model
+                failed.model = exc.response_model
+                failed.provider_name = exc.provider_name or failed.provider_name
             failed.status = "failed"
             failed.stage = None
             failed.error_code = summary_failure_code(exc)

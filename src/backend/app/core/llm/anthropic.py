@@ -19,6 +19,7 @@ from app.core.llm.base import (
     LLMProvider,
     Message,
     OpaqueProviderStateBlock,
+    ProviderProtocolError,
     StreamDone,
     StreamEvent,
     TextBlock,
@@ -32,7 +33,7 @@ from app.core.llm.base import (
     ToolUseStop,
     normalize_finish_reason,
 )
-from app.core.llm.usage import normalize_anthropic_usage
+from app.core.llm.usage import normalize_anthropic_usage, normalize_openai_chat_usage
 
 logger = logging.getLogger("polaris.llm")
 
@@ -261,6 +262,12 @@ class AnthropicProvider(LLMProvider):
             )
         resp.raise_for_status()
         data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("content"), list):
+            raw = data if isinstance(data, dict) else {}
+            raise ProviderProtocolError(
+                model, raw.get("model"),
+                normalize_openai_chat_usage(raw.get("usage")) if "choices" in raw else {},
+            )
         blocks: list[ContentBlock] = []
         texts: list[str] = []
         for raw in data.get("content", []):
@@ -340,16 +347,29 @@ class AnthropicProvider(LLMProvider):
         )
         usage: dict[str, Any] = {}
         finish_reason: str | None = None
+        saw_message = False
         async with self._client.stream(
             "POST", self._api_url, headers=self._headers(), json=payload
         ) as resp:
             resp.raise_for_status()
+            if "application/json" in resp.headers.get("content-type", ""):
+                raw = json.loads(await resp.aread())
+                raise ProviderProtocolError(
+                    model, raw.get("model"),
+                    normalize_openai_chat_usage(raw.get("usage")) if "choices" in raw else {},
+                )
             async for line in resp.aiter_lines():
                 if not line.startswith("data:"):
                     continue
                 event = json.loads(line[len("data:") :].strip())
+                if "choices" in event:
+                    raise ProviderProtocolError(model, event.get("model"),
+                                                normalize_openai_chat_usage(event.get("usage")))
                 kind = event.get("type")
+                if kind in {"content_block_start", "content_block_delta", "message_delta"}:
+                    saw_message = True
                 if kind == "message_start":
+                    saw_message = True
                     usage.update((event.get("message") or {}).get("usage") or {})
                 elif kind == "content_block_start":
                     block = event.get("content_block") or {}
@@ -378,6 +398,8 @@ class AnthropicProvider(LLMProvider):
                     usage.update(event.get("usage") or {})
                     if reason := (event.get("delta") or {}).get("stop_reason"):
                         finish_reason = reason
+        if not saw_message:
+            raise ProviderProtocolError(model)
         yield StreamDone(
             finish_reason=normalize_finish_reason(finish_reason), usage=_normalize_usage(usage)
         )

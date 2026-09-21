@@ -27,6 +27,7 @@ from app.core.llm.base import (
     EffortLevel,
     LLMProvider,
     Message,
+    ProviderProtocolError,
     StreamDone,
     StreamEvent,
     TextDelta,
@@ -618,6 +619,7 @@ class LLMRouter:
         voyage_id: uuid.UUID | None,
         library_id: uuid.UUID | None = None,
         route: ResolvedRoute | None = None,
+        response_error: str | None = None,
     ) -> None:
         from app.models.llm_config import LLMUsage
 
@@ -637,12 +639,15 @@ class LLMRouter:
                         cache_read_tokens=usage.get("cache_read_tokens"),
                         cache_creation_tokens=usage.get("cache_creation_tokens"),
                         usage_estimated=bool(usage.get("usage_estimated", 1)),
-                        cost_usd=estimate_cost(usage, route.pricing if route else None),
+                        cost_usd=estimate_cost(
+                            usage, route.pricing if route and not response_error else None
+                        ),
                         pricing_snapshot={
                             "model": route.model,
                             "currency": "USD",
-                            "rates": route.pricing,
-                        } if route and route.pricing is not None else None,
+                            "rates": route.pricing if not response_error else None,
+                            **({"response_error": response_error} if response_error else {}),
+                        } if route else None,
                     )
                 )
                 await session.commit()
@@ -782,6 +787,15 @@ class LLMRouter:
                     messages, model=route.model, temperature=temp, max_tokens=max_tokens, **extra
                 )
         except Exception as e:
+            if isinstance(e, ProviderProtocolError):
+                e.provider_name = route.provider_name
+            if isinstance(e, ProviderProtocolError) and e.usage:
+                await self._record_usage(
+                    route=route, stage=stage, model=e.response_model or route.model,
+                    usage={**e.usage, "usage_estimated": 0}, user_id=user_id,
+                    project_id=project_id, voyage_id=voyage_id, library_id=library_id,
+                    response_error="LLM_PROVIDER_PROTOCOL_MISMATCH",
+                )
             if log_enabled:
                 await self._log_call(
                     stage=stage,
@@ -800,6 +814,8 @@ class LLMRouter:
                 )
             raise
         accounting_usage = self._ensure_usage(messages, result.content, result.usage)
+        result.requested_model = route.model
+        result.provider_name = route.provider_name
         await self._record_usage(
             route=route,
             stage=stage,

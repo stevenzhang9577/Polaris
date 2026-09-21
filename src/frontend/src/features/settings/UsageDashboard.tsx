@@ -197,7 +197,13 @@ function UsageCalls({ scope, days, model }: { scope: 'personal' | 'platform'; da
           <th>{tr('输入', 'Input')}</th><th>{tr('输出', 'Output')}</th><th>{tr('缓存读 / 写', 'Cache read / write')}</th><th>{tr('命中率', 'Hit rate')}</th><th>{tr('调用', 'Calls')}</th><th>USD</th></tr></thead>
         <tbody>{query.data?.items.map(row => <tr key={row.id}>
           <td className="mono" style={{ whiteSpace: 'nowrap' }}>{fmtFullTime(row.occurred_at)}</td>
-          <td>{tr(stageLabel(row.stage).zh, stageLabel(row.stage).en)}</td><td>{row.provider_name ?? tr('历史未记录', 'Not recorded historically')}</td><td className="mono">{row.model}</td><UsageCells usage={row} />
+          <td>{tr(stageLabel(row.stage).zh, stageLabel(row.stage).en)}</td><td>{row.provider_name ?? tr('历史未记录', 'Not recorded historically')}</td><td className="mono">
+            <div>{tr('返回：', 'Returned: ')}{row.model}</div>
+            {row.requested_model && <div className="muted">{tr('请求：', 'Requested: ')}{row.requested_model}</div>}
+            {row.requested_model && row.requested_model !== row.model && <div style={{ color: 'var(--warn-tx)' }}>{tr('请求与返回名称不同，请核对网关映射', 'Request and response names differ; check gateway mapping')}</div>}
+            {row.pricing_model && <div className="muted">{tr('计价依据：', 'Price basis: ')}{row.pricing_model}</div>}
+            {row.response_error && <div style={{ color: 'var(--danger-tx)' }}>{tr('响应协议不匹配', 'Response protocol mismatch')}</div>}
+          </td><UsageCells usage={row} />
         </tr>)}</tbody>
       </table></div>}
     <div className="row gap8" style={{ marginTop: 12 }}>

@@ -408,3 +408,22 @@ async def test_vectorize_persists_document_and_chunk_vectors(app, client, monkey
             )
         ) is not None
         assert (await session.scalar(select(PaperContentChunkVector))) is not None
+
+
+async def test_missing_embedding_keeps_parsed_fulltext_usable(app, client, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from app.core.llm.router import get_llm_router
+
+    _user_row, library, _paper, asset = await _setup(client)
+    monkeypatch.setattr(get_llm_router(), "model_name", AsyncMock(return_value=None))
+    async with get_sessionmaker()() as session:
+        version = await create_content_version(session, asset=asset)
+        await parse_content_version(session, version=version, mineru_parser=None)
+        old_status = version.status
+        text_key = version.text_key
+        await vectorize_content_version(session, version=version, library_id=library.id)
+        assert version.status == old_status
+        assert version.document_vector_state == version.chunk_vector_state == "unconfigured"
+        assert version.error_code == "EMBEDDING_NOT_CONFIGURED"
+        assert version.text_key == text_key and Path(text_key).read_text()

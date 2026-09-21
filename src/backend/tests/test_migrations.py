@@ -10,7 +10,8 @@ from alembic import command
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
-HEAD_REVISION = "4758f07e3148"  # LLM cache usage and model pricing snapshots
+HEAD_REVISION = "eb9085b1ffc4"  # Summary attempt model provenance
+USAGE_COST_REVISION = "4758f07e3148"
 SUMMARY_BATCHES_REVISION = "bad1bb4329c1"  # Durable summary batches and concurrency leases
 VAULT_DIRECTORY_REVISION = "0a93d8114114"  # Configurable Obsidian managed folder
 ZOTERO_ORIGINAL_PDF_REVISION = "57022e4415e1"
@@ -212,7 +213,8 @@ def _inspect_db(db_path: Path) -> tuple[str, dict[str, set[str]]]:
 def test_single_migration_head(tmp_path):
     script = ScriptDirectory.from_config(_make_config(tmp_path / "unused.db"))
     assert script.get_heads() == [HEAD_REVISION]
-    assert script.get_revision(HEAD_REVISION).down_revision == SUMMARY_BATCHES_REVISION
+    assert script.get_revision(HEAD_REVISION).down_revision == USAGE_COST_REVISION
+    assert script.get_revision(USAGE_COST_REVISION).down_revision == SUMMARY_BATCHES_REVISION
     assert script.get_revision(SUMMARY_BATCHES_REVISION).down_revision == VAULT_DIRECTORY_REVISION
     assert script.get_revision(VAULT_DIRECTORY_REVISION).down_revision == (
         ZOTERO_ORIGINAL_PDF_REVISION
@@ -1845,3 +1847,15 @@ def test_hypothesis_seq_backfill_follows_the_previous_best_effort_order(tmp_path
         n = conn.execute(text("SELECT COUNT(*) FROM hypothesis_nodes")).scalar_one()
     assert n == 4
     engine.dispose()
+
+
+def test_summary_provenance_columns_roundtrip(tmp_path):
+    path = tmp_path / "summary-provenance.db"
+    cfg = _make_config(path)
+    command.upgrade(cfg, USAGE_COST_REVISION)
+    command.upgrade(cfg, HEAD_REVISION)
+    assert {"requested_model", "provider_name"} <= _inspect_db(path)[1]["paper_wiki_revisions"]
+    command.downgrade(cfg, USAGE_COST_REVISION)
+    assert "requested_model" not in _inspect_db(path)[1]["paper_wiki_revisions"]
+    command.upgrade(cfg, HEAD_REVISION)
+    assert {"requested_model", "provider_name"} <= _inspect_db(path)[1]["paper_wiki_revisions"]

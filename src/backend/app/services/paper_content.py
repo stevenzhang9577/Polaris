@@ -411,7 +411,16 @@ async def vectorize_content_version(
     if not chunks or not version.text_key or not Path(version.text_key).is_file():
         raise ContentParseError("CONTENT_TEXT_MISSING")
 
+    from app.core.llm.router import get_llm_router
     from app.services.embedding import embed_documents
+
+    if await get_llm_router().model_name("embedding") is None:
+        version.document_vector_state = "unconfigured"
+        version.chunk_vector_state = "unconfigured"
+        version.error_code = "EMBEDDING_NOT_CONFIGURED"
+        version.error_detail = None
+        await session.commit()
+        return version
 
     version.document_vector_state = "building"
     version.chunk_vector_state = "building"
@@ -468,6 +477,8 @@ async def vectorize_content_version(
         version.document_vector_state = "ready"
         version.chunk_vector_state = "ready"
         version.status = "vector_ready"
+        version.error_code = None
+        version.error_detail = None
         await session.commit()
     except Exception as exc:
         await session.rollback()
