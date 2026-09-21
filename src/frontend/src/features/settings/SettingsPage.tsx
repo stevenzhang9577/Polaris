@@ -938,11 +938,24 @@ function parseModels(raw: string): string[] {
   return [...new Set(raw.split(/[\n,，]/).map((s) => s.trim()).filter(Boolean))];
 }
 
-const OPENAI_ENDPOINT_SUFFIX_RE = /\/(?:chat\/completions|embeddings|responses|rerank)\/?$/i;
+const OPENAI_CONCRETE_ENDPOINT_SUFFIX_RE = /\/(?:chat\/completions|embeddings|responses|rerank)\/?$/i;
+const OPENAI_RESPONSES_ENDPOINT_SUFFIX_RE = /\/responses\/?$/;
 
-/** OpenAI-compatible adapters append the capability endpoint themselves. */
-function hasOpenAiEndpointSuffix(draft: Pick<ProviderDraft, 'kind' | 'base_url'>): boolean {
-  return draft.kind === 'openai_compat' && OPENAI_ENDPOINT_SUFFIX_RE.test(draft.base_url.trim());
+/**
+ * OpenAI-compatible adapters normally append the capability endpoint themselves.
+ * The Responses adapter is the exception: it deliberately accepts either an API
+ * root or a complete `/responses` URL (some relays expose only that endpoint).
+ */
+export function hasUnsupportedOpenAiEndpointSuffix(draft: {
+  kind: LlmProviderKind;
+  transport: LlmProviderTransport;
+  base_url: string;
+}): boolean {
+  const value = draft.base_url.trim();
+  if (draft.kind !== 'openai_compat' || !OPENAI_CONCRETE_ENDPOINT_SUFFIX_RE.test(value)) {
+    return false;
+  }
+  return !(draft.transport === 'responses' && OPENAI_RESPONSES_ENDPOINT_SUFFIX_RE.test(value));
 }
 
 function emptyDraft(): ProviderDraft {
@@ -998,7 +1011,7 @@ function ProviderForm({ draft, setDraft, isNew }: {
 }) {
   const noAuth = draft.auth_scheme === 'none';
   const credentialMissing = !noAuth && !draft.has_api_key && !draft.api_key.trim();
-  const endpointSuffix = hasOpenAiEndpointSuffix(draft);
+  const endpointSuffix = hasUnsupportedOpenAiEndpointSuffix(draft);
   return (
     <>
       <FormField label={tr('名称', 'Name')}>
@@ -1028,10 +1041,15 @@ function ProviderForm({ draft, setDraft, isNew }: {
         <FormField
           label="Base URL"
           hint={draft.kind === 'openai_compat'
-            ? tr(
-              '填写 API 根地址；Polaris 会按测试能力追加 /chat/completions、/embeddings 或 /rerank。',
-              'Enter the API root; Polaris appends /chat/completions, /embeddings, or /rerank for the selected capability.',
-            )
+            ? draft.transport === 'responses'
+              ? tr(
+                '填写 API 根地址或完整的 /responses 地址；向量嵌入和重排序仍需使用 API 根地址。',
+                'Enter the API root or a complete /responses URL; embeddings and reranking still require an API root.',
+              )
+              : tr(
+                '填写 API 根地址；Polaris 会按测试能力追加 /chat/completions、/embeddings 或 /rerank。',
+                'Enter the API root; Polaris appends /chat/completions, /embeddings, or /rerank for the selected capability.',
+              )
             : undefined}
           style={{ flex: 1 }}
         >
@@ -1490,7 +1508,7 @@ export function ProvidersSection() {
               disabled={
                 !draft.name.trim()
                 || (draft.auth_scheme !== 'none' && !draft.has_api_key && !draft.api_key.trim())
-                || hasOpenAiEndpointSuffix(draft)
+                || hasUnsupportedOpenAiEndpointSuffix(draft)
                 || busy
               }
               onClick={() => (isNew ? createMutation.mutate() : patchMutation.mutate(modal))}>
