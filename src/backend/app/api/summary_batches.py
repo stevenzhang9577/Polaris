@@ -141,7 +141,7 @@ async def get_summary_batch(
 async def control_summary_batch(
     library_id: uuid.UUID,
     batch_id: uuid.UUID,
-    action: Literal["pause", "resume", "retry"],
+    action: Literal["pause", "resume", "retry", "cancel"],
     session: AsyncSession = Depends(get_session),
     user: User = Depends(current_active_user),
     queue: TaskQueue = Depends(get_task_queue),

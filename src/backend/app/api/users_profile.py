@@ -14,7 +14,7 @@ from app.api.auth import current_active_user
 from app.core.config import get_settings
 from app.core.db import get_session
 from app.models.user import User
-from app.schemas.llm_admin import UsageRow
+from app.schemas.llm_admin import UsageCallPage, UsageRow
 from app.schemas.user import (
     ManagedCommandWatchdogUserRead,
     ManagedCommandWatchdogUserUpdate,
@@ -144,6 +144,20 @@ async def my_usage(
 ) -> UsageSummary:
     used = await tokens_used_by_user(session, user.id)
     return UsageSummary(tokens_used=used)
+
+
+@router.get("/users/me/usage/calls", response_model=UsageCallPage)
+async def my_usage_calls(
+    days: int = Query(default=30, ge=1, le=365),
+    model: str | None = Query(default=None, max_length=255),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+):
+    return await llm_admin_service.usage_calls(
+        session, user_id=user.id, days=days, model=model, offset=offset, limit=limit
+    )
 
 
 @router.get("/users/me/usage/history", response_model=list[UsageRow])

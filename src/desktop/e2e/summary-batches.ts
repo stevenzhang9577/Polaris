@@ -79,6 +79,7 @@ async function main() {
         if (method === 'POST') {
           const action = url.pathname.split('/').at(-1)!;
           actions.push(action);
+          if (action === 'cancel') { batch.status = 'cancelled'; batch.cancelled = batch.pending + batch.running; batch.pending = 0; batch.running = 0; }
           if (action === 'pause') batch.status = 'paused';
           if (action === 'resume') batch.status = 'running';
           if (action === 'retry') { batch.pending += batch.failed; batch.failed = 0; batch.status = 'running'; }
@@ -86,7 +87,7 @@ async function main() {
         }
         const pageNumber = Number(url.searchParams.get('page'));
         detailPages.push(pageNumber);
-        return reply({ batch, page: pageNumber, size: 20, total: batch.total, items: Array.from({ length: 20 }, (_, index) => ({ paper_id: paperId((pageNumber - 1) * 20 + index + 2), title: `Robustness paper ${(pageNumber - 1) * 20 + index + 2}`, status: index === 0 && batch!.failed > 0 ? 'failed' : index === 1 ? 'running' : 'pending', stage: index === 1 ? 'compile' : null, error: index === 0 && batch!.failed > 0 ? 'Synthetic provider timeout' : null })) });
+        return reply({ batch, page: pageNumber, size: 20, total: batch.total, items: Array.from({ length: 20 }, (_, index) => ({ paper_id: paperId((pageNumber - 1) * 20 + index + 2), title: `Robustness paper ${(pageNumber - 1) * 20 + index + 2}`, status: batch!.status === 'cancelled' ? 'cancelled' : index === 0 && batch!.failed > 0 ? 'failed' : index === 1 ? 'running' : 'pending', stage: index === 1 ? 'compile' : null, error: index === 0 && batch!.failed > 0 ? 'Synthetic provider timeout' : null })) });
       }
       if (url.pathname.endsWith('/libraries/library-summary/papers')) {
         const pageNumber = Number(url.searchParams.get('page'));
@@ -130,7 +131,11 @@ async function main() {
     await progress.getByRole('button', { name: '下一页', exact: true }).click();
     await progress.getByText('Robustness paper 22', { exact: true }).waitFor();
     assert(detailPages.includes(2));
-    assert.deepEqual(actions, ['pause', 'resume', 'retry']);
+    await page.screenshot({ path: join(artifacts, 'batch-cancel-button.png'), fullPage: true });
+    await progress.getByRole('button', { name: '取消任务', exact: true }).click();
+    await progress.getByText('已取消', { exact: true }).first().waitFor();
+    assert.equal(await progress.getByRole('button', { name: '继续任务', exact: true }).count(), 0);
+    assert.deepEqual(actions, ['pause', 'resume', 'retry', 'cancel']);
     await page.screenshot({ path: join(artifacts, 'batch-progress.png'), fullPage: true });
     await progress.getByRole('button', { name: '完成', exact: true }).click();
     for (const width of [1100, 820, 430]) {
@@ -143,7 +148,7 @@ async function main() {
     assert(await page.getByRole('button', { name: '生成总结', exact: true }).first().isDisabled(), 'Changing filters must reset selection');
     await page.goto(`${origin}/e2e/local-integrations.html?view=summary-settings`);
     await page.getByLabel('同时生成的论文数', { exact: true }).waitFor();
-    await page.getByLabel('同时生成的论文数', { exact: true }).fill('11');
+    await page.getByLabel('同时生成的论文数', { exact: true }).fill('21');
     assert(await page.getByRole('button', { name: '保存', exact: true }).isDisabled());
     await page.getByLabel('同时生成的论文数', { exact: true }).fill('10');
     await page.getByRole('button', { name: '保存', exact: true }).click();

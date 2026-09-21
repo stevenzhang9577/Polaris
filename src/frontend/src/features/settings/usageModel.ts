@@ -1,6 +1,6 @@
 import type { LlmUsageRow, ModelPricing } from '../../lib/api';
 
-export type UsageTotals = Omit<LlmUsageRow, 'date' | 'stage' | 'model' | 'provider_name'>;
+export type UsageTotals = Omit<LlmUsageRow, 'date' | 'stage' | 'model' | 'provider_name' | 'id' | 'occurred_at'>;
 export type ModelUsage = UsageTotals & Pick<LlmUsageRow, 'model' | 'provider_name'>;
 
 /** Add Decimal API values without rounding each request to cents. */
@@ -33,6 +33,7 @@ export function summarizeUsage(rows: UsageTotals[]): UsageTotals {
     priced_calls: rows.reduce((sum, row) => sum + row.priced_calls, 0),
     calls: rows.reduce((sum, row) => sum + row.calls, 0),
     cost_usd: sumUsd(rows.map((row) => row.cost_usd)),
+    reference_cost_usd: sumUsd(rows.map((row) => row.reference_cost_usd ?? null)),
   };
 }
 

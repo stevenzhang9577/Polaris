@@ -840,6 +840,9 @@ export interface LlmTestResult {
 }
 
 export interface LlmUsageRow {
+  id?: string | null;
+  occurred_at?: string | null;
+  reference_cost_usd?: string | null;
   date: string;
   stage: string;
   model: string;
@@ -1245,13 +1248,14 @@ export interface SummaryBatchInput {
 export interface SummaryBatch {
   id: string;
   library_id: string;
-  status: 'queued' | 'running' | 'paused' | 'completed' | 'completed_with_errors';
+  status: 'queued' | 'running' | 'paused' | 'completed' | 'completed_with_errors' | 'cancelled';
   total: number;
   pending: number;
   running: number;
   completed: number;
   skipped: number;
   failed: number;
+  cancelled?: number;
   concurrency: number;
   created_at: string;
   updated_at: string;
@@ -1260,7 +1264,7 @@ export interface SummaryBatch {
 export interface SummaryBatchItem {
   paper_id: string;
   title: string;
-  status: 'pending' | 'running' | 'completed' | 'skipped' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'skipped' | 'failed' | 'cancelled';
   stage: string | null;
   error: string | null;
 }
@@ -4178,7 +4182,7 @@ export const api = {
   getSummaryBatch(libraryId: string, batchId: string, page = 1, size = 20): Promise<SummaryBatchDetail> {
     return request<SummaryBatchDetail>(`/libraries/${libraryId}/summary-batches/${batchId}?page=${page}&size=${size}`);
   },
-  controlSummaryBatch(libraryId: string, batchId: string, action: 'pause' | 'resume' | 'retry'): Promise<SummaryBatch> {
+  controlSummaryBatch(libraryId: string, batchId: string, action: 'pause' | 'resume' | 'retry' | 'cancel'): Promise<SummaryBatch> {
     return request<SummaryBatch>(`/libraries/${libraryId}/summary-batches/${batchId}/${action}`, { method: 'POST' });
   },
   /** 这篇论文的两种向量各自建没建、何时建的、用的哪个模型（只读，权限同看论文）。 */
@@ -5437,6 +5441,13 @@ export const api = {
       'POST',
       input,
     );
+  },
+  getCcSwitchPricing(): Promise<Record<string, ModelPricing>> {
+    return request('/admin/llm/cc-switch-pricing');
+  },
+  getUsageCalls(scope: 'personal' | 'platform', days: number, model: string, offset: number): Promise<{ total: number; items: LlmUsageRow[] }> {
+    const params = new URLSearchParams({ days: String(days), model, offset: String(offset), limit: '50' });
+    return request(`${scope === 'personal' ? '/users/me' : '/admin/llm'}/usage/calls?${params}`);
   },
   getLlmUsage(opts: { projectId?: string; userId?: string; days?: number } = {}): Promise<LlmUsageRow[]> {
     const params = new URLSearchParams();

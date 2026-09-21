@@ -3,8 +3,8 @@
 Polaris records each model call in the server-side usage ledger and summarizes it by provider,
 model, research stage, and day. The dashboard follows the useful parts of CC Switch's usage view:
 input and output tokens, cache activity, model attribution, and estimated USD cost are visible in one
-place. This is a product-design reference rather than a CC Switch data import; Polaris measures calls
-that pass through its own `app/core/llm/` boundary.
+place. Polaris measures calls through its own `app/core/llm/` boundary; the Desktop app can also read
+CC Switch's local model price table, without importing its request history or credentials.
 
 ## Where to find it
 
@@ -16,7 +16,25 @@ that pass through its own `app/core/llm/` boundary.
   deployment owner this is the shared deployment configuration. Prices are stored per provider and
   exact model ID, in USD per million tokens.
 
-![Usage dashboard grouped by model and day](assets/llm-usage-dashboard.png)
+![Usage dashboard with individual timestamps](assets/llm-usage-dashboard.png)
+
+## Changing the model from the interface
+
+In **Settings → Models & routing**, select the provider and model in the routing table, then choose
+**Save routing**. A provider's model list only defines available choices. Unsaved edits are marked
+and survive background refresh; incomplete routes are rejected without deleting the old route.
+After a successful save, new calls use the saved model. Requests already sent retain their model,
+and explicit stage overrides remain independent of the default.
+
+When importing a local connection with **Set as default**, the confirmation defaults to replacing
+that route. **Connection only** does not change routing. The usage overview also shows the current
+default and provides a direct switch. Historical model names are never rewritten on a switch.
+
+![Saved routing verified against real backend and local HTTP providers](assets/llm-routing-saved.png)
+
+**Individual calls** lists each persisted request in local time, including seconds, newest first,
+with model filtering and pages of 50. **Daily totals** still groups by UTC date.
+
 
 ## Token and cache semantics
 
@@ -66,6 +84,18 @@ At call time Polaris saves both the computed `cost_usd` and a `pricing_snapshot`
 model ID, currency, and rates used. Editing a provider's prices affects future calls only, so a later
 price change cannot rewrite historical costs.
 
+### CC Switch prices on Desktop
+
+**Import matching prices from local CC Switch** reads only `~/.cc-switch/cc-switch.db`'s
+`model_pricing` table. It matches model IDs case-insensitively and removes context suffixes such
+as `[1M]`; it does not substitute another model's prices. Existing provider-specific rates win.
+The imported rates apply to future calls and are saved in their normal price snapshots.
+
+The dashboard separately labels **CC Switch reference** estimates at the current local prices,
+including for old unpriced calls. Unknown cache buckets receive no discount for this reference
+estimate. Models without a matching rate are excluded. Reference estimates do not overwrite the
+ledger's original supplier, cache counts or cost. Server deployments never inspect local CC Switch.
+
 ![Per-provider model pricing editor](assets/llm-model-pricing.png)
 
 ## Reported and estimated usage
@@ -78,6 +108,15 @@ false precision.
 
 Rows created before this accounting was introduced keep their original input and output totals. Their
 provider, cache buckets, cost, and price snapshot remain unknown, and they are marked as estimated.
+
+## Cancelling paper summary batches
+
+Use **Cancel batch** next to the latest batch in the paper list, or inside **Summary tasks**.
+Cancellation stops dispatch, interrupts in-flight processing when the worker observes the state,
+and marks remaining items cancelled. Completed summaries are kept. Cancellation persists across
+restarts and cannot be undone with Resume or Retry. Pause only stops new papers from starting.
+
+![Summary batch cancellation control](assets/summary-batch-cancel.png)
 
 ## Design reference
 

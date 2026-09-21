@@ -379,6 +379,7 @@ class LLMRouter:
         # 所以这里恢复按 owner 取表，而部署级那份的行为一字不变。
         self._routes: dict[uuid.UUID | None, dict[str, ResolvedRoute]] = {}
         self._routes_loaded_at: dict[uuid.UUID | None, float] = {}
+        self._route_generation = 0
         # 键含耐心档位（见 call_profile）：长/短两档各持一个客户端。键是实现细节，
         # 要在测试里替换 provider 请用 override_provider()，别直接往这个字典里塞。
         #
@@ -405,6 +406,7 @@ class LLMRouter:
         每个靠回退用到它的用户手上那份合并结果也就跟着过期了。
         """
         self._routes_loaded_at.clear()
+        self._route_generation += 1
 
     async def _load_routes(self, owner_id: uuid.UUID | None = None) -> dict[str, ResolvedRoute]:
         from app.models.llm_config import LLMProviderConfig, ModelRoute
@@ -453,7 +455,13 @@ class LLMRouter:
         # 缓存有效——只按时间戳判断会在那种时候 KeyError。
         loaded_at = self._routes_loaded_at.get(owner_id)
         if loaded_at is None or now - loaded_at > _ROUTE_CACHE_TTL:
-            self._routes[owner_id] = await self._load_routes(owner_id)
+            generation = self._route_generation
+            routes = await self._load_routes(owner_id)
+            if generation != self._route_generation:
+                # A settings save committed while this read was in flight. Do not
+                # resurrect the old snapshot for another cache TTL after that save.
+                return await self._cached_routes(owner_id)
+            self._routes[owner_id] = routes
             self._routes_loaded_at[owner_id] = now
         return self._routes[owner_id]
 

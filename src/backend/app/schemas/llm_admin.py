@@ -148,6 +148,9 @@ class TestModelResult(BaseModel):
 
 
 class UsageRow(BaseModel):
+    id: str | None = None
+    occurred_at: datetime | None = None
+    reference_cost_usd: Decimal | None = None
     date: str
     stage: str
     model: str
@@ -161,6 +164,11 @@ class UsageRow(BaseModel):
     estimated_calls: int = 0
     priced_calls: int = 0
     cost_usd: Decimal | None = None
+
+
+class UsageCallPage(BaseModel):
+    total: int
+    items: list[UsageRow]
 
 
 # ---- 调用日志 ----

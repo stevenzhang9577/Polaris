@@ -21,7 +21,7 @@ function renderDashboard(scope: 'personal' | 'platform'): string {
 describe('usage reporting', () => {
   it('renders cache coverage and marks the priced subset incomplete', () => {
     const html = renderToStaticMarkup(<UsageReport rows={[row]} />);
-    for (const text of ['全部输入', '输出', '缓存读取 / 命中率', '50.0%', '缓存完整上报 ', '部分已计价', '$0.125', 'Provider A', 'model-a', '按模型汇总', '每日明细', '未计价调用不按免费处理']) {
+    for (const text of ['全部输入', '输出', '缓存读取 / 命中率', '50.0%', '缓存完整上报 ', '部分已计价', '$0.125', 'Provider A', 'model-a', '按模型汇总', '每日汇总', '未计价调用不按免费处理']) {
       expect(html).toContain(text);
     }
     expect(html).toContain('1 次调用的 token 数为估算');
@@ -45,6 +45,14 @@ describe('usage reporting', () => {
       expect(html).toContain('model-a');
       expect(html).toContain('$0.125');
     }
+  });
+
+  it('labels CC Switch reference estimates separately from saved historical costs', () => {
+    const html = renderToStaticMarkup(<UsageReport rows={[{ ...row, priced_calls: 0, cost_usd: null, reference_cost_usd: '0.45', provider_name: null }]} />);
+    expect(html).toContain('$0.45');
+    expect(html).toContain('CC Switch 参考');
+    expect(html).toContain('历史未记录');
+    expect(html).toContain('缺失的缓存明细按无折扣估算');
   });
 
   it('resolves direct links to pricing and platform usage', () => {

@@ -10,12 +10,13 @@ import { tr } from '../../lib/i18n';
 import type { SummarySelection } from './summarySelection';
 
 export function summaryBatchFinished(batch: SummaryBatch): number {
-  return batch.completed + batch.skipped + batch.failed;
+  return batch.completed + batch.skipped + batch.failed + (batch.cancelled ?? 0);
 }
 
 export function summaryBatchStatus(batch: SummaryBatch): string {
   if (batch.status === 'paused') return batch.running > 0 ? tr('暂停中，等待当前论文完成', 'Pausing; finishing active papers') : tr('已暂停', 'Paused');
   const labels: Record<SummaryBatch['status'], [string, string]> = {
+    cancelled: ['已取消', 'Cancelled'],
     queued: ['排队中', 'Queued'], running: ['生成中', 'Generating'], paused: ['已暂停', 'Paused'],
     completed: ['已完成', 'Completed'], completed_with_errors: ['已结束，有失败项', 'Finished with errors'],
   };
@@ -32,6 +33,7 @@ export function summaryBatchItemLabel(item: SummaryBatchItem): string {
     return item.stage && stages[item.stage] ? tr(...stages[item.stage]!) : tr('处理中', 'In progress');
   }
   const labels: Record<SummaryBatchItem['status'], [string, string]> = {
+    cancelled: ['已取消', 'Cancelled'],
     pending: ['等待中', 'Waiting'], running: ['处理中', 'In progress'], completed: ['已完成', 'Completed'],
     skipped: ['已跳过', 'Skipped'], failed: ['失败', 'Failed'],
   };
@@ -65,6 +67,7 @@ export function SummaryBatchProgress({ batch, compact = false }: { batch: Summar
         style={{ display: 'block', width: '100%', height: 7, margin: '9px 0', accentColor: 'var(--accent)' }} />
       {!compact && (
         <div className="row gap8 wrap" style={{ fontSize: 12, lineHeight: 1.7 }}>
+          <span>{tr(`已取消 ${batch.cancelled ?? 0}`, `Cancelled ${batch.cancelled ?? 0}`)}</span>
           <span>{tr(`等待 ${batch.pending}`, `Waiting ${batch.pending}`)}</span>
           <span>{tr(`进行中 ${batch.running}`, `Active ${batch.running}`)}</span>
           <span style={{ color: 'var(--ok-tx)' }}>{tr(`完成 ${batch.completed}`, `Completed ${batch.completed}`)}</span>
@@ -143,9 +146,14 @@ export function SummaryBatchPanel({ libraryId, selection, selectedCount, onClose
     onError: (error) => toast(`${tr('创建失败，可重试', 'Could not create batch; retry is safe')}：${error instanceof Error ? error.message : String(error)}`, 'error'),
   });
   const control = useMutation({
-    mutationFn: (action: 'pause' | 'resume' | 'retry') => api.controlSummaryBatch(libraryId, batchId!, action),
+    mutationFn: (action: 'pause' | 'resume' | 'retry' | 'cancel') => api.controlSummaryBatch(libraryId, batchId!, action),
     onSuccess: refresh,
     onError: (error) => toast(`${tr('操作失败', 'Action failed')}：${error instanceof Error ? error.message : String(error)}`, 'error'),
+  });
+  const cancelLatest = useMutation({
+    mutationFn: (id: string) => api.controlSummaryBatch(libraryId, id, 'cancel'),
+    onSuccess: refresh,
+    onError: (error) => toast(error instanceof Error ? error.message : String(error), 'error'),
   });
   const showHistory = () => {
     setBatchId(latest?.id ?? null);
@@ -158,6 +166,7 @@ export function SummaryBatchPanel({ libraryId, selection, selectedCount, onClose
       <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 10 }}>
         <div className="row gap8 wrap" style={{ justifyContent: 'space-between', marginBottom: latest ? 8 : 0 }}>
           <span style={{ fontSize: 12, fontWeight: 600 }}>{tr('批量论文总结', 'Batch summaries')}</span>
+          {latest && ['running', 'queued', 'paused'].includes(latest.status) && <button className="btn btn-soft sm" style={{ color: 'var(--danger-tx)' }} disabled={cancelLatest.isPending} onClick={() => cancelLatest.mutate(latest.id)}>{tr('取消任务', 'Cancel batch')}</button>}
           <button className="btn btn-soft sm" onClick={showHistory}><Icon name="clock" size={12} />{tr('总结任务', 'Summary tasks')}</button>
         </div>
         {latest && <SummaryBatchProgress batch={latest} compact />}
@@ -187,7 +196,7 @@ export function SummaryBatchPanel({ libraryId, selection, selectedCount, onClose
       </Modal>
 
       <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title={tr('论文总结任务', 'Paper summary tasks')}
-        sub={tr('任务会持久保存；关闭本窗口不取消任务。暂停只停止派发新论文。', 'Tasks are persisted. Closing this dialog does not cancel them. Pausing stops new papers from starting.')}
+        sub={tr('关闭窗口不会取消。暂停只停止派发；取消会中断当前处理、取消剩余论文，保留已完成总结。', 'Closing this dialog does not cancel the task. Pause stops dispatching; Cancel interrupts active work and cancels remaining papers, keeping completed summaries.')}
         width={800} footer={<button className="btn btn-primary sm" onClick={() => setHistoryOpen(false)}>{tr('完成', 'Done')}</button>}
       >
         {batches.isLoading ? <p>{tr('读取任务中…', 'Loading tasks…')}</p> : batches.isError ? <button className="btn btn-soft sm" onClick={() => void batches.refetch()}>{tr('重试加载任务', 'Retry loading tasks')}</button> : !batches.data?.length ? <p className="muted">{tr('还没有批量总结任务。在论文列表全选或勾选后，点击「生成总结」。', 'No summary batches yet. Select papers in the list and choose Generate summaries.')}</p> : <>
@@ -201,8 +210,9 @@ export function SummaryBatchPanel({ libraryId, selection, selectedCount, onClose
             <SummaryBatchProgress batch={current} />
             <div className="row gap8 wrap" style={{ margin: '14px 0' }}>
               {(current.status === 'running' || current.status === 'queued') && <button className="btn btn-soft sm" disabled={control.isPending} onClick={() => control.mutate('pause')}>{tr('暂停任务', 'Pause')}</button>}
+              {['running', 'queued', 'paused'].includes(current.status) && <button className="btn btn-soft sm" style={{ color: 'var(--danger-tx)' }} disabled={control.isPending} onClick={() => control.mutate('cancel')}>{tr('取消任务', 'Cancel batch')}</button>}
               {current.status === 'paused' && <button className="btn btn-primary sm" disabled={control.isPending} onClick={() => control.mutate('resume')}>{tr('继续任务', 'Resume')}</button>}
-              {current.failed > 0 && <button className="btn btn-soft sm" disabled={control.isPending} onClick={() => control.mutate('retry')}>{tr(`重试失败 ${current.failed} 篇`, `Retry ${current.failed} failed`)}</button>}
+              {current.failed > 0 && current.status !== 'cancelled' && <button className="btn btn-soft sm" disabled={control.isPending} onClick={() => control.mutate('retry')}>{tr(`重试失败 ${current.failed} 篇`, `Retry ${current.failed} failed`)}</button>}
               <span className="muted" style={{ fontSize: 12 }}>{tr(`当前并发上限 ${current.concurrency}`, `Current concurrency limit ${current.concurrency}`)}</span>
             </div>
             <div style={{ borderTop: '1px solid var(--border)' }}>

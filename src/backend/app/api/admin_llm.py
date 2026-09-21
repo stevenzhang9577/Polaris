@@ -20,12 +20,14 @@ from app.schemas.llm_admin import (
     LocalConfigDiscovery,
     LocalConfigImportRequest,
     LocalConfigImportResult,
+    ModelPricing,
     ProviderCreate,
     ProviderRead,
     ProviderUpdate,
     RouteItem,
     TestModelRequest,
     TestModelResult,
+    UsageCallPage,
     UsageRow,
 )
 from app.services import llm_admin as llm_admin_service
@@ -215,6 +217,31 @@ async def import_local_config(
         updated_stages=result.updated_stages,
         skipped_stages=result.skipped_stages,
         probe=TestModelResult(ok=True, latency_ms=result.latency_ms, error=None),
+    )
+
+
+@router.get("/cc-switch-pricing", response_model=dict[str, ModelPricing])
+async def cc_switch_prices(_owner: User = Depends(require_owner)):
+    from app.services.cc_switch_pricing import local_prices
+
+    try:
+        local_config_service.require_desktop_profile()
+    except local_config_service.DesktopOnlyError as exc:
+        raise HTTPException(403, detail="DESKTOP_ONLY") from exc
+    return await local_prices()
+
+
+@router.get("/usage/calls", response_model=UsageCallPage)
+async def usage_calls(
+    _owner: User = Depends(require_owner),
+    days: int = Query(default=30, ge=1, le=365),
+    model: str | None = Query(default=None, max_length=255),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+):
+    return await llm_admin_service.usage_calls(
+        session, days=days, model=model, offset=offset, limit=limit
     )
 
 

@@ -49,13 +49,16 @@ class SummaryBatchCreate(BaseModel):
 class SummaryBatchRead(BaseModel):
     id: uuid.UUID
     library_id: uuid.UUID
-    status: Literal["queued", "running", "paused", "completed", "completed_with_errors"]
+    status: Literal[
+        "queued", "running", "paused", "completed", "completed_with_errors", "cancelled"
+    ]
     total: int
     pending: int
     running: int
     completed: int
     skipped: int
     failed: int
+    cancelled: int = 0
     created_at: datetime
     updated_at: datetime
     concurrency: int

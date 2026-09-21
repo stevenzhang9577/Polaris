@@ -672,8 +672,10 @@ async def generate_queued_revision(
             source_level=source.source_level,
             include_figures=False,
         )
-        revision = await session.get(PaperWikiRevision, revision_id)
+        revision = await session.get(PaperWikiRevision, revision_id, populate_existing=True)
         assert revision is not None
+        if revision.error_code == "SUMMARY_CANCELLED":
+            raise asyncio.CancelledError
         revision.content_version_id = source.content_version_id
         revision.source_level = source.source_level
         revision.source_fingerprint = source.fingerprint

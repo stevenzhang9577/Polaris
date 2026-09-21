@@ -1581,7 +1581,7 @@ function ModelCombobox({ value, options, placeholder, muted, onChange }: {
   );
 }
 
-function RoutesSection() {
+export function RoutesSection() {
   const queryClient = useQueryClient();
   const providersQuery = useQuery({ queryKey: ['llm', 'providers'], queryFn: () => api.listLlmProviders(), retry: false });
   const routesQuery = useQuery({ queryKey: ['llm', 'routes'], queryFn: () => api.getLlmRoutes(), retry: false });
@@ -1590,10 +1590,11 @@ function RoutesSection() {
   // 只有显式设置过的 stage 才有行；其余环节运行时回退 default 路由
   const [rows, setRows] = useState<Record<string, RouteDraft>>({});
   const [showAll, setShowAll] = useState(false);
+  const [dirty, setDirty] = useState(false);
   const tests = useModelTests(api.testLlmModel);
 
   useEffect(() => {
-    if (!routesQuery.data) return;
+    if (!routesQuery.data || dirty) return;
     const next: Record<string, RouteDraft> = {};
     for (const r of routesQuery.data) {
       next[r.stage] = {
@@ -1604,7 +1605,7 @@ function RoutesSection() {
       };
     }
     setRows(next);
-  }, [routesQuery.data]);
+  }, [routesQuery.data, dirty]);
 
   const saveMutation = useMutation({
     mutationFn: () => {
@@ -1612,7 +1613,11 @@ function RoutesSection() {
       // PUT 是整表覆盖：插件环节的行也要一并提交，否则每次保存都会把它们静默删光
       for (const stage of [...LLM_STAGES, ...pluginStages]) {
         const r = rows[stage];
-        if (!r || !r.provider_id || !r.model.trim()) continue;
+        if (!r || (!r.provider_id && !r.model.trim())) continue;
+        if (!r.provider_id || !r.model.trim()) throw new Error(tr(
+          `${stageLabel(stage).zh}：请选择供应商并填写模型，当前修改尚未保存`,
+          `${stage}: choose a provider and model; changes were not saved`,
+        ));
         const t = r.temperature.trim();
         routes.push({
           stage,
@@ -1624,8 +1629,10 @@ function RoutesSection() {
       }
       return api.putLlmRoutes(routes);
     },
-    onSuccess: () => {
-      toast(tr('模型路由表已保存', 'Model routing saved'), 'ok');
+    onSuccess: (saved) => {
+      queryClient.setQueryData(['llm', 'routes'], saved);
+      setDirty(false);
+      toast(tr('模型路由表已保存，后续调用按新路由执行', 'Routing saved; future requests use the new routes'), 'ok');
       void queryClient.invalidateQueries({ queryKey: ['llm', 'routes'] });
     },
     onError: (err) => toast(`${tr('保存失败', 'Save failed')}：${err instanceof Error ? err.message : String(err)}`, 'error'),
@@ -1647,7 +1654,8 @@ function RoutesSection() {
 
   // 编辑「跟随默认」的行时，以 default 的值为底稿转成显式设置；
   // 能力型环节不跟随默认，底稿从空开始
-  const setRow = (stage: string, patch: Partial<RouteDraft>) =>
+  const setRow = (stage: string, patch: Partial<RouteDraft>) => {
+    setDirty(true);
     setRows((prev) => {
       const seed = prev[stage]
         ?? (stage !== 'default' && !CAPABILITY_STAGES.has(stage) && prev['default']
@@ -1655,12 +1663,15 @@ function RoutesSection() {
           : emptyDraftRow);
       return { ...prev, [stage]: { ...seed, ...patch } };
     });
-  const clearRow = (stage: string) =>
+  };
+  const clearRow = (stage: string) => {
+    setDirty(true);
     setRows((prev) => {
       const next = { ...prev };
       delete next[stage];
       return next;
     });
+  };
 
   /** 行的生效路由：显式设置优先，否则跟随 default（能力型环节不跟随；不完整则 null）。 */
   const effectiveOf = (stage: string): RouteDraft | null => {
@@ -1706,12 +1717,13 @@ function RoutesSection() {
             <Icon name="play" size={12} />
             {tests.testing ? tr('测试中…', 'Testing…') : tr('批量测试', 'Test all')}
           </button>
-          <button className="btn btn-primary sm" disabled={saveMutation.isPending} onClick={() => saveMutation.mutate()}>
+          <button className="btn btn-primary sm" disabled={saveMutation.isPending || !routesQuery.isSuccess} onClick={() => saveMutation.mutate()}>
             <Icon name="check" size={13} />
             {saveMutation.isPending ? tr('保存中…', 'Saving…') : tr('保存路由表', 'Save routing')}
           </button>
         </div>
       </div>
+      {dirty && <p role="status" className="field-hint" style={{ color: 'var(--warn-tx)', marginBottom: 10 }}>{tr('有未保存的修改；点击「保存路由表」后，新调用才会使用所选模型。', 'Unsaved changes. Save routing to apply the selected model to future requests.')}</p>}
       {routesQuery.isError && (
         <div className="field-hint" style={{ marginBottom: 10, color: 'var(--warn-tx)' }}>
           {tr('路由表加载失败（后端不可用），保存将覆盖整表。', 'Failed to load routes (backend unavailable); saving will overwrite the whole table.')}

@@ -62,12 +62,18 @@ async function main() {
         prompt_tokens: 100000, completion_tokens: 10000, cache_read_tokens: 0, cache_creation_tokens: 0,
         calls: 2, cache_reported_calls: 0, estimated_calls: 2, priced_calls: 0, cost_usd: null },
     ];
+    let routes = [{ stage: 'default', provider_id: provider.id, model: 'research-model' }];
     await page.route('**/api/**', async (route) => {
       const request = route.request();
       const url = new URL(request.url());
       paths.push(url.pathname);
       let data: unknown = {};
-      if (url.pathname.endsWith('/usage/history') || url.pathname.endsWith('/llm/usage')) data = rows;
+      if (url.pathname.endsWith('/llm/routes')) {
+        if (request.method() === 'PUT') routes = request.postDataJSON();
+        data = routes;
+      } else if (url.pathname.endsWith('/usage/calls')) data = { total: 1, items: [{ ...rows[0], id: 'call-1', occurred_at: '2026-09-21T02:39:25Z', calls: 1, cache_reported_calls: 1, priced_calls: 1, prompt_tokens: 1000, completion_tokens: 100, cache_read_tokens: 750, cost_usd: '0.00142', reference_cost_usd: '0.0012' }] };
+      else if (url.pathname.endsWith('/cc-switch-pricing')) data = { 'fast-model': { input_per_million: '1', output_per_million: '4', cache_read_per_million: '0.1', cache_creation_per_million: '0' } };
+      else if (url.pathname.endsWith('/usage/history') || url.pathname.endsWith('/llm/usage')) data = rows;
       else if (request.method() === 'PATCH' && url.pathname.endsWith(provider.id)) {
         provider.model_pricing = request.postDataJSON().model_pricing;
         data = provider;
@@ -77,6 +83,7 @@ async function main() {
     await page.goto(`${origin}/e2e/llm-usage.html`);
     await page.getByText('按模型汇总', { exact: true }).waitFor();
     assert(paths.includes('/api/users/me/usage/history'));
+    await page.getByText('逐次调用明细 · 本地时间', { exact: true }).waitFor();
     assert.match(await page.locator('.usage-stats').innerText(), /1,800,000/);
     assert.match(await page.locator('.usage-stats').innerText(), /61\.1%/);
     assert.match(await page.locator('.usage-stats').innerText(), /\$1\.665/);
@@ -91,11 +98,19 @@ async function main() {
     await page.goto(`${origin}/e2e/llm-usage.html?view=platform`);
     await page.getByText('按模型汇总', { exact: true }).waitFor();
     assert(paths.includes('/api/admin/llm/usage'));
+    await page.getByLabel('切换默认模型', { exact: true }).selectOption(JSON.stringify([provider.id, 'fast-model']));
+    await page.getByRole('button', { name: '设为默认调用模型', exact: true }).click();
+    await page.getByText(/默认路由已切换/).waitFor();
+    assert.equal(routes[0]?.model, 'fast-model');
+
     await page.setViewportSize({ width: 390, height: 844 });
     await page.screenshot({ path: join(artifacts, 'usage-mobile.png'), fullPage: true });
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     await page.setViewportSize({ width: 1440, height: 1050 });
     await page.goto(`${origin}/e2e/llm-usage.html?view=pricing`);
+    await page.getByRole('button', { name: '从本机 CC Switch 导入匹配单价', exact: true }).click();
+    await page.getByText(/已导入匹配单价/).waitFor();
+    assert(provider.model_pricing['fast-model']);
     await page.getByLabel('模型 ID', { exact: true }).fill('research-model');
     await page.getByLabel('输入单价', { exact: true }).fill('2');
     await page.getByLabel('输出单价', { exact: true }).fill('8');
@@ -106,6 +121,8 @@ async function main() {
       input_per_million: '2', output_per_million: '8', cache_read_per_million: '0.2', cache_creation_per_million: null,
     });
     await page.screenshot({ path: join(artifacts, 'model-pricing.png'), fullPage: true });
+    await page.getByRole('button', { name: '移除单价', exact: true }).first().click();
+    await page.waitForFunction(() => document.querySelectorAll('.usage-table tbody tr').length === 1);
     await page.getByRole('button', { name: '移除单价', exact: true }).click();
     await page.getByText('尚未配置单价，用量将记录为费用未知。').waitFor();
     assert.deepEqual(provider.model_pricing, {});

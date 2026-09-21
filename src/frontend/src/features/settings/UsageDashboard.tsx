@@ -5,8 +5,10 @@ import { Segmented } from '../../components/ui/Segmented';
 import { SelectMenu } from '../../components/ui/SelectMenu';
 import { api, type LlmUsageRow } from '../../lib/api';
 import { tr } from '../../lib/i18n';
+import { fmtFullTime } from '../../lib/format';
 import { stageLabel } from '../../lib/stageLabels';
 import { cacheHitRate, formatUsd, summarizeUsage, usageByModel, type UsageTotals } from './usageModel';
+import { ActiveModelRoute } from './ActiveModelRoute';
 import './usage.css';
 
 function coverage(reported: number, calls: number): string {
@@ -22,8 +24,9 @@ export function UsageCost({ usage }: { usage: UsageTotals }) {
   const known = usage.priced_calls > 0 && usage.cost_usd !== null;
   return (
     <>
-      <span className="mono">{known ? formatUsd(usage.cost_usd) : '—'}</span>
-      {usage.calls > 0 && usage.priced_calls < usage.calls && (
+      <span className="mono">{formatUsd(known ? usage.cost_usd : usage.reference_cost_usd ?? null)}</span>
+      {usage.reference_cost_usd != null && <small className="usage-subtext">{tr('CC Switch 参考 ', 'CC Switch reference ')}{formatUsd(usage.reference_cost_usd)}</small>}
+      {usage.calls > 0 && usage.priced_calls < usage.calls && usage.reference_cost_usd == null && (
         <small className="usage-subtext">{known
           ? tr(`部分已计价 · ${coverage(usage.priced_calls, usage.calls)} 次`, `Partial · ${coverage(usage.priced_calls, usage.calls)} calls priced`)
           : tr('费用未知', 'Cost unknown')}</small>
@@ -82,6 +85,7 @@ export function UsageReport({ rows }: { rows: LlmUsageRow[] }) {
         )}
         {totals.estimated_calls > 0 && tr(` ${totals.estimated_calls.toLocaleString()} 次调用的 token 数为估算。`, ` Token counts were estimated for ${totals.estimated_calls.toLocaleString()} calls.`)}
         {' '}{tr('费用为估算值，未计价调用不按免费处理。', 'Costs are estimates; unpriced calls are not treated as free.')}
+        {' '}{tr('历史供应商缺失表示旧版本没有保存归属，不能用当前配置倒推。CC Switch 参考费用使用本机当前单价，缺失的缓存明细按无折扣估算；未匹配价格的模型不计入参考合计。', 'Missing historical providers were not recorded by older versions and cannot be inferred from current settings. CC Switch reference costs use current local prices without discounts for unknown cache usage; models without matching prices are excluded.')}
       </p>
       <div className="card card-pad usage-section">
         <div className="section-h">{tr('按模型汇总', 'Usage by model')}</div>
@@ -90,7 +94,7 @@ export function UsageReport({ rows }: { rows: LlmUsageRow[] }) {
             <thead><UsageHeaders /></thead>
             <tbody>{models.map((row) => (
               <tr key={JSON.stringify([row.provider_name, row.model])}>
-                <td>{row.provider_name ?? tr('未记录', 'Not recorded')}</td>
+                <td>{row.provider_name ?? tr('历史未记录', 'Not recorded historically')}</td>
                 <td className="mono">{row.model}</td>
                 <UsageCells usage={row} />
               </tr>
@@ -99,7 +103,7 @@ export function UsageReport({ rows }: { rows: LlmUsageRow[] }) {
         </div>
       </div>
       <div className="card card-pad usage-section">
-        <div className="section-h">{tr('每日明细', 'Daily details')}</div>
+        <div className="section-h">{tr('每日汇总', 'Daily totals')}</div>
         <div className="table-wrap">
           <table className="table usage-table">
             <thead><UsageHeaders detail /></thead>
@@ -107,7 +111,7 @@ export function UsageReport({ rows }: { rows: LlmUsageRow[] }) {
               <tr key={index}>
                 <td className="mono">{row.date}</td>
                 <td>{tr(stageLabel(row.stage).zh, stageLabel(row.stage).en)}</td>
-                <td>{row.provider_name ?? tr('未记录', 'Not recorded')}</td>
+                <td>{row.provider_name ?? tr('历史未记录', 'Not recorded historically')}</td>
                 <td className="mono">{row.model}</td>
                 <UsageCells usage={row} />
               </tr>
@@ -156,6 +160,7 @@ export function UsageDashboard({ scope }: { scope: 'personal' | 'platform' }) {
   const selectedRows = rows.filter((row) => !model || row.model === model);
   return (
     <>
+      {scope === 'platform' && <ActiveModelRoute />}
       <div className="usage-toolbar">
         <div className="section-h"><Icon name="chart" size={16} style={{ color: 'var(--accent)' }} />
           {scope === 'personal' ? tr('我的模型用量', 'My model usage') : tr('模型用量总览', 'Model usage overview')}
@@ -172,6 +177,33 @@ export function UsageDashboard({ scope }: { scope: 'personal' | 'platform' }) {
         : query.isError ? <div className="empty">{tr('无法加载用量，请重试。', 'Could not load usage. Please retry.')}</div>
         : selectedRows.length === 0 ? <div className="card empty">{tr(`近 ${days} 天暂无匹配的用量记录`, `No matching usage records in the last ${days} days`)}</div>
         : <UsageReport rows={selectedRows} />}
+      <UsageCalls scope={scope} days={Number(days)} model={model} key={`${scope}:${days}:${model}`} />
     </>
   );
+}
+
+function UsageCalls({ scope, days, model }: { scope: 'personal' | 'platform'; days: number; model: string }) {
+  const [page, setPage] = useState(0);
+  const query = useQuery({
+    queryKey: ['llm-usage-calls', scope, days, model, page],
+    queryFn: () => api.getUsageCalls(scope, days, model, page * 50),
+    refetchInterval: 10000,
+  });
+  return <div className="card card-pad usage-section">
+    <div className="section-h">{tr('逐次调用明细 · 本地时间', 'Individual calls · local time')}</div>
+    {query.isError ? <button className="btn btn-soft sm" onClick={() => void query.refetch()}>{tr('重试加载', 'Retry')}</button> :
+      <div className="table-wrap"><table className="table usage-table">
+        <thead><tr><th>{tr('时间', 'Time')}</th><th>{tr('环节', 'Stage')}</th><th>{tr('供应商', 'Provider')}</th><th>{tr('模型', 'Model')}</th>
+          <th>{tr('输入', 'Input')}</th><th>{tr('输出', 'Output')}</th><th>{tr('缓存读 / 写', 'Cache read / write')}</th><th>{tr('命中率', 'Hit rate')}</th><th>{tr('调用', 'Calls')}</th><th>USD</th></tr></thead>
+        <tbody>{query.data?.items.map(row => <tr key={row.id}>
+          <td className="mono" style={{ whiteSpace: 'nowrap' }}>{fmtFullTime(row.occurred_at)}</td>
+          <td>{tr(stageLabel(row.stage).zh, stageLabel(row.stage).en)}</td><td>{row.provider_name ?? tr('历史未记录', 'Not recorded historically')}</td><td className="mono">{row.model}</td><UsageCells usage={row} />
+        </tr>)}</tbody>
+      </table></div>}
+    <div className="row gap8" style={{ marginTop: 12 }}>
+      <button className="btn btn-soft sm" disabled={!page || query.isFetching} onClick={() => setPage(page - 1)}>{tr('上一页', 'Previous')}</button>
+      <span>{page + 1} / {Math.max(1, Math.ceil((query.data?.total ?? 0) / 50))}</span>
+      <button className="btn btn-soft sm" disabled={query.isFetching || (page + 1) * 50 >= (query.data?.total ?? 0)} onClick={() => setPage(page + 1)}>{tr('下一页', 'Next')}</button>
+    </div>
+  </div>;
 }

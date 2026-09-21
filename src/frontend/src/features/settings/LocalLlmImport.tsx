@@ -374,7 +374,7 @@ export function LocalLlmImport() {
                       style={{ width: '100%', marginTop: 7, justifyContent: 'center' }}
                       disabled={!config.importable || importMutation.isPending}
                       onClick={() => {
-                        setOverwriteRoutes(false);
+                        setOverwriteRoutes(target !== 'provider');
                         setPending({ config, target });
                       }}
                     >

@@ -32,12 +32,31 @@ function ProviderPricing({ provider }: { provider: LlmProviderRead }) {
     },
     onError: (error) => toast(`${tr('保存失败', 'Save failed')}：${error instanceof Error ? error.message : String(error)}`, 'error'),
   });
+  const importPrices = useMutation({
+    mutationFn: async () => {
+      const catalogue = await api.getCcSwitchPricing();
+      const imported: Record<string, ModelPricing> = {};
+      for (const model of modelOptions) {
+        const match = catalogue[model.trim().toLowerCase().replace(/\[\d+[mk]\]$/, '')];
+        if (match) imported[model] = match;
+      }
+      if (!Object.keys(imported).length) throw new Error(tr('CC Switch 没有匹配的单价', 'No matching CC Switch prices'));
+      // Preserve explicitly configured provider-specific rates.
+      return api.patchLlmProvider(provider.id, { model_pricing: { ...imported, ...prices } });
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['llm', 'providers'] });
+      toast(tr('已导入匹配单价，已有单价保留', 'Matching prices imported; existing prices preserved'), 'ok');
+    },
+    onError: (error) => toast(error instanceof Error ? error.message : String(error), 'error'),
+  });
   return (
     <>
       <p className="usage-note">
         {tr('单价单位为 USD / 百万 tokens。输入单价用于未命中缓存的输入；缓存读取和写入按各自单价计算。缓存价格留空表示未知，填 0 表示该项免费。', 'Prices are USD per million tokens. The input price applies to uncached input; cache reads and writes use their own prices. An empty cache price means unknown; enter 0 only when it is free.')}
         {' '}{tr('保存只影响之后的调用，历史费用保留当时的单价。', 'Saved prices apply to future calls only. Historical costs keep the prices recorded at call time.')}
       </p>
+      <button className="btn btn-soft sm" disabled={importPrices.isPending} onClick={() => importPrices.mutate()}>{tr('从本机 CC Switch 导入匹配单价', 'Import matching prices from local CC Switch')}</button>
       <form onSubmit={(event) => {
         event.preventDefault();
         if (price) mutation.mutate({ ...prices, [draft.model.trim()]: price });

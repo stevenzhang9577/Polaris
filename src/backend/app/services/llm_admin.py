@@ -8,7 +8,7 @@ import contextlib
 import time
 import uuid
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import UTC, timedelta
 from typing import Any
 
 from cryptography.fernet import InvalidToken
@@ -416,7 +416,7 @@ async def usage_report(
     if user_id is not None:
         stmt = stmt.where(LLMUsage.user_id == user_id)
     rows = (await session.execute(stmt)).all()
-    return [
+    result = [
         {
             "date": str(row.date),
             "stage": row.stage,
@@ -434,6 +434,52 @@ async def usage_report(
         }
         for row in rows
     ]
+
+
+    await add_reference_costs(result)
+    return result
+
+
+async def add_reference_costs(rows: list[dict]) -> None:
+    from app.core.llm.pricing import estimate_cost
+    from app.services.cc_switch_pricing import canonical_model, local_prices
+
+    prices = await local_prices()
+    for row in rows:
+        # A separate, current reference estimate; never rewrite historical price snapshots.
+        # Missing cache buckets receive no discount, and the UI labels this assumption.
+        row["reference_cost_usd"] = estimate_cost(row, prices.get(canonical_model(row["model"])))
+
+
+async def usage_calls(session, *, user_id=None, days=30, model=None, offset=0, limit=50):
+    where = [LLMUsage.created_at >= utcnow() - timedelta(days=days)]
+    if user_id is not None:
+        where.append(LLMUsage.user_id == user_id)
+    if model:
+        where.append(LLMUsage.model == model)
+    total = await session.scalar(select(func.count()).select_from(LLMUsage).where(*where))
+    calls = await session.scalars(
+        select(LLMUsage).where(*where)
+        .order_by(LLMUsage.created_at.desc(), LLMUsage.id.desc()).offset(offset).limit(limit)
+    )
+    rows = []
+    for call in calls:
+        stamp = call.created_at
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=UTC)
+        rows.append(dict(
+            id=str(call.id), occurred_at=stamp.isoformat(), date=stamp.date().isoformat(),
+            stage=call.stage, model=call.model, provider_name=call.provider_name,
+            prompt_tokens=call.prompt_tokens, completion_tokens=call.completion_tokens,
+            cache_read_tokens=call.cache_read_tokens or 0,
+            cache_creation_tokens=call.cache_creation_tokens or 0,
+            cache_reported_calls=int(call.cache_read_tokens is not None
+                                     and call.cache_creation_tokens is not None),
+            estimated_calls=int(call.usage_estimated), priced_calls=int(call.cost_usd is not None),
+            calls=1, cost_usd=call.cost_usd,
+        ))
+    await add_reference_costs(rows)
+    return {"total": total, "items": rows}
 
 
 # ---- 调用日志 ----

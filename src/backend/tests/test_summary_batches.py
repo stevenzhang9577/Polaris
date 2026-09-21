@@ -842,3 +842,49 @@ async def test_cancelling_dispatch_releases_leases_and_recovery_requeues_item(
         await summary_batches.recover_batch_items(session, batch_id)
         await session.refresh(item)
         assert item.status == "pending"
+
+
+async def test_cancel_stops_active_work_and_survives_restart(app, monkeypatch):
+    from app.models.summary_batch import SummaryBatch
+
+    user_id, library_id, paper_ids = await _seed_library(count=4, concurrency=1)
+    batch_id = await _create_batch(user_id=user_id, library_id=library_id, paper_ids=paper_ids)
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def generate(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(summary_batches.paper_summaries, 'generate_queued_revision', generate)
+    task = asyncio.create_task(summary_batches.run_batch(batch_id))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        async with get_sessionmaker()() as session:
+            batch = await session.get(SummaryBatch, batch_id)
+            await summary_batches.control_batch(session, batch=batch, action='cancel')
+            await session.commit()
+        await asyncio.wait_for(task, 5)
+        assert stopped.is_set()
+        await summary_batches.run_batch(batch_id)
+        async with get_sessionmaker()() as session:
+            batch = await session.get(SummaryBatch, batch_id)
+            for action in ('resume', 'retry', 'cancel'):
+                await summary_batches.control_batch(session, batch=batch, action=action)
+            await summary_batches.recover_batch_items(session, batch_id)
+            await session.commit()
+            view = await summary_batches.read_batch(session, batch)
+            assert view.status == 'cancelled'
+            assert view.cancelled == 4 and view.pending == view.running == 0
+            leases = await session.scalar(select(func.count()).select_from(SummaryGenerationLease))
+            assert leases == 0
+            revisions = (await session.scalars(select(PaperWikiRevision))).all()
+            assert len(revisions) == 1
+            assert revisions[0].error_code == 'SUMMARY_CANCELLED'
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
