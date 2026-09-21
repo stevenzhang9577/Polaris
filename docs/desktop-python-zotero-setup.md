@@ -51,7 +51,7 @@ pnpm --dir src/desktop run e2e:packaged-setup
 
 The packaged setup test uses a temporary profile and a random `POLARIS_DESKTOP_ENGINE_PORT`, never the user's existing backend or database. It chooses the repository backend Python as a local interpreter, verifies both buttons and subsequent environment reuse, then switches to managed Python 3.12 through Settings and verifies reconnection. It retains its isolated profile/screenshots for inspection. It does not import the user's real Zotero Collection.
 
-The Mac output is Universal (arm64 + x86_64) with ad-hoc signatures, not Apple Developer ID notarization. Native Intel execution must be tested on Intel hardware separately from architecture inspection.
+The default Mac output is arm64-only (Apple Silicon) with ad-hoc signatures, not Apple Developer ID notarization. Both `make desktop-dist` and `pnpm --dir src/desktop run dist:mac` use the arm64 packaging path.
 
 ## 0.1.1 verification
 

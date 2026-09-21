@@ -1,4 +1,4 @@
-/** Run against the built Universal App with an isolated profile and backend port. */
+/** Run against the built arm64 App with an isolated profile and backend port. */
 import assert from 'node:assert/strict';
 import { mkdtempSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,7 +19,7 @@ async function main() {
   await new Promise<void>((resolve) => socket.close(() => resolve()));
   const env = Object.fromEntries(Object.entries(process.env).filter(([k, v]) => v !== undefined && !k.startsWith('POLARIS_') && k !== 'ELECTRON_RUN_AS_NODE')) as Record<string, string>;
   Object.assign(env, { POLARIS_USER_DATA_DIR: data, POLARIS_DESKTOP_ENGINE_PORT: String(address.port) });
-  const executablePath = resolve('release/mac-universal/Polaris.app/Contents/MacOS/Polaris');
+  const executablePath = resolve('release/mac-arm64/Polaris.app/Contents/MacOS/Polaris');
   const python = resolve('../backend/.venv/bin/python');
   let app: ElectronApplication | undefined;
   async function close() {
@@ -89,7 +89,7 @@ async function main() {
     console.log('PASS: settings switched local Python to managed 3.12 and reconnected successfully');
     console.log(`Screenshots and isolated profile retained: ${data}`);
   } finally { await close(); }
-  execFileSync('codesign', ['--verify', '--deep', '--strict', resolve('release/mac-universal/Polaris.app')]);
+  execFileSync('codesign', ['--verify', '--deep', '--strict', resolve('release/mac-arm64/Polaris.app')]);
   console.log('PASS: App signature remains intact after installation, restart and environment switch');
 }
 main().catch((error: unknown) => { console.error(error); process.exitCode = 1; });

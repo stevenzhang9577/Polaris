@@ -1,7 +1,7 @@
 {
   "name": "polaris-desktop",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Polaris desktop shell (Electron)",
   "homepage": "https://github.com/ZJU-REAL/Polaris",
   "author": "Polaris contributors <polaris@users.noreply.github.com>",
@@ -20,7 +20,7 @@
     "icons": "./scripts/make-icons.sh",
     "stage:resources": "node scripts/fetch-uv.mjs && node scripts/stage-backend.mjs",
     "stage:resources:mac-arm64": "node scripts/fetch-uv.mjs --arch=arm64 && node scripts/stage-backend.mjs",
-    "dist:mac": "pnpm run stage:resources && pnpm run build && electron-builder --mac --universal",
+    "dist:mac": "pnpm run dist:mac:arm64",
     "dist:mac:arm64": "pnpm run stage:resources:mac-arm64 && pnpm run build && electron-builder --mac --arm64",
     "dist:win": "pnpm run stage:resources && pnpm run build && electron-builder --win",
     "dist:linux": "pnpm run stage:resources && pnpm run build && electron-builder --linux",
