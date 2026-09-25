@@ -197,6 +197,18 @@ cd src/desktop && pnpm run smoke   # loads the SPA for real; non-zero exit means
 make desktop-dist          # stage uv + backend, build an installer (unsigned)
 ```
 
+`pnpm --dir src/desktop run e2e` installs Playwright's version-matched Chromium
+headless shell on first use. For individual `e2e:*` scripts, run
+`pnpm --dir src/desktop run e2e:install-browser` first. Browser tests use that
+shell by default; set `POLARIS_TEST_BROWSER` to an executable path only when
+testing a specific browser installation. Playwright uses its normal user cache
+outside Codex Seatbelt. Inside Seatbelt, the install command and browser tests
+use Playwright's package-local `.local-browsers` directory under `node_modules`,
+which is writable from the repository. An explicit `PLAYWRIGHT_BROWSERS_PATH`
+overrides either default.
+An override pointing into a macOS `.app` must be run outside Codex Seatbelt;
+inside that sandbox, the test fails early with instructions to use the headless shell.
+
 In development the shell starts with **no local engine** by default and follows the
 remote-server flow; set `POLARIS_DESKTOP_ENGINE` (either form above) to exercise the local
 engine chain. The packaged app boots its own engine, so it asks for nothing on first launch;

@@ -10,7 +10,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { chromium } from 'playwright-core';
+import { launchTestBrowser } from './test-browser';
 
 function originalPdfFixture(): Buffer {
   const stream = 'BT /F1 18 Tf 50 200 Td (Original Zotero PDF) Tj ET';
@@ -55,14 +55,7 @@ async function main() {
       await delay(100);
     }
     assert(ready, output);
-    browser = await chromium.launch({
-      executablePath: process.env.POLARIS_TEST_BROWSER ?? (
-        process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-          : process.platform === 'win32' ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
-            : '/usr/bin/chromium'
-      ),
-      headless: true,
-    });
+    browser = await launchTestBrowser();
     const page = await browser.newPage({ viewport: { width: 1100, height: 850 } });
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
