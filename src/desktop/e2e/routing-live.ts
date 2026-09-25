@@ -8,7 +8,7 @@ import { createServer as createSocket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { chromium } from 'playwright-core';
+import { launchTestBrowser } from './test-browser';
 
 async function freePort() {
   const socket = createSocket().listen(0, '127.0.0.1');
@@ -88,7 +88,7 @@ async function main() {
     const newProvider = await api('/admin/llm/providers', 'POST', { name: 'Claude Code', kind: 'anthropic', auth_scheme: 'none', base_url: `http://127.0.0.1:${address.port}`, models: ['kimi-k3[1M]'] });
     await api('/admin/llm/routes', 'PUT', [{ stage: 'default', provider_id: oldProvider.id, model: 'gpt-6-astra' }]);
     assert.equal((await api('/test-routing/call', 'POST')).model, 'gpt-6-astra');
-    browser = await chromium.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    browser = await launchTestBrowser();
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
     await page.addInitScript(token => localStorage.setItem('polaris.token', token), session.access_token);
     await page.goto(`${webOrigin}/e2e/llm-usage.html?view=routing`);

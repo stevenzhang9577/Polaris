@@ -2,28 +2,12 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { chromium } from 'playwright-core';
-
-function browserExecutable(): string {
-  const candidates = [
-    process.env.POLARIS_TEST_BROWSER,
-    process.platform === 'darwin'
-      ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-      : undefined,
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-  ].filter((candidate): candidate is string => Boolean(candidate));
-  const executable = candidates.find(existsSync);
-  assert(executable, `No Chromium browser found; checked: ${candidates.join(', ')}`);
-  return executable;
-}
+import { launchTestBrowser } from './test-browser';
 
 async function main() {
   const frontend = join(__dirname, '..', '..', 'frontend');
@@ -52,7 +36,7 @@ async function main() {
       await delay(100);
     }
     assert(ready, output);
-    browser = await chromium.launch({ executablePath: browserExecutable(), headless: true });
+    browser = await launchTestBrowser();
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
     const errors: string[] = [];
     const probes: unknown[] = [];
