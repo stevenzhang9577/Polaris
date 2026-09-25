@@ -202,12 +202,10 @@ headless shell on first use. For individual `e2e:*` scripts, run
 `pnpm --dir src/desktop run e2e:install-browser` first. Browser tests use that
 shell by default; set `POLARIS_TEST_BROWSER` to an executable path only when
 testing a specific browser installation. Playwright uses its normal user cache
-outside Codex Seatbelt. Inside Seatbelt, the install command and browser tests
-use Playwright's package-local `.local-browsers` directory under `node_modules`,
-which is writable from the repository. An explicit `PLAYWRIGHT_BROWSERS_PATH`
-overrides either default.
-An override pointing into a macOS `.app` must be run outside Codex Seatbelt;
-inside that sandbox, the test fails early with instructions to use the headless shell.
+unless `PLAYWRIGHT_BROWSERS_PATH` is explicitly set. Browser E2E and its
+installer fail early inside Codex Seatbelt, because Chromium can crash even
+after a test reports success. Run a single browser E2E command with
+`require_escalated`, or run it from a regular terminal.
 
 In development the shell starts with **no local engine** by default and follows the
 remote-server flow; set `POLARIS_DESKTOP_ENGINE` (either form above) to exercise the local

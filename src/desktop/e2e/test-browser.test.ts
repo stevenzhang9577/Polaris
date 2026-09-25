@@ -14,17 +14,11 @@ test('honors an explicitly selected browser', () => {
   });
 });
 
-test('rejects a macOS app override inside Codex seatbelt', () => {
+test('rejects any browser launch inside Codex seatbelt', () => {
   assert.throws(() => testBrowserOptions({
     CODEX_SANDBOX: 'seatbelt',
     POLARIS_TEST_BROWSER: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  }), /Unset it to use Playwright headless shell/);
-});
-
-test('uses verified headless-shell flags inside Codex seatbelt', () => {
-  assert.deepEqual(testBrowserOptions({ CODEX_SANDBOX: 'seatbelt' }), {
-    headless: true,
-    executablePath: undefined,
-    args: ['--no-sandbox', '--single-process', '--no-zygote', '--disable-gpu', '--disable-dev-shm-usage'],
-  });
+  }), /Browser E2E is unsafe inside Codex Seatbelt/);
+  assert.throws(() => testBrowserOptions({ CODEX_SANDBOX: 'seatbelt' }),
+    /Run this single E2E command with require_escalated/);
 });
